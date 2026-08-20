@@ -1,0 +1,78 @@
+[AGENT] sade starts on lab=dc_clos_bgp
+[TOOL] ToolSearch({'query': 'select:mcp__kathara_base_mcp_server__get_reachability'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_base_mcp_server__get_reachability'}]
+[TOOL] mcp__kathara_base_mcp_server__get_reachability({})
+[RESULT] {"result":"{\"hosts\":{\"pc_0_0\":\"10.0.0.2\",\"pc_0_1\":\"10.0.1.2\"},\"results\":[{\"src\":\"pc_0_0\",\"dst\":\"pc_0_1\",\"dst_ip\":\"10.0.1.2\",\"tx\":null,\"rx\":null,\"loss_percent\":null,\"time_ms\":null,\"rtt_avg_ms\":null,\"rtt_min_ms\":null,\"rtt_max_ms\":null,\"rtt_mdev_ms\":null,\"status\":\"unknown\"},{\"src\":\"pc_0_1\",\"dst\":\"pc_0_0\",\"dst_ip\":\"10.0.0.2\",\"tx\":null,\"rx\":nu
+[TEXT] Both rows are `status="unknown"` — I must re-test with direct-IP probes before promoting to a symptom (per the unknown-status caveat).
+[TOOL] ToolSearch({'query': 'select:mcp__kathara_base_mcp_server__exec_shell'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_base_mcp_server__exec_shell'}]
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'pc_0_0', 'command': 'ping -c3 10.0.1.2'})
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'pc_0_1', 'command': 'ping -c3 10.0.0.2'})
+[RESULT] {"result":"[TIMEOUT] Command 'ping -c3 10.0.1.2' on 'pc_0_0' exceeded 10s."}
+[RESULT] {"result":"PING 10.0.0.2 (10.0.0.2) 56(84) bytes of data.\nFrom 10.0.1.1 icmp_seq=1 Destination Net Unreachable\nFrom 10.0.1.1 icmp_seq=2 Destination Net Unreachable\nFrom 10.0.1.1 icmp_seq=3 Destination Net Unreachable\n\n--- 10.0.0.2 ping statistics ---\n3 packets transmitted, 0 received, +3 errors, 100% packet loss, time 2176ms"}
+[TEXT] Real symptoms confirmed:
+- `pc_0_0 → 10.0.1.2`: hard timeout (100% loss, no ICMP response)
+- `pc_0_1 → 10.0.0.2`: 100% loss, **"Destination Net Unreachable"** returned by `10.0.1.1` (leaf_router_0_1's gateway) — meaning the leaf has no route to 10.0.0.0/24
+
+This is a routing fault: 10.0.0.0/24 is missing from the fabric. The user report says all BGP sessions are Established but spines lack the prefix — that fingerprint maps directly to **BGP missing route advertisement**. Entering the BGP fault skill.
+[TOOL] Skill({'skill': 'bgp-fault-skill'})
+[RESULT] Launching skill: bgp-fault-skill
+[TEXT] The skill is loaded. Now I'll run the BGP snapshot helper to get a fabric-wide picture before doing any per-device drilling.
+[TOOL] ToolSearch({'query': 'select:mcp__helper_server__run_helper'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__helper_server__run_helper'}]
+[TOOL] mcp__helper_server__run_helper({'script_name': 'bgp_snapshot'})
+[RESULT] {"result":"=== BGP SNAPSHOT ===\nLab: dc_clos_bgp\nRouters scanned: 5\nFlags: none\n\nleaf_router_0_0\n  FRR: watchfrr=yes, zebra=yes, bgpd=yes\n  ASN: 65200\n  Networks: (none)\n  Loopback IPv4: 127.0.0.1/8\n  Null routes: (none)\n  BGP neighbors: 2 (Established x2)\n  Command errors: none\n\nleaf_router_0_1\n  FRR: watchfrr=yes, zebra=yes, bgpd=yes\n  ASN: 65201\n  Networks: 10.0.1.0/24\n  Loopb
+[TEXT] The smoking gun is clear: **`leaf_router_0_0` has `Networks: (none)`** — it is advertising no prefixes via BGP. Meanwhile `leaf_router_0_1` correctly advertises `10.0.1.0/24`. All sessions are Established, which matches the NOC report exactly. This is `bgp_missing_route_advertisement` on `leaf_router_0_0`.
+
+Let me confirm by inspecting the FRR running config on `leaf_router_0_0` directly:
+[TOOL] ToolSearch({'query': 'select:mcp__kathara_frr_mcp_server__frr_show_running_config'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_frr_mcp_server__frr_show_running_config'}]
+[TOOL] mcp__kathara_frr_mcp_server__frr_show_running_config({'router_name': 'leaf_router_0_0'})
+[TOOL] mcp__kathara_frr_mcp_server__frr_show_running_config({'router_name': 'leaf_router_0_1'})
+[RESULT] {"result":"Building configuration...\n\nCurrent configuration:\n!\nfrr version 9.1.3\nfrr defaults traditional\nhostname leaf_router_0_0\ndomainname localdomain\nlog file /var/log/frr/frr.log\nno ipv6 forwarding\nservice integrated-vtysh-config\n!\ndebug bgp keepalives\ndebug bgp updates in\ndebug bgp updates out\n!\nrouter bgp 65200\n bgp router-id 172.16.0.5\n no bgp ebgp-requires-policy\n neigh
+[RESULT] {"result":"Building configuration...\n\nCurrent configuration:\n!\nfrr version 9.1.3\nfrr defaults traditional\nhostname leaf_router_0_1\ndomainname localdomain\nlog file /var/log/frr/frr.log\nno ipv6 forwarding\nservice integrated-vtysh-config\n!\ndebug bgp keepalives\ndebug bgp updates in\ndebug bgp updates out\n!\nrouter bgp 65201\n bgp router-id 172.16.0.7\n no bgp ebgp-requires-policy\n neigh
+[TEXT] The config comparison is definitive:
+
+- **`leaf_router_0_1`**: has `address-family ipv4 unicast` with `network 10.0.1.0/24` ✅
+- **`leaf_router_0_0`**: has **no** `address-family ipv4 unicast` block and **no** `network` statement whatsoever ❌
+
+Let me do one final cross-check — verify the spine routing tables confirm 10.0.0.0/24 is absent:
+[TOOL] mcp__kathara_frr_mcp_server__frr_show_ip_route({'router_name': 'spine_router_0_0'})
+[RESULT] {"result":"Codes: K - kernel route, C - connected, S - static, R - RIP,\n       O - OSPF, I - IS-IS, B - BGP, E - EIGRP, N - NHRP,\n       T - Table, v - VNC, V - VNC-Direct, A - Babel, F - PBR,\n       f - OpenFabric,\n       > - selected route, * - FIB route, q - queued, r - rejected, b - backup\n       t - trapped, o - offload failure\n\nB>* 10.0.1.0/24 [20/0] via 172.16.0.7, eth2, weight 1, 00
+[TEXT] Confirmed. `spine_router_0_0`'s BGP table has `10.0.1.0/24` via leaf_router_0_1 — but **`10.0.0.0/24` is completely absent**. The root cause is proven.
+
+---
+
+=== DIAGNOSIS ===
+is_anomaly: true
+faulty_devices: leaf_router_0_0
+diagnosis_text:
+**Affected component:** The `router bgp 65200` configuration block on `leaf_router_0_0` is missing its `address-family ipv4 unicast` stanza and, consequently, the `network 10.0.0.0/24` advertisement statement.
+
+**Mechanism:** In FRR's BGP implementation, a directly-connected prefix is only redistributed into BGP when an explicit `network <prefix>` statement exists under the `address-family ipv4 unicast` block. Without it, `leaf_router_0_0` never originates UPDATE messages for `10.0.0.0/24` to its eBGP peers (`spine_router_0_0` and `spine_router_0_1`). B
+[FINAL] stop=end_turn tool_calls=12
+[SUBMITTED] parsed_ok=True is_anomaly=True faulty_devices=['leaf_router_0_0']
+[FINAL-TEXT] Confirmed. `spine_router_0_0`'s BGP table has `10.0.1.0/24` via leaf_router_0_1 — but **`10.0.0.0/24` is completely absent**. The root cause is proven.
+
+---
+
+=== DIAGNOSIS ===
+is_anomaly: true
+faulty_devices: leaf_router_0_0
+diagnosis_text:
+**Affected component:** The `router bgp 65200` configuration block on `leaf_router_0_0` is missing its `address-family ipv4 unicast` stanza and, consequently, the `network 10.0.0.0/24` advertisement statement.
+
+**Mechanism:** In FRR's BGP implementation, a directly-connected prefix is only redistributed into BGP when an explicit `network <prefix>` statement exists under the `address-family ipv4 unicast` block. Without it, `leaf_router_0_0` never originates UPDATE messages for `10.0.0.0/24` to its eBGP peers (`spine_router_0_0` and `spine_router_0_1`). Because the prefix is never injected at the leaf, it never propagates through the spine layer or reaches `leaf_router_0_1`. All BGP sessions remain Established (no peering fault) — the router simply has nothing to advertise.
+
+**Localization:** `leaf_router_0_0` (ASN 65200). Confirmed by the running config: the `router bgp 65200` block has only `neighbor` statements and no `address-family` block. By direct contrast, `leaf_router_0_1` (ASN 65201) has `network 10.0.1.0/24` under `address-family ipv4 unicast`, which is why `10.0.1.0/24` propagates correctly. The spine routing table (`spine_router_0_0`) contains `10.0.1.0/24` but no entry for `10.0.0.0/24`, consistent with the NOC observation.
+
+**Root cause:** The `network 10.0.0.0/24` statement (and its `address-family ipv4 unicast` wrapper) is missing from the BGP configuration of `leaf_router_0_0`, preventing the PC-0-0 subnet from being advertised into the fabric.
+
+**Fix:** Add the following to `leaf_router_0_0`'s FRR config under `router bgp 65200`:
+```
+ address-family ipv4 unicast
+  network 10.0.0.0/24
+ exit-address-family
+```
+Once applied and BGP UPDATE messages propagate (~convergence time), `10.0.0.0/24` will appear in all spine and peer-leaf routing tables and pc_0_0 ↔ pc_0_1 connectivity will be restored.
+=== END ===

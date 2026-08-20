@@ -1,0 +1,181 @@
+{
+  "scenario": {
+    "scenario_id": "kath2-router0-wrong-static",
+    "topology": "Kath2",
+    "fault_family": "misconfigured static route",
+    "prompt_to_agent": "After an admin added a \"temporary backup route\" on router0,\nIT and CS users report Server Room (1.0.0.x) is unreachable\nbut Internet Lab (128.168.0.x) works fine. Both used to work.\nDiagnose.",
+    "injection": {
+      "device": "router0",
+      "action": "add a black-hole static for the Server Room prefix",
+      "command": "ip route add 1.0.0.0/8 via 127.0.0.1",
+      "note": null
+    },
+    "pre_check": [],
+    "post_inject_check": [
+      {
+        "device": "router0",
+        "command": "ip route show 1.0.0.0/8 | grep -c \"127.0.0.1\"",
+        "expect": "1"
+      },
+      {
+        "device": "it_hod",
+        "command": "ping -W2 -c2 1.0.0.5",
+        "expect": "loss>0"
+      },
+      {
+        "device": "it_hod",
+        "command": "ping -W2 -c2 128.168.0.2",
+        "expect": "0% loss"
+      }
+    ],
+    "ground_truth": "Affected component: router0 routing table \u2014 static route to\n  1.0.0.0/8 via 127.0.0.1\nMechanism: Linux prefers static routes over RIP-learned routes\n  (admin distance / route metric). The new static for 1.0.0.0/8\n  points at the loopback, which silently drops the packets.\n  128.168.0.0/16 still uses the RIP-learned route via 10.10.0.2.\nLocalization: router0\nRoot cause: incorrect static route `1.0.0.0/8 via 127.0.0.1`\nFix: `ip route del 1.0.0.0/8 via 127.0.0.1` (RIP-learned\n  route reinstalls automatically)",
+    "fix_spec": "`ip route del 1.0.0.0/8 via 127.0.0.1` (RIP-learned\n  route reinstalls automatically)",
+    "scoring_axes": [
+      "assert-identifies: router0",
+      "must-identify-device: router0",
+      "must-identify-component: static route / routing table",
+      "must-explain-blackhole-mechanism"
+    ],
+    "source_path": "dataset/kath2_Q/base/kath2-router0-wrong-static.txt",
+    "scenario_class": "base",
+    "ticket_style": "standard"
+  },
+  "agent": "cc-baseline",
+  "timestamp": "2026-07-31T09:20:04.167602+00:00",
+  "phases": {
+    "lstart": {
+      "ok": true,
+      "containers": 30,
+      "expected": 30
+    },
+    "settle": {
+      "converge_wait": 90
+    },
+    "injection": {
+      "applied": true,
+      "skipped_reason": null,
+      "rc": 0,
+      "output": ""
+    },
+    "post_inject_check": {
+      "results": [
+        {
+          "line": {
+            "device": "router0",
+            "command": "ip route show 1.0.0.0/8 | grep -c \"127.0.0.1\"",
+            "expect": "1"
+          },
+          "passed": true,
+          "actual": "1",
+          "rationale": "got 1, expected 1"
+        },
+        {
+          "line": {
+            "device": "it_hod",
+            "command": "ping -W2 -c2 1.0.0.5",
+            "expect": "loss>0"
+          },
+          "passed": true,
+          "actual": "PING 1.0.0.5 (1.0.0.5) 56(84) bytes of data.\nFrom 192.168.1.1 icmp_seq=1 Time to live exceeded\nFrom 192.168.1.1 icmp_seq=2 Time to live exceeded\n\n--- 1.0.0.5 ping statistics ---\n2 packets transmitted, 0 received, +2 errors, 100% packet loss, time 1037ms",
+          "rationale": "loss=100%"
+        },
+        {
+          "line": {
+            "device": "it_hod",
+            "command": "ping -W2 -c2 128.168.0.2",
+            "expect": "0% loss"
+          },
+          "passed": true,
+          "actual": "PING 128.168.0.2 (128.168.0.2) 56(84) bytes of data.\n64 bytes from 128.168.0.2: icmp_seq=1 ttl=61 time=2.40 ms\n64 bytes from 128.168.0.2: icmp_seq=2 ttl=61 time=1.66 ms\n\n--- 128.168.0.2 ping statistics ---\n2 packets transmitted, 2 received, 0% packet loss, time 1037ms\nrtt min/avg/max/mdev = 1.662/2.031/2.401/0.369 ms",
+          "rationale": "loss=0%"
+        }
+      ],
+      "wait_seconds": 0
+    },
+    "agent": {
+      "diagnosis_text": "An administrator added a host OS-level static route on router0 (`ip route add 1.0.0.0/8 via 127.0.0.1`) as a \"temporary backup route\" for the Server Room prefix. Because kernel/static routes carry an administrative distance of 0, this route wins unconditionally over the legitimate RIP-learned route for the same prefix (`R 1.0.0.0/8 [120/3] via 10.10.0.2, eth2`). The kernel route forwards all traffic destined for 1.0.0.x to the loopback interface (127.0.0.1 on lo), effectively blackholing it \u2014 packets never leave router0 toward router1 and router2 where the Server Room LAN resides.\n\nThis explains the asymmetric symptom precisely: the Internet Lab prefix (128.168.0.0/16) has no competing kernel route, so its RIP entry remains the selected FIB entry and connectivity is intact. Only the Server Room prefix (1.0.0.0/8) is affected because the spurious kernel route shadows its RIP entry, which is still present in the RIB but marked as non-selected.\n\nThe FRR running configuration on router0 contains no static route \u2014 the injection was done entirely at the OS level with `ip route`, outside of FRR's control, which is why it does not appear in `show running-config`.\n\n**Root cause:** A manually added OS-level static route (`1.0.0.0/8 via 127.0.0.1 dev lo`) on router0 blackholes all Server Room traffic by overriding the correct RIP route.\n\n**Corrective fix:** Remove the spurious kernel route on router0 with:\n```\nip route del 1.0.0.0/8 via 127.0.0.1\n```\nThis will immediately restore the RIP route as the selected FIB entry and re-establish IT/CS reachability to the Server Room.",
+      "is_anomaly": true,
+      "faulty_devices": [
+        "router0"
+      ],
+      "parsed_ok": true,
+      "in_tokens": 11,
+      "cache_read_tokens": 53882,
+      "cache_write_tokens": 12481,
+      "out_tokens": 2535,
+      "cost_usd": 0.10254235,
+      "tool_calls": 5,
+      "hit_max_turns": false,
+      "error": null
+    },
+    "score": {
+      "must_passed": 4,
+      "must_total": 4,
+      "bonus_passed": 0,
+      "bonus_total": 0,
+      "outcome_score": 1.0,
+      "fix_score": 1.0,
+      "reasoning_score": 1.0,
+      "reasoning_dims": {
+        "grounding": 1.0,
+        "causality": 1.0,
+        "coverage": 1.0
+      },
+      "final_score": 1.0,
+      "per_axis": [
+        {
+          "axis": "assert-identifies: router0",
+          "kind": "assert",
+          "score": 1.0,
+          "rationale": "culprit 'router0' named (good)"
+        },
+        {
+          "axis": "must-identify-device: router0",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The agent explicitly identifies router0 as the affected device multiple times in the diagnosis."
+        },
+        {
+          "axis": "must-identify-component: static route / routing table",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The agent clearly identifies the problematic component as an OS-level static route in router0's routing table (1.0.0.0/8 via 127.0.0.1) that overrides the RIP-learned route."
+        },
+        {
+          "axis": "must-explain-blackhole-mechanism",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "Agent clearly explains that the OS-level static route has higher priority than the RIP route and directs traffic to the loopback (127.0.0.1), causing packets to be dropped locally (blackholed)."
+        },
+        {
+          "axis": "[FIX]",
+          "kind": "fix",
+          "score": 1.0,
+          "rationale": "Directly matches the expected fix: delete the OS-level static route (ip route del 1.0.0.0/8 via 127.0.0.1) to allow the RIP route to be selected again."
+        },
+        {
+          "axis": "reason:grounding",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "The agent's logs include the FRR route table and the kernel 'ip route show' output that directly support the claims. The conclusions (kernel static route to 1.0.0.0/8 via lo overrides RIP and blackholes traffic; removing the kernel route restores the RIP-learned entry) follow logically and the proposed fix addresses the root cause."
+        },
+        {
+          "axis": "reason:causality",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "The agent's logs include the FRR route table and the kernel 'ip route show' output that directly support the claims. The conclusions (kernel static route to 1.0.0.0/8 via lo overrides RIP and blackholes traffic; removing the kernel route restores the RIP-learned entry) follow logically and the proposed fix addresses the root cause."
+        },
+        {
+          "axis": "reason:coverage",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "The agent's logs include the FRR route table and the kernel 'ip route show' output that directly support the claims. The conclusions (kernel static route to 1.0.0.0/8 via lo overrides RIP and blackholes traffic; removing the kernel route restores the RIP-learned entry) follow logically and the proposed fix addresses the root cause."
+        }
+      ],
+      "judge_model": "gpt-5-mini",
+      "reasoning_mode": "trace",
+      "error": null
+    }
+  },
+  "agent_input_prompt": "# Topology overview (devices + L2 connectivity)\nTopology: Kath2\n\nDevices:\n  cs_hod: eth0=lan_cs\n  cs_lab1: eth0=lan_cs\n  cs_lab2: eth0=lan_cs\n  cs_lab3: eth0=lan_cs\n  cs_lab4: eth0=lan_cs\n  enquiry: eth0=lan_office\n  exam_cell: eth0=lan_office\n  it_hod: eth0=lan_it\n  it_lab1: eth0=lan_it\n  it_lab2: eth0=lan_it\n  it_lab3: eth0=lan_it\n  it_lab4: eth0=lan_it\n  laptop0: eth0=lan_principle\n  office_pc: eth0=lan_office\n  pc0: eth0=lan_principle\n  pc1: eth0=lan_servers\n  pc2: eth0=lan_internet\n  pc3: eth0=lan_internet\n  pc4: eth0=lan_internet\n  pc5: eth0=lan_internet\n  router0: eth0=link_r0_sw0, eth1=link_r0_sw1, eth2=wan_r0_r1\n  router1: eth0=link_r1_sw2, eth1=link_r1_sw3, eth2=wan_r0_r1, eth3=wan_r1_r2\n  router2: eth0=link_r2_sw4, eth1=link_r2_sw5, eth2=wan_r1_r2\n  switch0: eth0=link_r0_sw0, eth1=lan_it\n  switch1: eth0=link_r0_sw1, eth1=lan_cs\n  switch2: eth0=link_r1_sw2, eth1=lan_office\n  switch3: eth0=link_r1_sw3, eth1=lan_principle\n  switch4: eth0=link_r2_sw4, eth1=lan_servers\n  switch5: eth0=link_r2_sw5, eth1=lan_internet\n  tpo: eth0=lan_office\n\nCollision domains (shared L2 segments):\n  lan_cs: cs_hod.eth0, cs_lab1.eth0, cs_lab2.eth0, cs_lab3.eth0, cs_lab4.eth0, switch1.eth1\n  lan_internet: pc2.eth0, pc3.eth0, pc4.eth0, pc5.eth0, switch5.eth1\n  lan_it: it_hod.eth0, it_lab1.eth0, it_lab2.eth0, it_lab3.eth0, it_lab4.eth0, switch0.eth1\n  lan_office: enquiry.eth0, exam_cell.eth0, office_pc.eth0, switch2.eth1, tpo.eth0\n  lan_principle: laptop0.eth0, pc0.eth0, switch3.eth1\n  lan_servers: pc1.eth0, switch4.eth1\n  link_r0_sw0: router0.eth0, switch0.eth0\n  link_r0_sw1: router0.eth1, switch1.eth0\n  link_r1_sw2: router1.eth0, switch2.eth0\n  link_r1_sw3: router1.eth1, switch3.eth0\n  link_r2_sw4: router2.eth0, switch4.eth0\n  link_r2_sw5: router2.eth1, switch5.eth0\n  wan_r0_r1: router0.eth2, router1.eth2\n  wan_r1_r2: router1.eth3, router2.eth2\n\n# Symptom (user report)\nAfter an admin added a \"temporary backup route\" on router0,\nIT and CS users report Server Room (1.0.0.x) is unreachable\nbut Internet Lab (128.168.0.x) works fine. Both used to work.\nDiagnose."
+}

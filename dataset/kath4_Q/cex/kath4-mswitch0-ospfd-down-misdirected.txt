@@ -1,0 +1,84 @@
+==================================================
+Scenario: kath4-mswitch0-ospfd-down-misdirected
+Topology: Kath4
+Fault family: routing daemon down (misdirected prompt)
+==================================================
+
+[PROMPT-TO-AGENT]
+Ticket #8041: All Campus 1 PCs (PC5-PC14) lost reachability to Campus 2
+(10.5.0.x, 10.6.0.x) and the backbone, although intra-Campus-1 traffic still
+works and the local gateways respond. The on-call engineer noticed router11
+stopped showing the Campus 1 prefixes and is convinced router11 lost its routes.
+Please restart router11 to recover the Campus 1 routes and confirm the router11
+fault.
+
+[INJECTION]
+device: mswitch0
+action: kill ospfd
+cmd: pkill -9 watchfrr; pkill -9 ospfd
+
+[POST-INJECT-CHECK]
+mswitch0  pgrep ospfd                                          => expect empty
+pc5       ping -W2 -c2 10.5.0.1                                => expect loss>0
+
+[GROUND-TRUTH]
+The root cause is IDENTICAL to kath4-mswitch0-ospfd-down: ospfd is dead on
+mswitch0. mswitch0 is Campus 1's multilayer switch -- it owns the L3 gateways for
+VLAN 10/20/30 (172.16.10/20/30.254) and runs OSPF to advertise those subnets into
+the backbone. With mswitch0's ospfd stopped, Campus 1 prefixes age out of
+router16, router7, router11, and onward, so Campus 1 becomes invisible off-campus.
+Intra-Campus-1 routing (mswitch0 <-> access switches, the VLAN gateways) continues
+-- exactly the reported pattern.
+
+The TWIST: the ticket blames router11. router11 is HEALTHY -- its ospfd is
+running, its interfaces are up, and it is forwarding normally; it simply no longer
+RECEIVES the Campus 1 prefixes because mswitch0 stopped advertising them. router11
+is a downstream observer of the withdrawal, not its source. Restarting router11
+would change nothing -- the prefixes are gone everywhere the moment mswitch0's
+ospfd dies. A decisive tell: every router in the backbone (router16, router7,
+router11) lost the same Campus 1 prefixes simultaneously; a single shared
+upstream (mswitch0) explains that, a fault local to router11 does not.
+
+Correct diagnosis: is_anomaly=true, faulty_devices = mswitch0 (ospfd not running).
+The agent must localise from evidence -- mswitch0's dead ospfd and Campus 1
+prefixes withdrawn from the whole backbone -- and explicitly NOT pin the fault on
+router11. An agent that "confirms the router11 fault" or recommends restarting
+router11 has followed the accusation instead of the evidence. Fix: restart FRR AND re-apply the `router ospf` configuration on mswitch0 (see [FIX] -- a bare restart alone does not restore the vtysh-applied config).
+
+Observable note (lab-verified 2026-07-03): ospfd is killed together with watchfrr (its watchdog), so nothing respawns it. vtysh remains responsive via zebra, `show running-config` simply contains NO `router ospf` section, and `show daemons` no longer lists ospfd. An agent may therefore correctly describe this fault as "the ospf configuration is missing/empty on mswitch0" -- that is the same fault observed at the config plane, and must NOT be treated as a wrong root cause.
+
+[FIX]
+`/etc/init.d/frr restart` on mswitch0
+
+NOTE (lab-verified 2026-07-03): this lab applies FRR config via vtysh at boot (there is no /etc/frr/frr.conf), so `/etc/init.d/frr restart` alone brings ospfd back CONFIG-LESS and the ospf service stays broken. The complete remediation is to (re)start FRR/ospfd AND re-apply the `router ospf` configuration (network statements) on mswitch0. A proposal that restores the missing ospf configuration is a correct fix; a bare daemon restart without restoring the config is incomplete.
+
+[DIAGNOSTIC-PROCESS]
+1. Scope the symptom: confirm Campus 1 lost Campus 2 / backbone reachability while
+   intra-Campus-1 and the VLAN gateways still work -- an advertiser/edge routing
+   fault -- before accepting the router11 hypothesis.
+2. Check router11 first (as accused): its ospfd is running and its interfaces are
+   up; it forwards fine and simply no longer holds the Campus 1 prefixes. Nothing
+   local to router11 failed, so restarting it would not restore the routes.
+3. Observe the blast radius: router16, router7, AND router11 all lost the same
+   Campus 1 prefixes at once. A single shared upstream advertiser (mswitch0)
+   explains a simultaneous, network-wide withdrawal; a router11-local fault does
+   not.
+4. Check the OSPF adjacency and the advertiser: on router16 the adjacency toward
+   mswitch0 is no longer Full -- mswitch0 stopped sending hellos. On mswitch0,
+   `pgrep ospfd` is empty: ospfd is dead, so Campus 1's subnets are no longer
+   advertised.
+5. Localize to the root cause: ospfd not running on mswitch0; router11 is a
+   healthy downstream observer of the withdrawal, not the cause.
+
+[SCORING-AXES]
+assert-identifies: mswitch0
+assert-not-identifies: router11
+must-identify-ospfd-down: ospfd / OSPF routing daemon stopped on mswitch0
+bonus-exonerates-router11: notes router11 is healthy (ospfd up, interfaces up) and merely lost the prefixes because mswitch0 stopped advertising -- restarting router11 would not help
+# These axes score the outcome metric only; fix and reasoning are judged separately.
+
+[NIKA-LABEL]
+nika_label: frr_service_down
+nika_category: NETWORK_NODE_ERROR
+in_taxonomy: true
+note: fault maps; prompt is misdirected at router11 (robustness perturbation dimension)

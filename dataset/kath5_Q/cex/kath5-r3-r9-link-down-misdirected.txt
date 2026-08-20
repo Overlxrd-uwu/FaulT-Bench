@@ -1,0 +1,77 @@
+==================================================
+Scenario: kath5-r3-r9-link-down-misdirected
+Topology: Kath5
+Fault family: WAN link cut (misdirected prompt)
+==================================================
+
+[PROMPT-TO-AGENT]
+Ticket #9052: After a maintenance window, routes for 19.0.0.0/8, 39.0.0.0/8, and
+90.0.0.0/8 became unstable in R1's RIB and R3 reports losing an OSPF neighbor. R9
+dropped off the network -- those are R9's prefixes and they keep flapping. The team
+wants R9 rebooted; they believe R9 hung during maintenance. Please confirm R9 is
+the failed node and bring it back.
+
+[INJECTION]
+device: r3
+action: bring down the link toward r9
+cmd: ip link set eth0 down
+
+[POST-INJECT-CHECK]
+r3  ip -br link show eth0 | grep -c UP                   => expect 0
+r1  vtysh -c "show ip route" | grep -c "90.0.0.0"        => expect 0
+
+[GROUND-TRUTH]
+The root cause is IDENTICAL to kath5-r3-r9-link-down: the backbone link from R3
+toward R9 is down. R3 is R9's primary OSPF backbone neighbor and R9 owns the
+19.0.0.0/8 and 90.0.0.0/8 prefixes. With the R3<->R9 link down, the adjacency drops
+and R9 -- whose ONLY uplink is that R3 link (its other interface is a stub LAN)
+-- becomes ISOLATED, so those prefixes disappear from R1's RIB -- exactly the
+reported pattern.
+
+The TWIST: the ticket blames R9 and wants it rebooted. R9 is HEALTHY but
+UNREACHABLE -- it has no alternate path (the R3 link is its sole uplink), so
+nothing about R9 can be probed remotely once the link drops; from R9's own side
+its interface is up and it keeps sending hellos into a dead wire. The fault is
+the link on R3's side, not R9. A decisive tell: on R3, the interface facing R9
+is operationally DOWN (L1/L2), while R3's OTHER adjacencies stay Full and every
+other backbone prefix is stable -- the blast radius is exactly R9's prefixes,
+the signature of a cut uplink, not a crashed router. Rebooting R9 would do
+nothing -- the wire to R3 stays down. This is "blame the device that went quiet"
+bias: R9's prefixes flap, so the team assumes R9 hung.
+
+Correct diagnosis: is_anomaly=true, faulty_devices = r3 (its link toward R9 is
+down). The agent must localise the failed LINK from evidence -- R3's down interface
+toward R9 and the resulting adjacency loss -- and explicitly NOT pin the fault on
+R9 or recommend rebooting it. An agent that "confirms R9 failed" has followed the
+accusation instead of the evidence. Fix: bring the R3<->R9 link back up.
+
+[FIX]
+bring the link back up
+
+[DIAGNOSTIC-PROCESS]
+1. Scope the symptom: confirm R1 lost / is flapping 19.0.0.0/8, 39.0.0.0/8, and
+   90.0.0.0/8 and that R3 reports a dropped OSPF neighbor -- before accepting the
+   "reboot R9" hypothesis.
+2. Check R9 first (as accused): R9 cannot be reached remotely -- but that alone
+   does not convict it; its ONLY uplink is the R3 link, so a cut link and a dead
+   router look identical from outside. Distinguish via R3's side and blast radius.
+3. Check interface/link state on R3: the interface facing R9 is operationally DOWN
+   (L1/L2 failure), not a configuration change -- this is the real fault.
+4. Correlate: `show ip ospf neighbor` on R3 confirms the Full adjacency to R9
+   dropped as a direct result of the down link; R9's prefixes vanish network-wide
+   because R9 has no other uplink.
+5. Localize to the lowest-layer root cause: the R3<->R9 link (R3's eth toward R9)
+   is down; rebooting R9 would not help -- R9 is a healthy node behind a cut link.
+
+[SCORING-AXES]
+assert-identifies: r3
+assert-not-identifies: r9
+must-identify-affected-link: r3<->r9
+bonus-notes-r9-healthy: argues R9 itself need not have failed by any valid evidence -- e.g. the fault localizes to R3's down interface, the blast radius is exactly R9's prefixes, R9 is unreachable only because its sole uplink is cut, and/or a reboot of R9 would not fix the link
+# These axes score the outcome metric only; fix and reasoning are judged separately.
+
+[NIKA-LABEL]
+nika_label: link_down
+nika_category: LINK_FAILURE
+in_taxonomy: true
+note: fault maps; prompt is misdirected at R9 (robustness perturbation dimension)

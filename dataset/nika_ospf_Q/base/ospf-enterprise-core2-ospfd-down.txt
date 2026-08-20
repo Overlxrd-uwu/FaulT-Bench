@@ -1,0 +1,78 @@
+==================================================
+Scenario: ospf-enterprise-core2-ospfd-down
+Topology: ospf_enterprise_static
+Fault family: routing daemon down
+==================================================
+
+[PROMPT-TO-AGENT]
+Helpdesk ticket #8871: host_2_1_1_1 (10.2.1.2) reports it has lost everything
+beyond its own gateway: every 10.200.0.x server times out, and it cannot reach
+host_1_1_1_1 in the other pod either. It CAN still ping its gateway 10.2.1.1.
+Pod 1 is unaffected -- host_1_1_1_1 reaches the server farm normally. Diagnose.
+
+[INJECTION]
+device: router_core_2
+action: kill the OSPF daemon (ospfd) on router_core_2 and stop watchfrr from respawning it
+cmd: pkill -9 watchfrr; pkill -9 ospfd
+
+[POST-INJECT-CHECK]
+router_core_2  pgrep ospfd              => expect empty
+host_2_1_1_1   ping -W2 -c2 10.200.0.2  => expect loss>0
+host_1_1_1_1   ping -W2 -c2 10.200.0.2  => expect 0% loss   (pod 1 unaffected)
+
+[GROUND-TRUTH]
+Affected component: router_core_2 ospfd
+Mechanism: router_core_2 is pod 2's only way out: switch_dist_2_1's single
+  uplink (172.16.0.8/31, area 1) terminates on router_core_2, which as the
+  pod-2 ABR carries 10.2.1.0/24 between area 1 and the area-0 backbone. With
+  ospfd killed, zebra flushes router_core_2's OSPF routes immediately, so
+  pod-2 traffic arriving at router_core_2 has no route and dies there; the
+  other routers then age out router_core_2's LSAs and withdraw 10.2.1.0/24.
+  Pod 1 (host -> switch_dist_1_1 -> router_core_1 -> router_core_3 -> farm)
+  never transits router_core_2, so it stays healthy.
+Localization: router_core_2
+Root cause: ospfd not running on router_core_2
+Fix: restart FRR on router_core_2 (`service frr restart`).
+
+Observable note (same kill pattern lab-verified on this topology 2026-07-03):
+ospfd is killed together with watchfrr (its watchdog), so nothing respawns it.
+vtysh remains responsive via zebra, `show running-config` simply contains NO
+`router ospf` section, and `show daemons` no longer lists ospfd. An agent may
+therefore correctly describe this fault as "the ospf configuration is
+missing/empty on router_core_2" -- that is the same fault observed at the
+config plane, and must NOT be treated as a wrong root cause.
+
+[FIX]
+Restart FRR / the OSPF daemon on router_core_2 (`service frr restart`).
+Unlike the vtysh-provisioned Kath labs, this topology keeps its OSPF config
+in /etc/frr/frr.conf (the injection killed the process, not the file), so a
+plain restart reloads the full configuration, OSPF re-converges, and pod 2
+regains connectivity.
+
+[DIAGNOSTIC-PROCESS]
+1. Scope the symptom: host_2_1_1_1 reaches its gateway 10.2.1.1 but nothing
+   beyond it, while pod 1 and the server farm are fine -- the break is on
+   pod 2's transit path, at or above switch_dist_2_1's uplink.
+2. Follow the path up: switch_dist_2_1's uplink interface is UP but its OSPF
+   adjacency toward router_core_2 is gone and its table has lost all remote
+   prefixes.
+3. Check the routing daemon on router_core_2: `pgrep ospfd` is empty; vtysh
+   `show daemons` no longer lists ospfd and `show running-config` has no
+   `router ospf` section -- the OSPF daemon is dead.
+4. Correlate: router_core_2's interfaces are all UP; router_core_1 and
+   router_core_3 have dropped their adjacencies to router_core_2 and
+   withdrawn 10.2.1.0/24 from their tables.
+5. Localize to router_core_2 ospfd: rule out the physical uplink (UP), the
+   access layer (gateway reachable), and the backbone (pod 1 healthy).
+
+[SCORING-AXES]
+assert-identifies: router_core_2
+must-identify-device: router_core_2
+must-identify-component: ospfd / OSPF daemon down
+bonus-scopes-blast-radius: notes pod 1 and the server farm stay healthy, isolating the fault to pod 2's transit through router_core_2
+# These axes score the outcome metric only; fix and reasoning are judged separately.
+
+[NIKA-LABEL]
+nika_label: frr_service_down
+nika_category: NETWORK_NODE_ERROR
+in_taxonomy: true

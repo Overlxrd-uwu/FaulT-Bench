@@ -1,0 +1,71 @@
+[AGENT] sade starts on lab=ospf_enterprise_static
+[TOOL] ToolSearch({'query': 'select:mcp__kathara_base_mcp_server__get_reachability'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_base_mcp_server__get_reachability'}]
+[TOOL] mcp__kathara_base_mcp_server__get_reachability({})
+[RESULT] {"result":"{\"hosts\":{\"host_1_1_1_1\":\"10.1.1.2\",\"host_2_1_1_1\":\"10.2.1.2\",\"web_server_0\":\"10.200.0.3\",\"web_server_1\":\"10.200.0.4\",\"web_server_2\":\"10.200.0.5\",\"web_server_3\":\"10.200.0.6\",\"dns_server\":\"10.200.0.2\"},\"results\":[{\"src\":\"dns_server\",\"dst\":\"web_server_2\",\"dst_ip\":\"10.200.0.5\",\"tx\":2,\"rx\":2,\"loss_percent\":0.0,\"time_ms\":1064.0,\"rtt_avg_ms
+[TEXT] **Phase 1 complete.** Clear pattern: every row with `host_2_1_1_1` as source OR destination shows `status="unknown"` with null tx/rx/loss. `host_1_1_1_1` ↔ server farm is all green (0% loss). This matches the symptom report exactly.
+
+Per the rules, `status="unknown"` rows require a direct-IP confirmation probe before entering a fault-family skill. Loading exec_shell and running simultaneous direct-IP checks now.
+[TOOL] ToolSearch({'query': 'select:mcp__kathara_base_mcp_server__exec_shell'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_base_mcp_server__exec_shell'}]
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'host_2_1_1_1', 'command': 'ping -c2 10.200.0.5'})
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'web_server_0', 'command': 'ping -c2 10.2.1.2'})
+[RESULT] {"result":"PING 10.200.0.5 (10.200.0.5) 56(84) bytes of data.\nFrom 10.2.1.1 icmp_seq=1 Destination Net Unreachable\nFrom 10.2.1.1 icmp_seq=2 Destination Net Unreachable\n\n--- 10.200.0.5 ping statistics ---\n2 packets transmitted, 0 received, +2 errors, 100% packet loss, time 1060ms"}
+[RESULT] {"result":"PING 10.2.1.2 (10.2.1.2) 56(84) bytes of data.\nFrom 10.200.0.1 icmp_seq=1 Destination Net Unreachable\nFrom 10.200.0.1 icmp_seq=2 Destination Net Unreachable\n\n--- 10.2.1.2 ping statistics ---\n2 packets transmitted, 0 received, +2 errors, 100% packet loss, time 1060ms"}
+[TEXT] **Phase 2 — Real symptom confirmed.** Both direct-IP pings fail with **ICMP Destination Net Unreachable** — not a name-resolution issue:
+- `host_2_1_1_1` → 10.200.0.5: **"From 10.2.1.1 Destination Net Unreachable"** (its own gateway can't route forward)
+- `web_server_0` → 10.2.1.2: **"From 10.200.0.1 Destination Net Unreachable"** (server-farm gateway can't route back to pod 2)
+
+Yet `host_1_1_1_1` works fine. This is a routing black-hole specific to the pod-2 path. With FRR/OSPF running on all routers, this maps to `ospf-fault-skill`. Entering now.
+[TOOL] Skill({'skill': 'ospf-fault-skill'})
+[RESULT] Launching skill: ospf-fault-skill
+[TEXT] The skill directs me to run `ospf_snapshot.py` for one-pass coverage before any raw probes. Loading the helper tool and running it now.
+[TOOL] ToolSearch({'query': 'select:mcp__helper_server__run_helper'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__helper_server__run_helper'}]
+[TOOL] mcp__helper_server__run_helper({'script_name': 'ospf_snapshot'})
+[RESULT] {"result":"=== OSPF SNAPSHOT ===\nLab: ospf_enterprise_static\nRouters scanned: 6\nFlags:\n  - router_core_1: OSPF interface eth0 on point-to-point link 172.16.0.0/31 has 0 neighbors (area=0.0.0.0) — adjacency never formed\n  - router_core_2: no OSPF network statements\n  - router_core_2: zero OSPF neighbors\n  - router_core_3: OSPF interface eth1 on point-to-point link 172.16.0.5/31 has 0 neighbo
+[TEXT] The snapshot is conclusive. The key finding jumps out immediately:
+
+**`router_core_2` has NO OSPF configuration and its ospfd daemon is NOT running:**
+- `ospfd=no` (daemon down)
+- `Areas (from config): (none)` — zero network statements
+- `Neighbors: 0`, `OSPF routes: 0`
+
+Compare with every other FRR device which shows `ospfd=yes` and 8 OSPF routes each. The snapshot also flags this explicitly: *"router_core_2: no OSPF network statements"* and *"router_core_2: zero OSPF neighbors"*.
+
+The cascade is clear:
+- `switch_dist_2_1` connects upward only through `router_core_2` (eth0, `172.16.0.9/31`, area 0.0.0.1). With `router_core_2` dark, it forms **0 OSPF adjacencies** and knows only 3 routes (its own local prefix + link).
+- `router_core_1` (eth0) and `router_core_3` (eth1) both show **0 neighb
+[FINAL] stop=end_turn tool_calls=8
+[SUBMITTED] parsed_ok=True is_anomaly=True faulty_devices=['router_core_2']
+[FINAL-TEXT] The snapshot is conclusive. The key finding jumps out immediately:
+
+**`router_core_2` has NO OSPF configuration and its ospfd daemon is NOT running:**
+- `ospfd=no` (daemon down)
+- `Areas (from config): (none)` — zero network statements
+- `Neighbors: 0`, `OSPF routes: 0`
+
+Compare with every other FRR device which shows `ospfd=yes` and 8 OSPF routes each. The snapshot also flags this explicitly: *"router_core_2: no OSPF network statements"* and *"router_core_2: zero OSPF neighbors"*.
+
+The cascade is clear:
+- `switch_dist_2_1` connects upward only through `router_core_2` (eth0, `172.16.0.9/31`, area 0.0.0.1). With `router_core_2` dark, it forms **0 OSPF adjacencies** and knows only 3 routes (its own local prefix + link).
+- `router_core_1` (eth0) and `router_core_3` (eth1) both show **0 neighbors** on their `router_core_2`-facing interfaces — confirming the blackout is bilateral.
+- The server-farm router (`switch_server_access`) never learns the `10.2.1.0/24` prefix, so it returns "Destination Net Unreachable" on the reverse path.
+- Pod 1 (`switch_dist_1_1` → `router_core_1`) is completely unaffected — it has 1 full OSPF neighbor and 8 routes.
+
+This is a confirmed **`ospf_neighbor_missing`** fault on `router_core_2`.
+
+=== DIAGNOSIS ===
+is_anomaly: true
+faulty_devices: router_core_2
+diagnosis_text:
+**Affected component:** The OSPF routing daemon (ospfd) and its configuration on `router_core_2`, the core router serving pod-2's uplink path.
+
+**Mechanism:** `router_core_2` is completely absent from the OSPF control plane. Its ospfd process is not running (`ospfd=no`) and it has zero OSPF network statements configured — no areas, no advertised prefixes, no neighbors. Because `switch_dist_2_1` (gateway 10.2.1.1 for pod 2) has `router_core_2` as its sole OSPF uplink (via `172.16.0.9/31`, area 0.0.0.1), it forms zero adjacencies and learns only 3 local routes. It therefore has no path to the server farm (`10.200.0.x`) or to pod 1 (`10.1.1.0/24`), and replies with "Destination Net Unreachable" for all inter-pod traffic sourced from `host_2_1_1_1`. Symmetrically, `router_core_2`'s absence means `10.2.1.0/24` is never injected into the backbone (area 0.0.0.0), so the server-farm gateway (`switch_server_access`, 10.200.0.1) has no return route to pod 2 either.
+
+**Localization:** `router_core_2` — all three of its interfaces (eth0 toward `router_core_1`, eth1 toward `router_core_3`, eth2 toward `switch_dist_2_1`) are silent in OSPF. Pod 1 and the server farm operate normally because they route through `router_core_1` and `router_core_3`, which maintain healthy full adjacencies with each other.
+
+**Root cause:** `router_core_2` has no OSPF network statements configured and its ospfd daemon is not running, removing it entirely from the routing domain.
+
+**Fix:** On `router_core_2`, start ospfd and add the three missing `network` statements — `172.16.0.0/31 area 0.0.0.0`, `172.16.0.4/31 area 0.0.0.0`, and `172.16.0.8/31 area 0.0.0.1` — to restore adjacencies with `router_core_1`, `router_core_3`, and `switch_dist_2_1` respectively.
+=== END ===

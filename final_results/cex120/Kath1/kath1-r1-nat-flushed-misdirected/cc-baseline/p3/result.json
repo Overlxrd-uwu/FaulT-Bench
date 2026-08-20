@@ -1,0 +1,166 @@
+{
+  "scenario": {
+    "scenario_id": "kath1-r1-nat-flushed-misdirected",
+    "topology": "Kath1",
+    "fault_family": "NAT misconfig (misdirected prompt)",
+    "prompt_to_agent": "Ticket #5092: PC1 (10.1.0.100) can ping the corporate gateway and Office-B\ninternal devices fine, and DNS resolves names, but no TCP connection to any\npublic Internet server completes -- they all time out. The outage started\naround the time of an ISP maintenance notice, so the network team is convinced\nthe ISP (ISPA) dropped our circuit and wants us to open a fault ticket with\nISPA. Please confirm the ISP-side outage so we can escalate to the carrier.",
+    "injection": {
+      "device": "r1",
+      "action": "flush nat table",
+      "command": "iptables -t nat -F POSTROUTING",
+      "note": null
+    },
+    "pre_check": [],
+    "post_inject_check": [
+      {
+        "device": "r1",
+        "command": "iptables -t nat -nL POSTROUTING | grep -c MASQUERADE",
+        "expect": "0"
+      },
+      {
+        "device": "pc1",
+        "command": "curl -s -m 5 -o /dev/null -w \"%{http_code}\" http://203.0.113.1",
+        "expect": "0"
+      }
+    ],
+    "ground_truth": "The root cause is IDENTICAL to kath1-r1-nat-flushed: r1's iptables nat\nPOSTROUTING chain has been flushed, so its MASQUERADE rules are gone. r1 is the\nNAT boundary for all internal /24 subnets (A-PC, B-PC, A-Mgmt, B-Mgmt, Wi-Fi).\nWithout MASQUERADE, outbound packets from 10.x leave r1's WAN interface with\ntheir RFC1918 source addresses unchanged; ISPA's ACL 100 silently drops RFC1918\nsource ranges at the WAN edge, so the connections time out with no reply.\nInternal traffic is unaffected because it never crosses r1.\n\nThe TWIST: the ticket blames the ISP and wants a carrier escalation. The ISP\nlink and egress are FINE -- this is a local NAT failure on r1, not a circuit\noutage. The \"Internet down\" framing plus an ISP maintenance notice is a\ncoincidence/red herring; ISPA is doing exactly what its policy says (dropping\nunNATed RFC1918 sources), which is the expected behaviour for correctly-NATed\ntraffic and is not a fault. Decisive tells that the WAN is up: r1's default\nroute is present and its OSPF/WAN adjacency to ISPA is intact, and traffic\nthat IS correctly translated (or r1's own sourced traffic) would egress\nnormally -- only the internal 10.x hosts, whose NAT was removed, are affected.\n\nCorrect diagnosis: is_anomaly=true, faulty_devices = r1 (iptables nat\nPOSTROUTING MASQUERADE rules missing). The agent must localize from the NAT\nevidence and explicitly NOT escalate to ISPA / NOT confirm an ISP outage. An\nagent that \"confirms the ISP circuit is down\" has followed the accusation\ninstead of the evidence. Fix: re-add the MASQUERADE rules on r1 (re-run the\nrelevant block from r1.startup).",
+    "fix_spec": "re-add MASQUERADE rules for each internal subnet via\n  iptables, or re-run the relevant block from r1.startup.",
+    "scoring_axes": [
+      "assert-identifies: r1",
+      "assert-not-identifies: ispa",
+      "must-identify-nat-missing: NAT / iptables nat POSTROUTING / MASQUERADE rules flushed on r1",
+      "bonus-isp-link-fine: exonerates the ISP side by any verified mechanism -- e.g. the WAN link/egress is healthy and unmasqueraded RFC1918 sources cannot return (whether described as ISPA ingress policy or as the ISP having no route back to 10.0.0.0/8)"
+    ],
+    "source_path": "dataset/kath1_Q/cex/kath1-r1-nat-flushed-misdirected.txt",
+    "scenario_class": "wrong-device",
+    "ticket_style": "standard"
+  },
+  "agent": "cc-baseline",
+  "timestamp": "2026-08-01T02:20:09.252952+00:00",
+  "phases": {
+    "lstart": {
+      "ok": true,
+      "containers": 20,
+      "expected": 20
+    },
+    "settle": {
+      "converge_wait": 90
+    },
+    "injection": {
+      "applied": true,
+      "skipped_reason": null,
+      "rc": 0,
+      "output": ""
+    },
+    "post_inject_check": {
+      "results": [
+        {
+          "line": {
+            "device": "r1",
+            "command": "iptables -t nat -nL POSTROUTING | grep -c MASQUERADE",
+            "expect": "0"
+          },
+          "passed": true,
+          "actual": "0",
+          "rationale": "got 0, expected 0"
+        },
+        {
+          "line": {
+            "device": "pc1",
+            "command": "curl -s -m 5 -o /dev/null -w \"%{http_code}\" http://203.0.113.1",
+            "expect": "0"
+          },
+          "passed": true,
+          "actual": "000",
+          "rationale": "got 0, expected 0"
+        }
+      ],
+      "wait_seconds": 0
+    },
+    "agent": {
+      "diagnosis_text": "The fault is a missing source-NAT (MASQUERADE) rule on r1's iptables POSTROUTING chain. ISPA is an ISP router that intentionally enforces an RFC1918 ingress-filter on its customer-facing interface (eth0): three iptables INPUT and FORWARD DROP rules block any packet arriving from 10.0.0.0/8, 172.16.0.0/12, or 192.168.0.0/16. This is a standing security policy \u2014 not a misconfiguration \u2014 and it has never changed. ISPA's drop counter already shows 5 hit packets, confirming live RFC1918 traffic is being silently discarded.\n\nr1 is the corporate edge router. It holds a kernel static default route to ISPA (203.0.113.1 via eth2). A destination-NAT rule for inbound port-forwarding (203.0.113.113 \u2192 10.5.0.4) is present in PREROUTING, but the companion outbound SNAT/MASQUERADE rule in POSTROUTING is completely absent. Consequently, every packet that leaves the corporate network toward ISPA carries its original private source address (e.g., 10.1.0.100 for PC1). ISPA receives it, the RFC1918 ingress-filter fires, and the packet is dropped \u2014 the TCP SYN never completes, producing the reported timeout.\n\nDNS works because the resolver in use is an internal one (traffic never leaves the corporate fabric). Internal pings succeed because they never traverse the r1\u2192ISPA segment. When r1 itself pings ISPA's loopback using its own public address 203.0.113.2 the ping succeeds 3/3 with zero loss, proving ISPA is fully operational.\n\nThe ISPA circuit is not down; there is no ISP-side fault to escalate. The root cause is the removal of the SNAT rule from r1. The corrective fix is to restore it: `iptables -t nat -A POSTROUTING -o eth2 -j MASQUERADE` (and optionally mirror it on eth3 for the ISPB backup path).",
+      "is_anomaly": true,
+      "faulty_devices": [
+        "r1"
+      ],
+      "parsed_ok": true,
+      "in_tokens": 12,
+      "cache_read_tokens": 170103,
+      "cache_write_tokens": 40417,
+      "out_tokens": 22426,
+      "cost_usd": 0.54171465,
+      "tool_calls": 17,
+      "hit_max_turns": false,
+      "error": null
+    },
+    "score": {
+      "must_passed": 3,
+      "must_total": 3,
+      "bonus_passed": 1,
+      "bonus_total": 1,
+      "outcome_score": 1.0,
+      "fix_score": 1.0,
+      "reasoning_score": 0.9,
+      "reasoning_dims": {
+        "grounding": 0.9,
+        "causality": 0.9,
+        "coverage": 0.9
+      },
+      "final_score": 1.0,
+      "per_axis": [
+        {
+          "axis": "assert-identifies: r1",
+          "kind": "assert",
+          "score": 1.0,
+          "rationale": "culprit 'r1' named (good)"
+        },
+        {
+          "axis": "assert-not-identifies: ispa",
+          "kind": "assert",
+          "score": 1.0,
+          "rationale": "decoy 'ispa' absent (good)"
+        },
+        {
+          "axis": "must-identify-nat-missing: NAT / iptables nat POSTROUTING / MASQUERADE rules flushed on r1",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "Agent explicitly identifies that r1's iptables nat POSTROUTING MASQUERADE rule is missing and recommends restoring it."
+        },
+        {
+          "axis": "bonus-isp-link-fine: exonerates the ISP side by any verified mechanism -- e.g. the WAN link/egress is healthy and unmasqueraded RFC1918 sources cannot return (whether described as ISPA ingress policy or as the ISP having no route back to 10.0.0.0/8)",
+          "kind": "bonus",
+          "score": 1.0,
+          "rationale": "Agent explicitly exonerates the ISP by citing ISPA's RFC1918 ingress-filter with drop counters and successful pings from r1 to ISPA's address, proving the WAN/egress is up and the ISP is not at fault."
+        },
+        {
+          "axis": "[FIX]",
+          "kind": "fix",
+          "score": 1.0,
+          "rationale": "Recommends restoring the missing POSTROUTING MASQUERADE rule (iptables -t nat -A POSTROUTING -o eth2 -j MASQUERADE), which matches the expected fix."
+        },
+        {
+          "axis": "reason:grounding",
+          "kind": "reason-dim",
+          "score": 0.9,
+          "rationale": "The agent's investigation log shows the key observations (r1 routing present, ISPA DROP rules for RFC1918 with hit counters, successful ping from r1's public IP and failed ping from PC1) that support the missing-MASQUERADE diagnosis; a minor ungrounded assertion about an inbound DNAT rule and an unsupported absolute claim that ISP policy 'has never changed' reduce perfection slightly."
+        },
+        {
+          "axis": "reason:causality",
+          "kind": "reason-dim",
+          "score": 0.9,
+          "rationale": "The agent's investigation log shows the key observations (r1 routing present, ISPA DROP rules for RFC1918 with hit counters, successful ping from r1's public IP and failed ping from PC1) that support the missing-MASQUERADE diagnosis; a minor ungrounded assertion about an inbound DNAT rule and an unsupported absolute claim that ISP policy 'has never changed' reduce perfection slightly."
+        },
+        {
+          "axis": "reason:coverage",
+          "kind": "reason-dim",
+          "score": 0.9,
+          "rationale": "The agent's investigation log shows the key observations (r1 routing present, ISPA DROP rules for RFC1918 with hit counters, successful ping from r1's public IP and failed ping from PC1) that support the missing-MASQUERADE diagnosis; a minor ungrounded assertion about an inbound DNAT rule and an unsupported absolute claim that ISP policy 'has never changed' reduce perfection slightly."
+        }
+      ],
+      "judge_model": "gpt-5-mini",
+      "reasoning_mode": "trace",
+      "error": null
+    }
+  },
+  "agent_input_prompt": "# Topology overview (devices + L2 connectivity)\nTopology: Kath1\n\nDevices:\n  aswa1: eth0=CD_CLIENT_A1, eth1=CD_LINK_A2, eth2=CD_DSW_1_A1, eth3=CD_DSW_2_A1\n  aswa2: eth0=link_a2_pc, eth1=CD_DSW_1_A2, eth2=CD_DSW_2_A2\n  aswa3: eth0=CD_CLIENT_A3, eth1=CD_DSW_1_A3, eth2=CD_DSW_2_A3\n  aswb1: eth0=CD_CLIENT_B1, eth1=CD_DSW_1_B1, eth2=CD_DSW_2_B1\n  aswb2: eth0=CD_CLIENT_B2, eth1=CD_DSW_1_B2, eth2=CD_DSW_2_B2\n  aswb3: eth0=CD_CLIENT_B3, eth1=CD_DSW_1_B3, eth2=CD_DSW_2_B3\n  csw1: eth0=CD_WAN_LINK_1, eth1=CD_CORE_PEER_1, eth2=CD_CORE_PEER_2, eth3=CD_CORE_1_DSW1, eth4=CD_CORE_1_DSW2, eth5=CD_CORE_1_DSWB1, eth6=CD_CORE_1_DSWB2\n  csw2: eth0=CD_WAN_LINK_2, eth1=CD_CORE_PEER_1, eth2=CD_CORE_PEER_2, eth3=CD_CORE_2_DSW1, eth4=CD_CORE_2_DSW2, eth5=CD_CORE_2_DSWB1, eth6=CD_CORE_2_DSWB2\n  dswa1: eth0=CD_DSW_1_A1, eth1=CD_DSW_1_A2, eth2=CD_DSW_1_A3, eth3=CD_DSW_PEER_1, eth4=CD_DSW_PEER_2, eth5=CD_CORE_1_DSW1, eth6=CD_CORE_2_DSW1\n  dswa2: eth0=CD_DSW_2_A1, eth1=CD_DSW_2_A2, eth2=CD_DSW_2_A3, eth3=CD_DSW_PEER_1, eth4=CD_DSW_PEER_2, eth5=CD_CORE_1_DSW2, eth6=CD_CORE_2_DSW2\n  dswb1: eth0=CD_DSW_1_B1, eth1=CD_DSW_1_B2, eth2=CD_DSW_1_B3, eth3=CD_DSW_PEER_B_1, eth4=CD_DSW_PEER_B_2, eth5=CD_CORE_1_DSWB1, eth6=CD_CORE_2_DSWB1\n  dswb2: eth0=CD_DSW_2_B1, eth1=CD_DSW_2_B2, eth2=CD_DSW_2_B3, eth3=CD_DSW_PEER_B_1, eth4=CD_DSW_PEER_B_2, eth5=CD_CORE_1_DSWB2, eth6=CD_CORE_2_DSWB2\n  ispa: eth0=CD_ISP_R1, eth1=CD_ISPA_ISPB\n  ispb: eth0=CD_ISPB_R1, eth1=CD_ISPA_ISPB\n  laptop1: eth0=CD_LINK_A2\n  pc1: eth0=link_a2_pc\n  pc2: eth0=CD_CLIENT_A3\n  pc3: eth0=CD_CLIENT_B2\n  r1: eth0=CD_WAN_LINK_1, eth1=CD_WAN_LINK_2, eth2=CD_ISP_R1, eth3=CD_ISPB_R1\n  srv1: eth0=CD_CLIENT_B3\n\nCollision domains (shared L2 segments):\n  CD_CLIENT_A1: aswa1.eth0\n  CD_CLIENT_A3: aswa3.eth0, pc2.eth0\n  CD_CLIENT_B1: aswb1.eth0\n  CD_CLIENT_B2: aswb2.eth0, pc3.eth0\n  CD_CLIENT_B3: aswb3.eth0, srv1.eth0\n  CD_CORE_1_DSW1: csw1.eth3, dswa1.eth5\n  CD_CORE_1_DSW2: csw1.eth4, dswa2.eth5\n  CD_CORE_1_DSWB1: csw1.eth5, dswb1.eth5\n  CD_CORE_1_DSWB2: csw1.eth6, dswb2.eth5\n  CD_CORE_2_DSW1: csw2.eth3, dswa1.eth6\n  CD_CORE_2_DSW2: csw2.eth4, dswa2.eth6\n  CD_CORE_2_DSWB1: csw2.eth5, dswb1.eth6\n  CD_CORE_2_DSWB2: csw2.eth6, dswb2.eth6\n  CD_CORE_PEER_1: csw1.eth1, csw2.eth1\n  CD_CORE_PEER_2: csw1.eth2, csw2.eth2\n  CD_DSW_1_A1: aswa1.eth2, dswa1.eth0\n  CD_DSW_1_A2: aswa2.eth1, dswa1.eth1\n  CD_DSW_1_A3: aswa3.eth1, dswa1.eth2\n  CD_DSW_1_B1: aswb1.eth1, dswb1.eth0\n  CD_DSW_1_B2: aswb2.eth1, dswb1.eth1\n  CD_DSW_1_B3: aswb3.eth1, dswb1.eth2\n  CD_DSW_2_A1: aswa1.eth3, dswa2.eth0\n  CD_DSW_2_A2: aswa2.eth2, dswa2.eth1\n  CD_DSW_2_A3: aswa3.eth2, dswa2.eth2\n  CD_DSW_2_B1: aswb1.eth2, dswb2.eth0\n  CD_DSW_2_B2: aswb2.eth2, dswb2.eth1\n  CD_DSW_2_B3: aswb3.eth2, dswb2.eth2\n  CD_DSW_PEER_1: dswa1.eth3, dswa2.eth3\n  CD_DSW_PEER_2: dswa1.eth4, dswa2.eth4\n  CD_DSW_PEER_B_1: dswb1.eth3, dswb2.eth3\n  CD_DSW_PEER_B_2: dswb1.eth4, dswb2.eth4\n  CD_ISPA_ISPB: ispa.eth1, ispb.eth1\n  CD_ISPB_R1: ispb.eth0, r1.eth3\n  CD_ISP_R1: ispa.eth0, r1.eth2\n  CD_LINK_A2: aswa1.eth1, laptop1.eth0\n  CD_WAN_LINK_1: csw1.eth0, r1.eth0\n  CD_WAN_LINK_2: csw2.eth0, r1.eth1\n  link_a2_pc: aswa2.eth0, pc1.eth0\n\n# Symptom (user report)\nTicket #5092: PC1 (10.1.0.100) can ping the corporate gateway and Office-B\ninternal devices fine, and DNS resolves names, but no TCP connection to any\npublic Internet server completes -- they all time out. The outage started\naround the time of an ISP maintenance notice, so the network team is convinced\nthe ISP (ISPA) dropped our circuit and wants us to open a fault ticket with\nISPA. Please confirm the ISP-side outage so we can escalate to the carrier."
+}

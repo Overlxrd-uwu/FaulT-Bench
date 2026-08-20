@@ -1,0 +1,188 @@
+{
+  "scenario": {
+    "scenario_id": "simple-bgp-pc2-no-default-route",
+    "topology": "simple_bgp",
+    "fault_family": "host misconfig (missing default route)",
+    "prompt_to_agent": "The user on pc2 (200.1.1.2) reports every attempt to reach the\npartner network fails instantly with \"Network is unreachable\" --\nno timeout, an immediate error. pc2 still reaches its own gateway\n200.1.1.1 fine. The partner side reports pings from pc1 to pc2\ntime out. It started right after maintenance on pc2. Diagnose.",
+    "injection": {
+      "device": "pc2",
+      "action": "delete pc2's default route (host left with only its connected subnet)",
+      "command": "ip route del default",
+      "note": null
+    },
+    "pre_check": [],
+    "post_inject_check": [
+      {
+        "device": "pc2",
+        "command": "ip route show default | grep -c via",
+        "expect": "0"
+      },
+      {
+        "device": "pc2",
+        "command": "ping -c 2 -W 2 195.11.14.1 >/dev/null 2>&1; echo $?",
+        "expect": "2"
+      },
+      {
+        "device": "pc1",
+        "command": "ping -W2 -c2 200.1.1.2",
+        "expect": "loss>0"
+      }
+    ],
+    "ground_truth": "Affected component: pc2 default route / gateway configuration\nMechanism: pc2's default route (via 200.1.1.1) has been deleted,\n  leaving only the connected 200.1.1.0/24 route. Any packet to an\n  off-subnet destination fails immediately in pc2's own kernel\n  with ENETUNREACH (\"Network is unreachable\") -- nothing is even\n  transmitted, which is why the error is instant rather than a\n  timeout. On-subnet traffic to 200.1.1.1 still works. The network\n  side is fully healthy: router2 still advertises 200.1.1.0/24,\n  the eBGP session is Established, and pc1's pings ARE delivered\n  to pc2 -- but pc2 has no route for the replies, so pc1 sees\n  timeouts.\nLocalization: pc2\nRoot cause: missing default route on pc2 (no gateway configured)\nFix: `ip route add default via 200.1.1.1 dev eth0` on pc2",
+    "fix_spec": "Restore pc2's default route -- `ip route add default via 200.1.1.1 dev eth0`\non pc2. Off-subnet connectivity returns immediately; no router or BGP change\nis needed.",
+    "scoring_axes": [
+      "assert-identifies: pc2",
+      "must-identify-device: pc2 (host-side issue)",
+      "must-identify-component: missing default route (no gateway configured)",
+      "must-explain-instant-error: ties the instant \"Network is unreachable\" to a local routing-table miss on pc2, not a network-side failure",
+      "bonus-exonerates-network: notes the eBGP session, the prefix advertisements and delivery to pc2 are all healthy; only pc2's replies are unroutable"
+    ],
+    "source_path": "dataset/nika_bgp_Q/base/simple-bgp-pc2-no-default-route.txt",
+    "scenario_class": "base",
+    "ticket_style": "standard"
+  },
+  "agent": "cc-baseline",
+  "timestamp": "2026-08-04T13:11:56.113909+00:00",
+  "phases": {
+    "lstart": {
+      "ok": true,
+      "containers": 4,
+      "expected": 4
+    },
+    "settle": {
+      "converge_wait": 90
+    },
+    "injection": {
+      "applied": true,
+      "skipped_reason": null,
+      "rc": 0,
+      "output": ""
+    },
+    "post_inject_check": {
+      "results": [
+        {
+          "line": {
+            "device": "pc2",
+            "command": "ip route show default | grep -c via",
+            "expect": "0"
+          },
+          "passed": true,
+          "actual": "0",
+          "rationale": "got 0, expected 0"
+        },
+        {
+          "line": {
+            "device": "pc2",
+            "command": "ping -c 2 -W 2 195.11.14.1 >/dev/null 2>&1; echo $?",
+            "expect": "2"
+          },
+          "passed": true,
+          "actual": "2",
+          "rationale": "got 2, expected 2"
+        },
+        {
+          "line": {
+            "device": "pc1",
+            "command": "ping -W2 -c2 200.1.1.2",
+            "expect": "loss>0"
+          },
+          "passed": true,
+          "actual": "PING 200.1.1.2 (200.1.1.2) 56(84) bytes of data.\n\n--- 200.1.1.2 ping statistics ---\n2 packets transmitted, 0 received, 100% packet loss, time 1087ms",
+          "rationale": "loss=100%"
+        }
+      ],
+      "wait_seconds": 0
+    },
+    "agent": {
+      "diagnosis_text": "The fault is entirely confined to pc2's kernel routing table. During\nmaintenance, pc2's default route was removed and never restored. After\nthe maintenance window, pc2's table contains only the directly-connected\nprefix 200.1.1.0/24 (its own LAN); there is no default gateway entry and\nno route to the partner subnet 195.11.14.0/24.\n\nWhen pc2 tries to reach any address outside its own /24, the Linux kernel\nfinds no matching route \u2014 not even a catch-all default \u2014 and immediately\nreturns ENETUNREACH to the application. This produces the \"Network is\nunreachable\" error the user sees instantly, with no timeout, because the\nfailure happens in the local routing lookup before any packet is ever sent.\n\nThe reverse direction (pc1 \u2192 pc2 timing out) is a consequence of the same\nmissing route: packets from pc1 travel correctly through router1 (which\nhas the BGP-learned 200.1.1.0/24 route) and are delivered to pc2, but\npc2's ICMP echo-reply is addressed to 195.11.14.2 \u2014 a destination for\nwhich pc2 has no route \u2014 so the replies are silently discarded, causing\none-way reachability and the observed timeout on pc1.\n\nrouter1 and router2 are healthy: BGP session is established, both routers\ncorrectly advertise and receive each other's prefixes, and router2's\ngateway interface (eth1, 200.1.1.1/24) is fully up.\n\nRoot cause: pc2's default route (`default via 200.1.1.1`) was deleted\nduring maintenance and not re-added.\n\nCorrective fix: on pc2, run `ip route add default via 200.1.1.1` to\nrestore immediate connectivity. For persistence across reboots, add the\nequivalent entry to pc2's startup configuration (e.g., /etc/network/interfaces\nor the Kathara startup script).",
+      "is_anomaly": true,
+      "faulty_devices": [
+        "pc2"
+      ],
+      "parsed_ok": true,
+      "in_tokens": 8,
+      "cache_read_tokens": 38430,
+      "cache_write_tokens": 11886,
+      "out_tokens": 3219,
+      "cost_usd": 0.10515649999999999,
+      "tool_calls": 9,
+      "hit_max_turns": false,
+      "error": null
+    },
+    "score": {
+      "must_passed": 4,
+      "must_total": 4,
+      "bonus_passed": 1,
+      "bonus_total": 1,
+      "outcome_score": 1.0,
+      "fix_score": 1.0,
+      "reasoning_score": 0.9,
+      "reasoning_dims": {
+        "grounding": 0.8,
+        "causality": 1.0,
+        "coverage": 0.9
+      },
+      "final_score": 1.0,
+      "per_axis": [
+        {
+          "axis": "assert-identifies: pc2",
+          "kind": "assert",
+          "score": 1.0,
+          "rationale": "culprit 'pc2' named (good)"
+        },
+        {
+          "axis": "must-identify-device: pc2 (host-side issue)",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "Diagnosis explicitly identifies pc2 as the affected host and states the missing default route on that device."
+        },
+        {
+          "axis": "must-identify-component: missing default route (no gateway configured)",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The report explicitly identifies that pc2's default route/gateway was deleted and not re-added and recommends adding 'ip route add default via 200.1.1.1'."
+        },
+        {
+          "axis": "must-explain-instant-error: ties the instant \"Network is unreachable\" to a local routing-table miss on pc2, not a network-side failure",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The agent explicitly attributes the instant ENETUNREACH to pc2's local routing lookup missing a default route, stating the kernel returns the error immediately before any packet is sent."
+        },
+        {
+          "axis": "bonus-exonerates-network: notes the eBGP session, the prefix advertisements and delivery to pc2 are all healthy; only pc2's replies are unroutable",
+          "kind": "bonus",
+          "score": 1.0,
+          "rationale": "The report explicitly states the BGP session is established, routers advertise and receive prefixes, packets from pc1 reach pc2, and only pc2 lacks a route for replies, thereby exonerating the network."
+        },
+        {
+          "axis": "[FIX]",
+          "kind": "fix",
+          "score": 1.0,
+          "rationale": "The agent correctly instructs adding the default route on pc2 (ip route add default via 200.1.1.1) and suggests making it persistent, which matches the expected fix."
+        },
+        {
+          "axis": "reason:grounding",
+          "kind": "reason-dim",
+          "score": 0.8,
+          "rationale": "The agent directly observed pc2's routing table lacking a default and pc2's interface/ip, which suffices to justify the diagnosis; however assertions about router BGP state and delivered pings are not explicitly shown in the truncated logs."
+        },
+        {
+          "axis": "reason:causality",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "The agent directly observed pc2's routing table lacking a default and pc2's interface/ip, which suffices to justify the diagnosis; however assertions about router BGP state and delivered pings are not explicitly shown in the truncated logs."
+        },
+        {
+          "axis": "reason:coverage",
+          "kind": "reason-dim",
+          "score": 0.9,
+          "rationale": "The agent directly observed pc2's routing table lacking a default and pc2's interface/ip, which suffices to justify the diagnosis; however assertions about router BGP state and delivered pings are not explicitly shown in the truncated logs."
+        }
+      ],
+      "judge_model": "gpt-5-mini",
+      "reasoning_mode": "trace",
+      "error": null
+    }
+  },
+  "agent_input_prompt": "# Topology overview (devices + L2 connectivity)\nTopology: simple_bgp\n\nDevices:\n  Routers (FRR): router1, router2\n  Hosts: pc1, pc2\n\nLinks (device:iface <-> device:iface):\n  router1:eth0 <-> router2:eth0\n  router1:eth1 <-> pc1:eth0\n  router2:eth1 <-> pc2:eth0\n\n# Symptom (user report)\nThe user on pc2 (200.1.1.2) reports every attempt to reach the\npartner network fails instantly with \"Network is unreachable\" --\nno timeout, an immediate error. pc2 still reaches its own gateway\n200.1.1.1 fine. The partner side reports pings from pc1 to pc2\ntime out. It started right after maintenance on pc2. Diagnose."
+}

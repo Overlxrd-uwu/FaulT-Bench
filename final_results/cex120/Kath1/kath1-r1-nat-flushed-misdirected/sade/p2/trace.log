@@ -1,0 +1,69 @@
+[AGENT] sade starts on lab=Kath1
+[TOOL] ToolSearch({'query': 'select:mcp__kathara_base_mcp_server__get_reachability'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_base_mcp_server__get_reachability'}]
+[TOOL] mcp__kathara_base_mcp_server__get_reachability({})
+[RESULT] {"result":"{\"hosts\":{\"pc1\":\"10.1.0.100\",\"pc2\":\"10.1.0.101\",\"pc3\":\"10.3.0.100\"},\"results\":[{\"src\":\"pc1\",\"dst\":\"pc2\",\"dst_ip\":\"10.1.0.101\",\"tx\":2,\"rx\":2,\"loss_percent\":0.0,\"time_ms\":1105.0,\"rtt_avg_ms\":1.217,\"rtt_min_ms\":1.191,\"rtt_max_ms\":1.244,\"rtt_mdev_ms\":0.026,\"status\":\"ok\"},{\"src\":\"pc1\",\"dst\":\"pc3\",\"dst_ip\":\"10.3.0.100\",\"tx\":2,\"rx\
+[TEXT] **Phase 1 result:** The reachability map tests only internal host pairs (pc1↔pc2, pc1↔pc3, pc2↔pc3) — all show 0% loss. No loss is evidenced from Phase 1's output.
+
+**Phase 2 branch:** The reported symptom (TCP to public Internet timing out) is NOT confirmed by Phase 1's evidence. Internal paths are clean. → Escalate to **Phase 4: broad-search**.
+[TOOL] Skill({'skill': 'diagnosis-methodology-skill'})
+[RESULT] Launching skill: diagnosis-methodology-skill
+[TEXT] **Phase A — L2 and infrastructure triage.** Running both triage helpers in parallel.
+[TOOL] ToolSearch({'query': 'select:mcp__helper_server__run_helper'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__helper_server__run_helper'}]
+[TOOL] mcp__helper_server__run_helper({'script_name': 'infra_sweep'})
+[TOOL] mcp__helper_server__run_helper({'script_name': 'l2_snapshot'})
+[RESULT] {"result":"Unknown machine type: ispb with image kathara/dhcp\nUnknown machine type: r1 with image kathara/dhcp\nUnknown machine type: ispa with image kathara/dhcp\nUnknown machine type: ispb with image kathara/dhcp\nUnknown machine type: r1 with image kathara/dhcp\nUnknown machine type: ispa with image kathara/dhcp\n=== INFRA SWEEP ===\nLab: Kath1\nScope: hosts, routers, switches, servers, bmv2_s
+[RESULT] {"result":"Unknown machine type: ispb with image kathara/dhcp\nUnknown machine type: r1 with image kathara/dhcp\nUnknown machine type: ispa with image kathara/dhcp\n=== L2 SNAPSHOT ===\nLab: Kath1\nScope: hosts, routers, switches, servers, bmv2_switches, ovs_switches, sdn_controllers, other_devices\nDevices scanned: 20\nDuplicate MAC groups: 0\nFlagged devices: 4\nDevices with bridge members: 8\nD
+[TEXT] **Phase A findings — key anomalies:**
+
+1. **`ispa`** has nftables ACL rules on `eth0` dropping RFC 1918 source prefixes (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`). Critically, the `10.0.0.0/8` rule shows **`packets 5 bytes 300 drop`** — live hit counter, real drops already occurring.
+2. **`ispb`** has the same rules, but counters are zero (no traffic tried this path yet).
+3. **`dswa1`/`dswa2`** have rules dropping 10.1.0.0/24 → 10.3.0.0/24, but counter is zero (not relevant to the reported symptom).
+4. **`r1`** only drops SSH — no other ACL flags.
+
+**Active lead:** Packets arriving at `ispa.eth0` (from `r1`) with private source IPs are being dropped by anti-spoofing ACL rules — 5 packets confirmed dropped. This is a direct ACL-family symptom. Entering the ACL skill.
+[TOOL] Skill({'skill': 'acl-skill'})
+[RESULT] Launching skill: acl-skill
+[TEXT] **ACL skill in action.** `infra_sweep` already found the drop fingerprint on `ispa`. Now I need the full `nft list ruleset` on `ispa` to characterise the rules, and on `r1` to check whether NAT/masquerade is configured (private IPs arriving at an ISP with no NAT would be the root cause of the rule hits).
+[TOOL] ToolSearch({'query': 'select:mcp__kathara_base_mcp_server__exec_shell'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_base_mcp_server__exec_shell'}]
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'ispa', 'command': 'nft list ruleset'})
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'r1', 'command': 'nft list ruleset'})
+[RESULT] {"result":"table ip nat {\n\tchain DOCKER_OUTPUT {\n\t\tip daddr 127.0.0.11 tcp dport 53 counter packets 0 bytes 0 dnat to 127.0.0.11:33827\n\t\tip daddr 127.0.0.11 udp dport 53 counter packets 0 bytes 0 dnat to 127.0.0.11:59526\n\t}\n\n\tchain OUTPUT {\n\t\ttype nat hook output priority -100; policy accept;\n\t\tip daddr 127.0.0.11 counter packets 0 bytes 0 jump DOCKER_OUTPUT\n\t}\n\n\tchain DOCK
+[RESULT] {"result":"table ip nat {\n\tchain DOCKER_OUTPUT {\n\t\tip daddr 127.0.0.11 tcp dport 53 counter packets 0 bytes 0 dnat to 127.0.0.11:40835\n\t\tip daddr 127.0.0.11 udp dport 53 counter packets 0 bytes 0 dnat to 127.0.0.11:32812\n\t}\n\n\tchain OUTPUT {\n\t\ttype nat hook output priority -100; policy accept;\n\t\tip daddr 127.0.0.11 counter packets 0 bytes 0 jump DOCKER_OUTPUT\n\t}\n\n\tchain DOCK
+[TEXT] **Confirming evidence found. Advancing directly to Phase 5.**
+
+Key findings:
+- **`r1` POSTROUTING NAT chain is empty** — no masquerade/SNAT rule exists. The `POSTROUTING` chain is declared but completely devoid of any outbound NAT rule.
+- **`ispa` INPUT chain** drops RFC 1918 sources on `eth0` (the r1-facing interface). The `10.0.0.0/8` counter shows **5 packets / 300 bytes already dropped** — confirming live traffic from PC1's private subnet is hitting and being blocked by this rule.
+- `r1` does have a `PREROUTING` DNAT entry (`203.0.113.113 → 10.5.0.4`), proving the NAT table was intentionally set up; only the outbound SNAT/masquerade rule is absent.
+- `ispb` has the same anti-spoofing rules but zero-byte counters — confirming no fallback path is in use.
+
+The ISP circuit is **up and heal
+[FINAL] stop=end_turn tool_calls=10
+[SUBMITTED] parsed_ok=True is_anomaly=True faulty_devices=['r1']
+[FINAL-TEXT] **Confirming evidence found. Advancing directly to Phase 5.**
+
+Key findings:
+- **`r1` POSTROUTING NAT chain is empty** — no masquerade/SNAT rule exists. The `POSTROUTING` chain is declared but completely devoid of any outbound NAT rule.
+- **`ispa` INPUT chain** drops RFC 1918 sources on `eth0` (the r1-facing interface). The `10.0.0.0/8` counter shows **5 packets / 300 bytes already dropped** — confirming live traffic from PC1's private subnet is hitting and being blocked by this rule.
+- `r1` does have a `PREROUTING` DNAT entry (`203.0.113.113 → 10.5.0.4`), proving the NAT table was intentionally set up; only the outbound SNAT/masquerade rule is absent.
+- `ispb` has the same anti-spoofing rules but zero-byte counters — confirming no fallback path is in use.
+
+The ISP circuit is **up and healthy**. The anti-spoofing rules on `ispa` are standard BCP38 behaviour (drop ingress packets bearing private source addresses). They are not the fault. The fault is the absence of a masquerade rule on `r1`.
+
+=== DIAGNOSIS ===
+is_anomaly: true
+faulty_devices: r1
+diagnosis_text:
+**Affected component:** The `POSTROUTING` NAT chain on `r1` (the campus edge/WAN router). There is no `masquerade` or `SNAT` rule for outbound traffic.
+
+**Mechanism:** When PC1 (10.1.0.100) initiates a TCP connection to a public Internet server, the packet is routed through the corporate fabric to `r1` and then forwarded unchanged — with its private source IP intact — to `ispa` via `r1.eth2`. ISPA's `eth0` INPUT chain applies a standard BCP38 anti-spoofing filter that drops any ingress packet whose source address falls within RFC 1918 ranges (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`). The `10.0.0.0/8` counter on `ispa` already shows 5 dropped packets (300 bytes), confirming real traffic is being silently discarded. Because the TCP SYN never reaches the Internet, no SYN-ACK is returned, and the connection times out from PC1's perspective.
+
+**Localization:** `r1`'s `nft` NAT table contains a `POSTROUTING` chain that is **completely empty** — no `masquerade` or `snat` rule is present. The PREROUTING DNAT entry (`203.0.113.113 → 10.5.0.4`) proves the NAT table was intentionally configured; the outbound masquerade rule was either accidentally deleted or never applied after the maintenance window.
+
+**Root cause:** `r1` is missing the outbound SNAT/masquerade rule, so private-sourced packets reach `ispa` unmodified and are dropped by ISPA's legitimate anti-spoofing policy. The ISP circuit is fully operational.
+
+**Fix:** Add a masquerade rule on `r1` for each ISP-facing interface: `nft add rule ip nat POSTROUTING oifname "eth2" ip saddr 10.0.0.0/8 masquerade` (repeat for `eth3`/ispb path). Do NOT raise a fault ticket with ISPA.
+=== END ===

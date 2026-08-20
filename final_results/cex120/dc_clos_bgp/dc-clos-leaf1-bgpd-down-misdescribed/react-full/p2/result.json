@@ -1,0 +1,174 @@
+{
+  "scenario": {
+    "scenario_id": "dc-clos-leaf1-bgpd-down-misdescribed",
+    "topology": "dc_clos_bgp",
+    "fault_family": "routing daemon down (misdescribed ticket)",
+    "prompt_to_agent": "Helpdesk ticket #9102: A user on pc_0_0 (10.0.0.2) reports they cannot reach\npc_0_1 (10.0.1.2). The team insists the problem is at the far end -- they say\n\"pc_0_1 has a bad host NIC or a loose cable\" and want the host's cabling\nreseated. Please find and confirm the real fault and tell us which device to\nrestart.",
+    "injection": {
+      "device": "leaf_router_0_1",
+      "action": "kill the BGP routing daemon (and watchfrr) on leaf_router_0_1",
+      "command": "pkill -9 watchfrr; pkill -9 bgpd",
+      "note": null
+    },
+    "pre_check": [],
+    "post_inject_check": [
+      {
+        "device": "leaf_router_0_1",
+        "command": "pgrep bgpd",
+        "expect": "empty"
+      },
+      {
+        "device": "pc_0_0",
+        "command": "ping -W2 -c2 10.0.1.2",
+        "expect": "loss>0"
+      },
+      {
+        "device": "leaf_router_0_1",
+        "command": "ip -br link show eth2 | grep -c UP",
+        "expect": "1"
+      }
+    ],
+    "ground_truth": "The real fault is on leaf_router_0_1: its BGP daemon (bgpd) is dead, so this\nleaf -- the top-of-rack for pc_0_1 -- loses its fabric BGP sessions and stops\nlearning/advertising routes through the CLOS fabric. As a result the\npc_0_0 <-> pc_0_1 path fails. The ticket MISDESCRIBES the fault as a host-side\nproblem, but the host link is fine: leaf_router_0_1's host-facing interface\n(eth2 -> pc_0_1) is UP, so there is no bad NIC / loose cable. The break is in\nthe fabric control plane on the leaf, not in pc_0_1's access cabling.\n\nThe correct diagnosis identifies leaf_router_0_1 (bgpd down) as the faulty\ndevice and explicitly REJECTS the host-NIC/cable cause: the leaf's host-facing\neth2 is UP and pc_0_1 is connected at L1/L2, so reseating the host cabling\nfixes nothing. An agent that blames pc_0_1's NIC / cable has followed the\nticket's misdescription instead of the evidence.\n\nObservable note (lab-verified 2026-07-03): bgpd is killed together with watchfrr (its watchdog), so nothing respawns it. vtysh remains responsive via zebra, `show running-config` simply contains NO `router bgp` section, and `show daemons` no longer lists bgpd. An agent may therefore correctly describe this fault as \"the bgp configuration is missing/empty on leaf_router_0_1\" -- that is the same fault observed at the config plane, and must NOT be treated as a wrong root cause.",
+    "fix_spec": "Restart FRR/bgpd on leaf_router_0_1 (`service frr restart`). Once bgpd comes\nback and re-establishes its BGP sessions with the spines, leaf_router_0_1\nrelearns and re-advertises the host prefixes and pc_0_0 reaches pc_0_1 again.\npc_0_1's host NIC/cabling needs no change.",
+    "scoring_axes": [
+      "assert-identifies: leaf_router_0_1",
+      "must-identify-bgpd-down: identifies bgpd on leaf_router_0_1 is down, not a host NIC/cable fault",
+      "bonus-rules-out-host-link: rules out the \"bad host cabling\" cause by any valid evidence -- either end of the host-leaf link shown UP/passing traffic (e.g. pc_0_1 eth0 healthy, or ICMP errors returned FROM the leaf prove the link forwards)"
+    ],
+    "source_path": "dataset/nika_clos_Q/cex/dc-clos-leaf1-bgpd-down-misdescribed.txt",
+    "scenario_class": "wrong-cause",
+    "ticket_style": "standard"
+  },
+  "agent": "react-full",
+  "timestamp": "2026-07-31T00:20:17.661363+00:00",
+  "phases": {
+    "lstart": {
+      "ok": true,
+      "containers": 7,
+      "expected": 7
+    },
+    "settle": {
+      "converge_wait": 90
+    },
+    "injection": {
+      "applied": true,
+      "skipped_reason": null,
+      "rc": 0,
+      "output": ""
+    },
+    "post_inject_check": {
+      "results": [
+        {
+          "line": {
+            "device": "leaf_router_0_1",
+            "command": "pgrep bgpd",
+            "expect": "empty"
+          },
+          "passed": true,
+          "actual": "",
+          "rationale": "output empty"
+        },
+        {
+          "line": {
+            "device": "pc_0_0",
+            "command": "ping -W2 -c2 10.0.1.2",
+            "expect": "loss>0"
+          },
+          "passed": true,
+          "actual": "PING 10.0.1.2 (10.0.1.2) 56(84) bytes of data.\nFrom 172.16.0.0 icmp_seq=1 Destination Net Unreachable\nFrom 10.0.0.1 icmp_seq=2 Destination Net Unreachable\n\n--- 10.0.1.2 ping statistics ---\n2 packets transmitted, 0 received, +2 errors, 100% packet loss, time 1000ms",
+          "rationale": "loss=100%"
+        },
+        {
+          "line": {
+            "device": "leaf_router_0_1",
+            "command": "ip -br link show eth2 | grep -c UP",
+            "expect": "1"
+          },
+          "passed": true,
+          "actual": "1",
+          "rationale": "got 1, expected 1"
+        }
+      ],
+      "wait_seconds": 0
+    },
+    "agent": {
+      "diagnosis_text": "Affected component: The FRRouting (FRR) control-plane daemon on leaf_router_0_1 has failed, causing BGP on that leaf to be down.\n\nMechanism: With BGP down on leaf_router_0_1, the 10.0.1.0/24 network (pc_0_1\u2019s LAN) is not being advertised upstream to the spines, nor is 10.0.0.0/24 learned from the fabric. Consequently, each leaf only knows its directly connected subnet and returns ICMP \u201cDestination Net Unreachable\u201d for the remote subnet.\n\nLocalization: \n- Host symptoms: \n  - pc_0_0 \u2192 pc_0_1: \u201cFrom 10.0.0.1 Destination Net Unreachable\u201d\n  - pc_0_1 \u2192 pc_0_0: \u201cFrom 10.0.1.1 Destination Net Unreachable\u201d\n  These messages come from the respective leaf SVIs.\n- Control-plane evidence:\n  - systemctl on leaf_router_0_1: frr.service Active: failed (failed).\n  - leaf_router_0_0 routing table: only connected routes; no 10.0.1.0/24 present.\n  - Spines have BGP for 10.0.0.0/24 but no route to 10.0.1.0/24, confirming 10.0.1.0/24 isn\u2019t being advertised by leaf_router_0_1.\n\nRoot cause: The FRR service on leaf_router_0_1 is stopped/failed, which broke BGP adjacencies and withdrew 10.0.1.0/24 from the fabric.\n\nCorrective fix: Restart FRR on leaf_router_0_1 (systemctl restart frr). This will reestablish BGP sessions to the spines, re-advertise 10.0.1.0/24, and restore reachability between pc_0_0 and pc_0_1. No host NIC/cabling issues are indicated by the data-plane or control-plane evidence.",
+      "is_anomaly": true,
+      "faulty_devices": [
+        "leaf_router_0_1"
+      ],
+      "parsed_ok": true,
+      "in_tokens": 4142,
+      "cache_read_tokens": 9344,
+      "cache_write_tokens": 0,
+      "out_tokens": 2927,
+      "cost_usd": 0.0356155,
+      "tool_calls": 12,
+      "hit_max_turns": false,
+      "error": null
+    },
+    "score": {
+      "must_passed": 2,
+      "must_total": 2,
+      "bonus_passed": 1,
+      "bonus_total": 1,
+      "outcome_score": 1.0,
+      "fix_score": 1.0,
+      "reasoning_score": 0.9,
+      "reasoning_dims": {
+        "grounding": 0.9,
+        "causality": 0.9,
+        "coverage": 0.9
+      },
+      "final_score": 1.0,
+      "per_axis": [
+        {
+          "axis": "assert-identifies: leaf_router_0_1",
+          "kind": "assert",
+          "score": 1.0,
+          "rationale": "culprit 'leaf_router_0_1' named (good)"
+        },
+        {
+          "axis": "must-identify-bgpd-down: identifies bgpd on leaf_router_0_1 is down, not a host NIC/cable fault",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The agent explicitly diagnoses FRR/bgpd on leaf_router_0_1 as failed (BGP down) and rejects a host NIC/cable cause, matching the axis requirement."
+        },
+        {
+          "axis": "bonus-rules-out-host-link: rules out the \"bad host cabling\" cause by any valid evidence -- either end of the host-leaf link shown UP/passing traffic (e.g. pc_0_1 eth0 healthy, or ICMP errors returned FROM the leaf prove the link forwards)",
+          "kind": "bonus",
+          "score": 1.0,
+          "rationale": "The report notes ICMP \u2018Destination Net Unreachable\u2019 messages originating from the leaf SVI and explicitly rejects host NIC/cabling faults, which validly rules out a bad host link."
+        },
+        {
+          "axis": "[FIX]",
+          "kind": "fix",
+          "score": 1.0,
+          "rationale": "Restarting the FRR service on leaf_router_0_1 to restore BGP and re-advertise the missing prefix matches the expected corrective action."
+        },
+        {
+          "axis": "reason:grounding",
+          "kind": "reason-dim",
+          "score": 0.9,
+          "rationale": "The agent's investigation shows FRR is failed on leaf_router_0_1 and the data-plane symptoms and routing queries support the conclusion that BGP routes for 10.0.1.0/24 are absent, so the diagnosis that the leaf's control-plane (bgp via FRR) is the fault is well supported."
+        },
+        {
+          "axis": "reason:causality",
+          "kind": "reason-dim",
+          "score": 0.9,
+          "rationale": "The agent's investigation shows FRR is failed on leaf_router_0_1 and the data-plane symptoms and routing queries support the conclusion that BGP routes for 10.0.1.0/24 are absent, so the diagnosis that the leaf's control-plane (bgp via FRR) is the fault is well supported."
+        },
+        {
+          "axis": "reason:coverage",
+          "kind": "reason-dim",
+          "score": 0.9,
+          "rationale": "The agent's investigation shows FRR is failed on leaf_router_0_1 and the data-plane symptoms and routing queries support the conclusion that BGP routes for 10.0.1.0/24 are absent, so the diagnosis that the leaf's control-plane (bgp via FRR) is the fault is well supported."
+        }
+      ],
+      "judge_model": "gpt-5-mini",
+      "reasoning_mode": "trace",
+      "error": null
+    }
+  },
+  "agent_input_prompt": "# Topology overview (devices + L2 connectivity)\nTopology: dc_clos_bgp\n\nDevices:\n  Routers (FRR): leaf_router_0_0, leaf_router_0_1, spine_router_0_0, spine_router_0_1, super_spine_router_0\n  Hosts: pc_0_0, pc_0_1\n\nLinks (device:iface <-> device:iface):\n  leaf_router_0_0:eth2 <-> pc_0_0:eth0\n  leaf_router_0_1:eth2 <-> pc_0_1:eth0\n  spine_router_0_0:eth1 <-> leaf_router_0_0:eth0\n  spine_router_0_0:eth2 <-> leaf_router_0_1:eth0\n  spine_router_0_1:eth1 <-> leaf_router_0_0:eth1\n  spine_router_0_1:eth2 <-> leaf_router_0_1:eth1\n  super_spine_router_0:eth0 <-> spine_router_0_0:eth0\n  super_spine_router_0:eth1 <-> spine_router_0_1:eth0\n\n# Symptom (user report)\nHelpdesk ticket #9102: A user on pc_0_0 (10.0.0.2) reports they cannot reach\npc_0_1 (10.0.1.2). The team insists the problem is at the far end -- they say\n\"pc_0_1 has a bad host NIC or a loose cable\" and want the host's cabling\nreseated. Please find and confirm the real fault and tell us which device to\nrestart."
+}

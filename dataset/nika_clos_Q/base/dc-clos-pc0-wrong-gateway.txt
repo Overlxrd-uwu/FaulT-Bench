@@ -1,0 +1,79 @@
+==================================================
+Scenario: dc-clos-pc0-wrong-gateway
+Topology: dc_clos_bgp
+Fault family: host misconfig (wrong default gateway)
+==================================================
+
+[PROMPT-TO-AGENT]
+A user on pc_0_0 (10.0.0.2) reports they lost all connectivity across
+the fabric after a workstation maintenance task -- pc_0_1 (10.0.1.2)
+and everything else is unreachable. pc_0_0 can still ping 10.0.0.1.
+No other device in the fabric shows any alarm: all BGP sessions are
+Established, all links are UP, and leaf_router_0_0 is forwarding
+normally for the rest of the network. What is wrong with pc_0_0
+specifically?
+
+[INJECTION]
+device: pc_0_0
+action: point the default route at a nonexistent gateway
+cmd: |
+  ip route del default
+  ip route add default via 10.0.0.254 dev eth0
+
+[POST-INJECT-CHECK]
+pc_0_0   ip route show default | grep -c "10.0.0.254"  => expect 1
+pc_0_0   ping -W2 -c2 10.0.1.2                         => expect loss>0
+pc_0_0   ping -W2 -c2 10.0.0.1                         => expect 0% loss   (on-link gateway still OK)
+
+[GROUND-TRUTH]
+Affected component: pc_0_0 default route
+Mechanism: pc_0_0's correct configuration is 10.0.0.2/24 on eth0 with
+  `default via 10.0.0.1` (leaf_router_0_0's host-facing eth2). The
+  default route was repointed at 10.0.0.254, an address that does not
+  exist on the 10.0.0.0/24 segment, so every off-subnet packet ARPs
+  for a next-hop that never answers and is dropped on the host. On-link
+  traffic (including the real gateway 10.0.0.1) still works because it
+  uses the connected /24 route, not the default. Traffic FROM pc_0_1
+  toward pc_0_0 is still delivered, but pc_0_0's replies chase the
+  dead next-hop, so the ping fails in both directions. The entire
+  fabric is healthy; the fault is purely host-side.
+Localization: pc_0_0
+Root cause: pc_0_0's default route points at 10.0.0.254 (nonexistent)
+  instead of 10.0.0.1
+Fix: restore the default route on pc_0_0 --
+  `ip route del default && ip route add default via 10.0.0.1 dev eth0`
+
+[FIX]
+restore pc_0_0's default route --
+`ip route del default && ip route add default via 10.0.0.1 dev eth0`
+
+[DIAGNOSTIC-PROCESS]
+1. Scope to the host: only pc_0_0 is affected; the fabric shows no
+   alarms and leaf_router_0_0 forwards normally -- suspect the endpoint,
+   not the network.
+2. Inspect pc_0_0's routing: `ip route` shows
+   `default via 10.0.0.254 dev eth0` -- the next-hop is not the leaf's
+   gateway address 10.0.0.1.
+3. Confirm the next-hop is dead: 10.0.0.254 answers neither ping nor
+   ARP (`ip neigh` shows the entry FAILED/incomplete) -- off-subnet
+   packets have nowhere to go, while the connected 10.0.0.0/24 route
+   still reaches 10.0.0.1.
+4. Cross-check from the far side: pc_0_1's packets reach pc_0_0 (the
+   fabric routes are intact), but no replies come back -- consistent
+   with a host-side egress fault rather than a fabric fault.
+5. Localize to pc_0_0's misconfigured default route: no daemon, link or
+   BGP fault anywhere; repointing the default at 10.0.0.1 restores
+   connectivity.
+
+[SCORING-AXES]
+assert-identifies: pc_0_0
+must-identify-device: pc_0_0 (host-side issue)
+must-identify-component: default route / wrong gateway (10.0.0.254 instead of 10.0.0.1)
+bonus-explains-dead-nexthop: explains (by any valid evidence) that 10.0.0.254 does not exist on the segment, so ARP for the next-hop fails and off-subnet packets are dropped at the host
+bonus-exonerates-fabric: explicitly notes the fabric and leaf_router_0_0 are healthy (sessions Established, routes present), so no network-side change is needed
+# These axes score the outcome metric only; fix and reasoning are judged separately.
+
+[NIKA-LABEL]
+nika_label: host_incorrect_gateway
+nika_category: END_HOST_FAILURE
+in_taxonomy: true

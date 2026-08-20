@@ -1,0 +1,173 @@
+{
+  "scenario": {
+    "scenario_id": "simple-bgp-router1-neighbor-removed",
+    "topology": "simple_bgp",
+    "fault_family": "BGP neighbor statement removed",
+    "prompt_to_agent": "pc1 (195.11.14.2) has lost all connectivity to the partner AS --\npings to pc2 (200.1.1.2) fail. The partner operator says their\nrouter2 shows the eBGP session to us as down and keeps retrying,\nand swears they changed nothing on their side. Our router1 is up\nand pc1 can still reach its gateway 195.11.14.1. Find what broke.",
+    "injection": {
+      "device": "router1",
+      "action": "remove the eBGP neighbor statement for router2 from router1's BGP config",
+      "command": "vtysh -c \"configure terminal\" \\\n        -c \"router bgp 1\" \\\n        -c \"no neighbor 193.10.11.2\" \\\n        -c \"exit\" -c \"exit\"",
+      "note": null
+    },
+    "pre_check": [],
+    "post_inject_check": [
+      {
+        "device": "router1",
+        "command": "vtysh -c \"show running-config\" | grep -c \"neighbor 193.10.11.2\"",
+        "expect": "0"
+      },
+      {
+        "device": "pc1",
+        "command": "ping -W2 -c2 200.1.1.2",
+        "expect": "loss>0"
+      }
+    ],
+    "ground_truth": "Affected component: router1 BGP configuration (neighbor statement)\nMechanism: router1's `router bgp 1` section no longer contains\n  `neighbor 193.10.11.2 remote-as 2`. Deleting the peer tears the\n  eBGP session down immediately: router1 loses the learned route\n  to 200.1.1.0/24 and stops advertising 195.11.14.0/24, so pc1 and\n  pc2 lose each other in both directions. bgpd is still RUNNING on\n  router1 (pgrep bgpd is non-empty) and `router bgp 1` with its\n  `network 195.11.14.0/24` line is still present -- only the\n  neighbor definition is gone. router2 is healthy: its config and\n  daemon are intact and it cycles trying to re-establish, because\n  router1 no longer has it configured as a peer.\nLocalization: router1\nRoot cause: BGP neighbor statement for 193.10.11.2 (remote-as 2)\n  missing from router1's configuration\nFix: re-add the neighbor statement on router1 (see [FIX])",
+    "fix_spec": "Re-add the neighbor on router1:\n`vtysh -c \"configure terminal\" -c \"router bgp 1\" -c \"neighbor 193.10.11.2 remote-as 2\"`\nThe eBGP session re-establishes and the inter-AS prefixes are re-exchanged.\n(A `service frr restart` on router1 also restores it, since /etc/frr/frr.conf\non disk was never modified.)",
+    "scoring_axes": [
+      "assert-identifies: router1",
+      "must-identify-device: router1",
+      "must-identify-component: BGP neighbor statement for 193.10.11.2 missing from router1's config",
+      "must-distinguish-from-daemon-down: recognizes bgpd is still running on router1 and the peer is unconfigured, not a crashed daemon or a link failure",
+      "bonus-exonerates-router2: notes router2's config/daemon are intact and its session retries fail only because router1 no longer has the peer configured"
+    ],
+    "source_path": "dataset/nika_bgp_Q/base/simple-bgp-router1-neighbor-removed.txt",
+    "scenario_class": "base",
+    "ticket_style": "standard"
+  },
+  "agent": "sade",
+  "timestamp": "2026-08-04T13:42:42.680709+00:00",
+  "phases": {
+    "lstart": {
+      "ok": true,
+      "containers": 4,
+      "expected": 4
+    },
+    "settle": {
+      "converge_wait": 90
+    },
+    "injection": {
+      "applied": true,
+      "skipped_reason": null,
+      "rc": 0,
+      "output": ""
+    },
+    "post_inject_check": {
+      "results": [
+        {
+          "line": {
+            "device": "router1",
+            "command": "vtysh -c \"show running-config\" | grep -c \"neighbor 193.10.11.2\"",
+            "expect": "0"
+          },
+          "passed": true,
+          "actual": "0",
+          "rationale": "got 0, expected 0"
+        },
+        {
+          "line": {
+            "device": "pc1",
+            "command": "ping -W2 -c2 200.1.1.2",
+            "expect": "loss>0"
+          },
+          "passed": true,
+          "actual": "PING 200.1.1.2 (200.1.1.2) 56(84) bytes of data.\nFrom 195.11.14.1 icmp_seq=1 Destination Net Unreachable\nFrom 195.11.14.1 icmp_seq=2 Destination Net Unreachable\n\n--- 200.1.1.2 ping statistics ---\n2 packets transmitted, 0 received, +2 errors, 100% packet loss, time 1066ms",
+          "rationale": "loss=100%"
+        }
+      ],
+      "wait_seconds": 0
+    },
+    "agent": {
+      "diagnosis_text": "**Affected component:** BGP neighbor configuration on router1's FRR `bgpd` daemon.\n\n**Mechanism:** An eBGP session between router1 (AS 1) and router2 (AS 2) requires both sides to declare each other as neighbors. Router2 is correctly configured with `neighbor 193.10.11.1 remote-as 1`, pointing at router1's eth0 address, and its BGP process is actively retrying the TCP connection (state: Active). Router1, however, has **no `neighbor` statement at all** in its `router bgp 1` block \u2014 it will never initiate a connection to router2 and will reject any unsolicited TCP SYN on port 179 (since no peer is expected). The eBGP session therefore never reaches Established.\n\n**Localization:** router1, `router bgp 1` stanza \u2014 the `neighbor 193.10.11.2 remote-as 2` line (and corresponding `address-family ipv4 unicast` activation) is absent.\n\n**Cascade:** Without an established eBGP session, neither router installs the other's prefix (195.11.14.0/24 and 200.1.1.0/24) into its routing table. When pc1 sends traffic toward 200.1.1.2, router1 has no route for that prefix and returns ICMP Destination Net Unreachable; router2 does the same in the opposite direction. pc1 can still reach its gateway (router1:eth1 at 195.11.14.1) because that is a directly-attached L3 hop \u2014 only inter-AS traffic is broken.\n\n**Root cause:** The `neighbor` statement pointing to router2 was removed from (or never committed to) router1's FRR BGP configuration.\n\n**Fix:** In router1's FRR config, add `neighbor 193.10.11.2 remote-as 2` under `router bgp 1`, and activate it in the `address-family ipv4 unicast` block. This will allow the eBGP session to establish, exchange prefix advertisements, and restore end-to-end connectivity between pc1 and pc2.",
+      "is_anomaly": true,
+      "faulty_devices": [
+        "router1"
+      ],
+      "parsed_ok": true,
+      "in_tokens": 23,
+      "cache_read_tokens": 147489,
+      "cache_write_tokens": 17885,
+      "out_tokens": 4411,
+      "cost_usd": 0.17828745,
+      "tool_calls": 14,
+      "hit_max_turns": false,
+      "error": null
+    },
+    "score": {
+      "must_passed": 4,
+      "must_total": 4,
+      "bonus_passed": 1,
+      "bonus_total": 1,
+      "outcome_score": 1.0,
+      "fix_score": 1.0,
+      "reasoning_score": 0.9666666666666667,
+      "reasoning_dims": {
+        "grounding": 0.9,
+        "causality": 1.0,
+        "coverage": 1.0
+      },
+      "final_score": 1.0,
+      "per_axis": [
+        {
+          "axis": "assert-identifies: router1",
+          "kind": "assert",
+          "score": 1.0,
+          "rationale": "culprit 'router1' named (good)"
+        },
+        {
+          "axis": "must-identify-device: router1",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The agent explicitly locates the fault on router1 (mentions router1 in Affected component and Localization sections)."
+        },
+        {
+          "axis": "must-identify-component: BGP neighbor statement for 193.10.11.2 missing from router1's config",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The agent explicitly identifies that the `neighbor 193.10.11.2 remote-as 2` statement is missing from router1's `router bgp 1` configuration."
+        },
+        {
+          "axis": "must-distinguish-from-daemon-down: recognizes bgpd is still running on router1 and the peer is unconfigured, not a crashed daemon or a link failure",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The report pinpoints a missing neighbor statement on router1 and explains the session failure as a configuration issue (not a daemon crash or link fault), implying bgpd is running and the peer is unconfigured."
+        },
+        {
+          "axis": "bonus-exonerates-router2: notes router2's config/daemon are intact and its session retries fail only because router1 no longer has the peer configured",
+          "kind": "bonus",
+          "score": 1.0,
+          "rationale": "Agent explicitly notes router2 is correctly configured and its BGP daemon is actively retrying (state: Active), attributing the failure to router1 missing the neighbor statement."
+        },
+        {
+          "axis": "[FIX]",
+          "kind": "fix",
+          "score": 1.0,
+          "rationale": "Re-adding the neighbor and activating it under router bgp 1 on router1 matches the expected fix and will re-establish the eBGP session and route exchange."
+        },
+        {
+          "axis": "reason:grounding",
+          "kind": "reason-dim",
+          "score": 0.9,
+          "rationale": "The agent's investigation log contains direct observations (ping failures with ICMP unreachable, BGP snapshot showing router1 has zero neighbors while router2 is Active, and router1's eth0 IP), and the writeup links these observations to a missing neighbor statement. The reasoning is logically consistent and the checks cover the necessary evidence and fix."
+        },
+        {
+          "axis": "reason:causality",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "The agent's investigation log contains direct observations (ping failures with ICMP unreachable, BGP snapshot showing router1 has zero neighbors while router2 is Active, and router1's eth0 IP), and the writeup links these observations to a missing neighbor statement. The reasoning is logically consistent and the checks cover the necessary evidence and fix."
+        },
+        {
+          "axis": "reason:coverage",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "The agent's investigation log contains direct observations (ping failures with ICMP unreachable, BGP snapshot showing router1 has zero neighbors while router2 is Active, and router1's eth0 IP), and the writeup links these observations to a missing neighbor statement. The reasoning is logically consistent and the checks cover the necessary evidence and fix."
+        }
+      ],
+      "judge_model": "gpt-5-mini",
+      "reasoning_mode": "trace",
+      "error": null
+    }
+  },
+  "agent_input_prompt": "# Topology overview (devices + L2 connectivity)\nTopology: simple_bgp\n\nDevices:\n  Routers (FRR): router1, router2\n  Hosts: pc1, pc2\n\nLinks (device:iface <-> device:iface):\n  router1:eth0 <-> router2:eth0\n  router1:eth1 <-> pc1:eth0\n  router2:eth1 <-> pc2:eth0\n\n# Symptom (user report)\npc1 (195.11.14.2) has lost all connectivity to the partner AS --\npings to pc2 (200.1.1.2) fail. The partner operator says their\nrouter2 shows the eBGP session to us as down and keeps retrying,\nand swears they changed nothing on their side. Our router1 is up\nand pc1 can still reach its gateway 195.11.14.1. Find what broke."
+}

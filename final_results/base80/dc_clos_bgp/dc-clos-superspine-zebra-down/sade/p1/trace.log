@@ -1,0 +1,83 @@
+[AGENT] sade starts on lab=dc_clos_bgp
+[TOOL] ToolSearch({'query': 'select:mcp__kathara_base_mcp_server__get_reachability'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_base_mcp_server__get_reachability'}]
+[TOOL] mcp__kathara_base_mcp_server__get_reachability({})
+[RESULT] {"result":"{\"hosts\":{\"pc_0_0\":\"10.0.0.2\",\"pc_0_1\":\"10.0.1.2\"},\"results\":[{\"src\":\"pc_0_0\",\"dst\":\"pc_0_1\",\"dst_ip\":\"10.0.1.2\",\"tx\":2,\"rx\":2,\"loss_percent\":0.0,\"time_ms\":1096.0,\"rtt_avg_ms\":1.385,\"rtt_min_ms\":0.752,\"rtt_max_ms\":2.019,\"rtt_mdev_ms\":0.633,\"status\":\"ok\"},{\"src\":\"pc_0_1\",\"dst\":\"pc_0_0\",\"dst_ip\":\"10.0.0.2\",\"tx\":2,\"rx\":2,\"loss_pe
+[TEXT] **Phase 1 result:** Both host paths (pc_0_0 ↔ pc_0_1) are 0% loss, status `ok`. No L3 reachability fault. The user-reported symptom (FRR CLI daemon-connection errors on super_spine_router_0) is unconfirmed by Phase 1 evidence.
+
+→ **Phase 2 branch: no confirmed reachability symptom → Phase 4 (broad-search escalation).**
+[TOOL] Skill({'skill': 'diagnosis-methodology-skill'})
+[RESULT] Launching skill: diagnosis-methodology-skill
+[TEXT] Phase A starts now — running both triage helpers simultaneously.
+[TOOL] ToolSearch({'query': 'select:mcp__helper_server__run_helper,mcp__helper_server__list_helpers'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__helper_server__run_helper'}, {'type': 'tool_reference', 'tool_name': 'mcp__helper_server__list_helpers'}]
+[TOOL] mcp__helper_server__run_helper({'script_name': 'infra_sweep'})
+[TOOL] mcp__helper_server__run_helper({'script_name': 'l2_snapshot'})
+[RESULT] {"result":"=== INFRA SWEEP ===\nLab: dc_clos_bgp\nScope: hosts, routers, switches, servers, bmv2_switches, ovs_switches, sdn_controllers, other_devices\nDevices scanned: 7\nFlagged devices: 0\n\nCategories inspected:\n  - ACL/firewall drop fingerprints: 0 device(s) with rules matched (0 means no protocol-specific drops seen)\n  - Static ARP entries (CM/PM/PERMANENT) on hosts: 0 found\n  - Fabricat
+[RESULT] {"result":"=== L2 SNAPSHOT ===\nLab: dc_clos_bgp\nScope: hosts, routers, switches, servers, bmv2_switches, ovs_switches, sdn_controllers, other_devices\nDevices scanned: 7\nDuplicate MAC groups: 0\nFlagged devices: 0\nDevices with bridge members: 0\nDevice errors: 0\n\nAll 7 devices' L2 identity is clean (no duplicate MACs, no down/missing interfaces).\nUse --show-clean to dump per-device interfac
+[TEXT] Phase A clean — no ACL, addressing, ARP, or L2 faults. Moving to **Phase B (control-plane triage)** — BGP topology, so running `bgp_snapshot` alongside `tc_snapshot`.
+[TOOL] mcp__helper_server__run_helper({'script_name': 'bgp_snapshot'})
+[TOOL] mcp__helper_server__run_helper({'script_name': 'tc_snapshot'})
+[RESULT] {"result":"=== BGP SNAPSHOT ===\nLab: dc_clos_bgp\nRouters scanned: 5\nFlags:\n  - super_spine_router_0: missing FRR process(es): watchfrr, zebra\n\nleaf_router_0_0\n  FRR: watchfrr=yes, zebra=yes, bgpd=yes\n  ASN: 65200\n  Networks: 10.0.0.0/24\n  Loopback IPv4: 127.0.0.1/8\n  Null routes: (none)\n  BGP neighbors: 2 (Established x2)\n  Command errors: none\n\nleaf_router_0_1\n  FRR: watchfrr=yes,
+[RESULT] {"result":"=== TC SNAPSHOT ===\nLab: dc_clos_bgp\nScope: hosts, routers, switches, servers, bmv2_switches, ovs_switches, sdn_controllers, other_devices\nDevices scanned: 7\nInterfaces inspected: 16\nFlagged interfaces: 0\nDevice errors: 0\nClean qdisc profiles:\n  - fq_codel: 16\nFlagged interfaces: none\n"}
+[TEXT] **Phase B anomaly found!**
+- `super_spine_router_0`: `watchfrr=no`, `zebra=no`, but `bgpd=yes` — exactly the FRR daemon-down fingerprint.
+- tc_snapshot: fully clean.
+
+**Active lead:** FRR infrastructure daemons `watchfrr` and `zebra` are dead on `super_spine_router_0`. This matches "FRR daemon down" → `ospf-fault-skill` (which owns all FRR-daemon faults). Entering now.
+[TOOL] Skill({'skill': 'ospf-fault-skill'})
+[RESULT] Launching skill: ospf-fault-skill
+[TEXT] The skill's fingerprint for `frr_service_down` is confirmed by process-state evidence. Let me do the single confirming exec_shell on `super_spine_router_0`.
+[TOOL] ToolSearch({'query': 'select:mcp__kathara_base_mcp_server__exec_shell'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_base_mcp_server__exec_shell'}]
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'super_spine_router_0', 'command': "ps aux | grep -E 'zebra|bgpd|watchfrr|ospfd' | grep -v grep"})
+[RESULT] {"result":"frr         57  0.0  0.1 276244 13420 ?        Ssl  06:44   0:00 /usr/lib/frr/bgpd -d -F traditional --daemon -A 127.0.0.1"}
+[TEXT] **Confirming evidence is definitive:**
+
+| Daemon | Status on super_spine_router_0 |
+|--------|-------------------------------|
+| `bgpd` | ✅ Running (PID 57) |
+| `zebra` | ❌ **Not present** |
+| `watchfrr` | ❌ **Not present** |
+
+This is the `frr_service_down` fingerprint — zebra and watchfrr are dead while bgpd survives. All three user-reported symptoms are explained:
+1. **Route-table daemon-connection errors** → vtysh routes `show ip route` through zebra; zebra is gone.
+2. **Interface state unreadable via FRR CLI** → zebra owns interface state in FRR; it's down.
+3. **BGP sessions still Established** → bgpd holds its own TCP sessions independently of zebra.
+4. **No user-traffic impact** → kernel forwarding table survives zebra's death; data plane is intact.
+
+→ **Phase 5 — Final Diagnosis**
+
+
+[FINAL] stop=end_turn tool_calls=11
+[SUBMITTED] parsed_ok=True is_anomaly=True faulty_devices=['super_spine_router_0']
+[FINAL-TEXT] **Confirming evidence is definitive:**
+
+| Daemon | Status on super_spine_router_0 |
+|--------|-------------------------------|
+| `bgpd` | ✅ Running (PID 57) |
+| `zebra` | ❌ **Not present** |
+| `watchfrr` | ❌ **Not present** |
+
+This is the `frr_service_down` fingerprint — zebra and watchfrr are dead while bgpd survives. All three user-reported symptoms are explained:
+1. **Route-table daemon-connection errors** → vtysh routes `show ip route` through zebra; zebra is gone.
+2. **Interface state unreadable via FRR CLI** → zebra owns interface state in FRR; it's down.
+3. **BGP sessions still Established** → bgpd holds its own TCP sessions independently of zebra.
+4. **No user-traffic impact** → kernel forwarding table survives zebra's death; data plane is intact.
+
+→ **Phase 5 — Final Diagnosis**
+
+=== DIAGNOSIS ===
+is_anomaly: true
+faulty_devices: super_spine_router_0
+diagnosis_text:
+**Affected component:** The FRR infrastructure daemons `zebra` and `watchfrr` on `super_spine_router_0` are not running. Only `bgpd` remains alive.
+
+**Mechanism:** In FRR's architecture, `zebra` is the central routing-manager daemon responsible for synchronising routing-table state between FRR and the Linux kernel, and for managing interface state visible to the FRR CLI. `watchfrr` is the process supervisor that monitors all other FRR daemons and restarts them on failure. When `zebra` is absent, any `vtysh` command that queries route tables (e.g., `show ip route`) or interface state attempts to connect to `zebra`'s Unix socket and immediately receives a "daemon connection" error. However, `bgpd` runs as an independent process and maintains its own TCP sessions with BGP peers; existing Established sessions persist without zebra. Because the Linux kernel forwarding table was populated before zebra went down and remains intact independently of the FRR daemons, data-plane forwarding between pc_0_0 and pc_0_1 continues uninterrupted through the Clos fabric.
+
+**Localisation:** `super_spine_router_0` — process table shows only `bgpd` running; `zebra` and `watchfrr` are completely absent from the process list.
+
+**Root cause:** The `zebra` and `watchfrr` FRR daemons have crashed or been stopped on `super_spine_router_0`, leaving the BGP daemon as the sole surviving FRR process.
+
+**Fix:** Restart the FRR service stack on `super_spine_router_0`: `systemctl restart frr`. This will bring up `watchfrr`, `zebra`, and all configured daemons in dependency order, restoring full FRR CLI functionality and re-syncing zebra's routing state from `bgpd`.
+=== END ===

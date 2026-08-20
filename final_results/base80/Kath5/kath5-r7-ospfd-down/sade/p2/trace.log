@@ -1,0 +1,57 @@
+[AGENT] sade starts on lab=Kath5
+[TEXT] I'll start with Phase 1 — a topology-wide reachability map before doing anything else.
+[TOOL] ToolSearch({'query': 'select:mcp__kathara_base_mcp_server__get_reachability'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_base_mcp_server__get_reachability'}]
+[TOOL] mcp__kathara_base_mcp_server__get_reachability({})
+[RESULT] {"result":"{\"hosts\":{\"pc0\":\"20.1.1.10\",\"pc12\":\"120.1.1.10\"},\"results\":[{\"src\":\"pc0\",\"dst\":\"pc12\",\"dst_ip\":\"120.1.1.10\",\"tx\":2,\"rx\":2,\"loss_percent\":0.0,\"time_ms\":1084.0,\"rtt_avg_ms\":0.765,\"rtt_min_ms\":0.731,\"rtt_max_ms\":0.799,\"rtt_mdev_ms\":0.034,\"status\":\"ok\"},{\"src\":\"pc12\",\"dst\":\"pc0\",\"dst_ip\":\"20.1.1.10\",\"tx\":2,\"rx\":2,\"loss_percent\":0
+[TEXT] **Phase 2 — Branch.** The reachability map only tests pc0 ↔ pc12 (both ok, 0% loss). However, the user explicitly reports **missing OSPF routes** on r1 for 17.x.x.x, 67.0.0.0/8, and 70.0.0.0/8 after a change on r7. Missing routes are a real, actionable symptom. The symptom maps to an OSPF fault (R7 lost its adjacency with R6). → **Phase 3.**
+
+Active lead: R7's OSPF adjacency with R6 has broken, causing R7-originated prefixes to vanish from r1's routing table.
+[TOOL] Skill({'skill': 'ospf-fault-skill'})
+[RESULT] Launching skill: ospf-fault-skill
+[TEXT] The skill recommends running `ospf_snapshot.py` for one-pass coverage. Let me do that first.
+[TOOL] ToolSearch({'query': 'select:mcp__helper_server__run_helper'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__helper_server__run_helper'}]
+[TOOL] mcp__helper_server__run_helper({'script_name': 'ospf_snapshot'})
+[RESULT] {"result":"=== OSPF SNAPSHOT ===\nLab: Kath5\nRouters scanned: 13\nFlags:\n  - r12: no OSPF network statements\n  - r12: non-Full neighbors present: {'is': 1}\n  - r13: FRR control sockets missing (ospfd_vty) — daemon likely down\n  - r13: no OSPF network statements\n  - r13: zero OSPF neighbors\n  - r4: OSPF interface VLINK0 (45.1.1.1/8) is running in area 0.0.0.0 but the matching network stateme
+[TEXT] The snapshot has surfaced clear evidence. Key findings:
+
+- **r7**: `ospfd=no` in ps, `no OSPF network statements`, `zero OSPF neighbors`, `OSPF routes: 0`
+- **r6 eth2** (the R6↔R7 link, 67.1.1.1/8): `nbr=0, adj=0` — no neighbor ever formed
+
+This nails the fault: r7's ospfd has **no `network` statements** configured, so it never joins any OSPF area or forms the adjacency with r6. Let me pull r7's running config to confirm exactly what's missing and what the fix should be.
+[TOOL] ToolSearch({'query': 'select:mcp__kathara_frr_mcp_server__frr_show_running_config'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_frr_mcp_server__frr_show_running_config'}]
+[TOOL] mcp__kathara_frr_mcp_server__frr_show_running_config({'router_name': 'r7'})
+[RESULT] {"result":"Building configuration...\n\nCurrent configuration:\n!\nfrr version 9.1.3\nfrr defaults traditional\nhostname r7\ndomainname localdomain\nlog file /var/log/frr/frr.log\nno ipv6 forwarding\nno service integrated-vtysh-config\n!\npassword zebra\nenable password zebra\n!\nend"}
+[TEXT] This is the smoking gun. R7's running configuration contains **no `router ospf` block whatsoever** — the entire OSPF stanza has been removed. Only the bare FRR skeleton (version, hostname, logging, passwords) remains.
+
+Combined with r6's eth2 showing `nbr=0, adj=0` on the 67.x.x.x/8 link, the evidence is complete and unambiguous.
+
+=== DIAGNOSIS ===
+is_anomaly: true
+faulty_devices: r7
+diagnosis_text:
+**Affected component:** OSPF process configuration on r7 — the entire `router ospf` stanza, including all `network` statements and area declarations, has been erased from r7's FRR running configuration.
+
+**Mechanism:** Without any `network` statement, ospfd on r7 does not activate OSPF on any interface and does not join any area. It therefore never sends Hello packets on eth0 (the 67.x.x.x/8 li
+[FINAL] stop=end_turn tool_calls=7
+[SUBMITTED] parsed_ok=True is_anomaly=True faulty_devices=['r7']
+[FINAL-TEXT] This is the smoking gun. R7's running configuration contains **no `router ospf` block whatsoever** — the entire OSPF stanza has been removed. Only the bare FRR skeleton (version, hostname, logging, passwords) remains.
+
+Combined with r6's eth2 showing `nbr=0, adj=0` on the 67.x.x.x/8 link, the evidence is complete and unambiguous.
+
+=== DIAGNOSIS ===
+is_anomaly: true
+faulty_devices: r7
+diagnosis_text:
+**Affected component:** OSPF process configuration on r7 — the entire `router ospf` stanza, including all `network` statements and area declarations, has been erased from r7's FRR running configuration.
+
+**Mechanism:** Without any `network` statement, ospfd on r7 does not activate OSPF on any interface and does not join any area. It therefore never sends Hello packets on eth0 (the 67.x.x.x/8 link toward r6) and never forms an adjacency with r6. As a result, r7's locally-connected and loopback prefixes — 17.x.x.x (loopbacks), 67.0.0.0/8 (r7–r6 link), and 70.0.0.0/8 (r7 LAN on segment AA) — are never injected into the OSPF LSDB. All downstream routers, including r1, consequently have no OSPF-learned routes for those prefixes.
+
+**Localization:** r7, ospfd daemon. Confirmed by: (1) `ospf_snapshot` reporting zero OSPF network statements, zero neighbors, and zero OSPF routes on r7; (2) r6/eth2 (67.1.1.1/8, the r6–r7 link) showing `nbr=0, adj=0`; (3) `frr_show_running_config(r7)` returning a bare FRR skeleton with no `router ospf` block at all.
+
+**Root cause:** A configuration change on r7 wiped its entire OSPF configuration, leaving ospfd running but unconfigured.
+
+**Fix:** Re-add a `router ospf` block to r7's FRR configuration with `network` statements covering r7's interfaces in the correct area (area 0.0.0.1, matching r6's configuration): e.g., `network 67.0.0.0/8 area 0.0.0.1`, `network 70.0.0.0/8 area 0.0.0.1`, and `network 17.0.0.0/8 area 0.0.0.1` (loopback). This will re-establish the r7–r6 adjacency and restore all three prefix families in r1's routing table.
+=== END ===

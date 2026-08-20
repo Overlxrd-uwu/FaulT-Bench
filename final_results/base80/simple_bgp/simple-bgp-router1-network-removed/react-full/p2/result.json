@@ -1,0 +1,173 @@
+{
+  "scenario": {
+    "scenario_id": "simple-bgp-router1-network-removed",
+    "topology": "simple_bgp",
+    "fault_family": "BGP missing network advertisement",
+    "prompt_to_agent": "pc1 (195.11.14.2) reports pings to pc2 (200.1.1.2) just time out.\nThe partner operator reports the reverse direction fails too, but\ndifferently: pings from pc2 toward 195.11.14.x die immediately\nwith \"Destination Net Unreachable\" from their own gateway\n200.1.1.1. Both sides confirm the eBGP session between router1\nand router2 shows Established. Diagnose.",
+    "injection": {
+      "device": "router1",
+      "action": "remove the network advertisement for pc1's subnet from router1's BGP config",
+      "command": "vtysh -c \"configure terminal\" \\\n        -c \"router bgp 1\" \\\n        -c \"no network 195.11.14.0/24\" \\\n        -c \"exit\" -c \"exit\"",
+      "note": null
+    },
+    "pre_check": [],
+    "post_inject_check": [
+      {
+        "device": "router1",
+        "command": "vtysh -c \"show running-config\" | grep -c \"network 195.11.14.0/24\"",
+        "expect": "0"
+      },
+      {
+        "device": "pc1",
+        "command": "ping -W2 -c2 200.1.1.2",
+        "expect": "loss>0"
+      }
+    ],
+    "ground_truth": "Affected component: router1 BGP configuration (network statement)\nMechanism: router1's `router bgp 1` section no longer contains\n  `network 195.11.14.0/24`, so router1 sends router2 an UPDATE\n  withdrawing that prefix. The eBGP session itself stays\n  Established and router1 still learns 200.1.1.0/24, so the\n  FORWARD path pc1 -> router1 -> router2 -> pc2 still delivers.\n  The RETURN path is dead: router2 has no route to 195.11.14.0/24,\n  so pc2's replies (and pc2-originated pings toward pc1) are\n  rejected at router2 with ICMP net-unreachable, sourced from\n  200.1.1.1, the router2 interface facing pc2. pc1 therefore sees\n  pure timeouts while pc2 sees instant net-unreachable errors.\nLocalization: router1\nRoot cause: missing `network 195.11.14.0/24` advertisement in\n  router1's BGP configuration\nFix: re-add the network statement on router1 (see [FIX])",
+    "fix_spec": "Re-add the advertisement on router1:\n`vtysh -c \"configure terminal\" -c \"router bgp 1\" -c \"network 195.11.14.0/24\"`\nrouter2 re-learns 195.11.14.0/24 and two-way reachability returns.\n(A `service frr restart` on router1 also restores it, since /etc/frr/frr.conf\non disk was never modified.)",
+    "scoring_axes": [
+      "assert-identifies: router1",
+      "must-identify-device: router1",
+      "must-identify-component: missing `network 195.11.14.0/24` advertisement in router1's BGP config",
+      "must-identify-mechanism: router2 no longer receives 195.11.14.0/24, so return traffic toward pc1 is unroutable while the eBGP session stays Established",
+      "bonus-explains-asymmetry: explains why pc1's pings time out (forward delivered, reply unroutable at router2) while pc2's fail instantly with net-unreachable from 200.1.1.1"
+    ],
+    "source_path": "dataset/nika_bgp_Q/base/simple-bgp-router1-network-removed.txt",
+    "scenario_class": "base",
+    "ticket_style": "standard"
+  },
+  "agent": "react-full",
+  "timestamp": "2026-08-03T08:06:07.136642+00:00",
+  "phases": {
+    "lstart": {
+      "ok": true,
+      "containers": 4,
+      "expected": 4
+    },
+    "settle": {
+      "converge_wait": 90
+    },
+    "injection": {
+      "applied": true,
+      "skipped_reason": null,
+      "rc": 0,
+      "output": ""
+    },
+    "post_inject_check": {
+      "results": [
+        {
+          "line": {
+            "device": "router1",
+            "command": "vtysh -c \"show running-config\" | grep -c \"network 195.11.14.0/24\"",
+            "expect": "0"
+          },
+          "passed": true,
+          "actual": "0",
+          "rationale": "got 0, expected 0"
+        },
+        {
+          "line": {
+            "device": "pc1",
+            "command": "ping -W2 -c2 200.1.1.2",
+            "expect": "loss>0"
+          },
+          "passed": true,
+          "actual": "PING 200.1.1.2 (200.1.1.2) 56(84) bytes of data.\n\n--- 200.1.1.2 ping statistics ---\n2 packets transmitted, 0 received, 100% packet loss, time 1069ms",
+          "rationale": "loss=100%"
+        }
+      ],
+      "wait_seconds": 0
+    },
+    "agent": {
+      "diagnosis_text": "- Affected component: BGP export on router1 (FRR bgpd) is not advertising the LAN 195.11.14.0/24 toward its eBGP neighbor.\n- Mechanism: Router1 has a BGP-learned route to 200.1.1.0/24 via router2, so pc1\u2019s probes are forwarded to pc2. However, router2 has no route to 195.11.14.0/24, so pc2\u2019s replies cannot return; from pc1 this appears as timeouts. When pc2 pings 195.11.14.x, its default gateway (router2 at 200.1.1.1) immediately generates \u201cDestination Net Unreachable\u201d because it lacks any route to 195.11.14.0/24.\n- Localization: \n  - router1 (eth1 195.11.14.1/24; eBGP over eth0 193.10.11.1) \u2014 FRR config has no \u201cnetwork 195.11.14.0/24\u201d (show running-config confirms only neighbor, no network/redistribute).\n  - router2 (eth1 200.1.1.1/24) \u2014 routing table has only connected 200.1.1.0/24 and 193.10.11.0/24 with no BGP route to 195.11.14.0/24, matching its ICMP unreachable behavior.\n- Root cause: router1 is not originating/advertising 195.11.14.0/24 into BGP, so router2 never learns a route to pc1\u2019s subnet.\n- Corrective fix: On router1, configure BGP to announce the LAN:\n  router bgp 1\n   address-family ipv4 unicast\n    network 195.11.14.0/24\n  or use \u201credistribute connected\u201d with appropriate policy. After commit, verify router2 installs BGP route to 195.11.14.0/24 and end-to-end pings succeed both ways.",
+      "is_anomaly": true,
+      "faulty_devices": [
+        "router1"
+      ],
+      "parsed_ok": true,
+      "in_tokens": 9664,
+      "cache_read_tokens": 9856,
+      "cache_write_tokens": 0,
+      "out_tokens": 3917,
+      "cost_usd": 0.052482,
+      "tool_calls": 11,
+      "hit_max_turns": false,
+      "error": null
+    },
+    "score": {
+      "must_passed": 4,
+      "must_total": 4,
+      "bonus_passed": 1,
+      "bonus_total": 1,
+      "outcome_score": 1.0,
+      "fix_score": 1.0,
+      "reasoning_score": 0.8666666666666667,
+      "reasoning_dims": {
+        "grounding": 0.8,
+        "causality": 0.9,
+        "coverage": 0.9
+      },
+      "final_score": 1.0,
+      "per_axis": [
+        {
+          "axis": "assert-identifies: router1",
+          "kind": "assert",
+          "score": 1.0,
+          "rationale": "culprit 'router1' named (good)"
+        },
+        {
+          "axis": "must-identify-device: router1",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The report explicitly names and localizes the problem to router1 (missing network statement in router1's BGP config)."
+        },
+        {
+          "axis": "must-identify-component: missing `network 195.11.14.0/24` advertisement in router1's BGP config",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The submission explicitly notes router1's FRR BGP config lacks the 'network 195.11.14.0/24' statement and that router1 is not advertising that prefix."
+        },
+        {
+          "axis": "must-identify-mechanism: router2 no longer receives 195.11.14.0/24, so return traffic toward pc1 is unroutable while the eBGP session stays Established",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The agent explicitly notes router2 has no route to 195.11.14.0/24 (causing return traffic to be unroutable) while router1 still learns 200.1.1.0/24, implying the eBGP session remains established."
+        },
+        {
+          "axis": "bonus-explains-asymmetry: explains why pc1's pings time out (forward delivered, reply unroutable at router2) while pc2's fail instantly with net-unreachable from 200.1.1.1",
+          "kind": "bonus",
+          "score": 1.0,
+          "rationale": "The diagnosis explicitly states router1 forwards pc1->pc2 while router2 lacks a route back, causing timeouts for pc1 and immediate ICMP net-unreachable from router2 for pc2-originated traffic."
+        },
+        {
+          "axis": "[FIX]",
+          "kind": "fix",
+          "score": 1.0,
+          "rationale": "Recommends adding the BGP network statement (or redistributing connected) on router1 to advertise 195.11.14.0/24, which matches the expected fix."
+        },
+        {
+          "axis": "reason:grounding",
+          "kind": "reason-dim",
+          "score": 0.8,
+          "rationale": "The agent ran appropriate commands (reachability, interface configs, routing tables, BGP and running-config) and produced a coherent explanation tying a missing BGP advertisement on router1 to asymmetric reachability. Some outputs are truncated in the log but the observed command calls and visible snippets support the key findings."
+        },
+        {
+          "axis": "reason:causality",
+          "kind": "reason-dim",
+          "score": 0.9,
+          "rationale": "The agent ran appropriate commands (reachability, interface configs, routing tables, BGP and running-config) and produced a coherent explanation tying a missing BGP advertisement on router1 to asymmetric reachability. Some outputs are truncated in the log but the observed command calls and visible snippets support the key findings."
+        },
+        {
+          "axis": "reason:coverage",
+          "kind": "reason-dim",
+          "score": 0.9,
+          "rationale": "The agent ran appropriate commands (reachability, interface configs, routing tables, BGP and running-config) and produced a coherent explanation tying a missing BGP advertisement on router1 to asymmetric reachability. Some outputs are truncated in the log but the observed command calls and visible snippets support the key findings."
+        }
+      ],
+      "judge_model": "gpt-5-mini",
+      "reasoning_mode": "trace",
+      "error": null
+    }
+  },
+  "agent_input_prompt": "# Topology overview (devices + L2 connectivity)\nTopology: simple_bgp\n\nDevices:\n  Routers (FRR): router1, router2\n  Hosts: pc1, pc2\n\nLinks (device:iface <-> device:iface):\n  router1:eth0 <-> router2:eth0\n  router1:eth1 <-> pc1:eth0\n  router2:eth1 <-> pc2:eth0\n\n# Symptom (user report)\npc1 (195.11.14.2) reports pings to pc2 (200.1.1.2) just time out.\nThe partner operator reports the reverse direction fails too, but\ndifferently: pings from pc2 toward 195.11.14.x die immediately\nwith \"Destination Net Unreachable\" from their own gateway\n200.1.1.1. Both sides confirm the eBGP session between router1\nand router2 shows Established. Diagnose."
+}

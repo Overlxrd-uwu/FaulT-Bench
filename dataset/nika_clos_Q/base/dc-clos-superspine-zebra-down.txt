@@ -1,0 +1,91 @@
+==================================================
+Scenario: dc-clos-superspine-zebra-down
+Topology: dc_clos_bgp
+Fault family: routing daemon down (zebra, management-plane failure)
+==================================================
+
+[PROMPT-TO-AGENT]
+The nightly audit job against super_spine_router_0 started failing:
+route-table queries on that device return daemon-connection errors,
+and interface state can no longer be read through the FRR CLI. Oddly,
+both spine routers still show their BGP session to the super-spine as
+Established, and no user traffic is affected -- pc_0_0 (10.0.0.2) and
+pc_0_1 (10.0.1.2) reach each other normally. Figure out what is wrong
+on super_spine_router_0.
+
+[INJECTION]
+device: super_spine_router_0
+action: kill the zebra daemon (and watchfrr) on super_spine_router_0
+cmd: pkill -9 watchfrr; pkill -9 zebra
+
+[POST-INJECT-CHECK]
+super_spine_router_0   pgrep zebra             => expect empty
+super_spine_router_0   pgrep -c bgpd           => expect 1
+pc_0_0                 ping -W2 -c2 10.0.1.2   => expect 0% loss   (still OK -- the super-spine is not on the pc_0_0<->pc_0_1 path)
+
+[GROUND-TRUTH]
+Affected component: super_spine_router_0 zebra
+Mechanism: zebra is FRR's RIB/kernel-interface daemon. It was killed
+  together with watchfrr (its watchdog), so nothing respawns it, while
+  bgpd keeps running: the BGP sessions to spine_router_0_0
+  (172.16.0.1) and spine_router_0_1 (172.16.0.3) stay Established
+  because bgpd owns its own TCP sessions. The failure is in the
+  management/route-programming plane: zebra-owned CLI queries (route
+  table, interface state) fail, and bgpd can no longer program new
+  routes into the kernel. Forwarding continues on the kernel FIB that
+  zebra had already installed (a SIGKILL leaves kernel routes in
+  place), and in this size-s fabric the super-spine is not even on the
+  pc_0_0 <-> pc_0_1 data path (that path is leaf -> spine -> leaf), so
+  there is no user impact -- but the device would blackhole any future
+  route change it needs zebra to program.
+Localization: super_spine_router_0
+Root cause: zebra not running on super_spine_router_0 (bgpd still up)
+Fix: restart FRR on super_spine_router_0 (`service frr restart`) --
+  the config persists in /etc/frr/frr.conf, so the restart brings back
+  zebra, watchfrr and bgpd cleanly.
+
+Observable note: the kill uses the same watchfrr-first pattern as the
+lab-verified bgpd kills on this fabric (nothing respawns the daemon).
+With zebra dead but bgpd alive, `pgrep zebra` is empty while
+`pgrep bgpd` still returns a process; zebra-owned vtysh queries (e.g.
+the route table) error out while BGP state remains queryable from the
+peers. An agent that describes this as "FRR is partially down /
+zebra crashed on super_spine_router_0" has found the fault.
+
+[FIX]
+`service frr restart` on super_spine_router_0. The persistent
+/etc/frr/frr.conf restores zebra (and watchfrr) alongside bgpd; the
+route-programming and CLI/telemetry plane recovers, and the BGP
+sessions re-establish.
+
+[DIAGNOSTIC-PROCESS]
+1. Scope the symptom: management queries against super_spine_router_0
+   fail while both spines still show Established sessions to it and
+   pc_0_0 <-> pc_0_1 traffic is unaffected -- a partial, device-local
+   failure on the super-spine.
+2. Check the daemons on super_spine_router_0: `pgrep zebra` is empty
+   while `pgrep bgpd` shows bgpd running -- FRR is half-alive: the
+   routing protocol survives, the RIB/kernel daemon is dead.
+3. Explain the intact sessions: bgpd maintains its own TCP sessions to
+   172.16.0.1 and 172.16.0.3, so the spines see nothing wrong.
+4. Explain the intact forwarding: the kernel FIB installed before the
+   crash remains in place, and the pc_0_0 <-> pc_0_1 path (leaf ->
+   spine -> leaf) does not transit the super-spine at all in this
+   fabric.
+5. Localize to zebra on super_spine_router_0: a dead zebra (with its
+   watchdog) explains failing route-table/interface queries alongside
+   Established BGP -- restart FRR to restore it.
+
+[SCORING-AXES]
+assert-identifies: super_spine_router_0
+must-identify-device: super_spine_router_0
+must-identify-component: zebra daemon down (FRR partially down -- bgpd still running)
+must-distinguish-symptom-pattern: BGP sessions remain Established and traffic flows while zebra-owned queries/route programming fail
+bonus-explains-stale-fib: explains that forwarding continues on the already-installed kernel FIB (and/or that the super-spine is not on the pc_0_0<->pc_0_1 data path)
+# These axes score the outcome metric only; fix and reasoning are judged separately.
+
+[NIKA-LABEL]
+nika_label: frr_service_down
+nika_category: NETWORK_NODE_ERROR
+in_taxonomy: true
+note: partial: the FRR service is only partially down -- zebra (and watchfrr) killed, bgpd left running

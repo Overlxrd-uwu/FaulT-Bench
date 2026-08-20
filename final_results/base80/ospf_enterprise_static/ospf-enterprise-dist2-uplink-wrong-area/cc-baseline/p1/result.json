@@ -1,0 +1,188 @@
+{
+  "scenario": {
+    "scenario_id": "ospf-enterprise-dist2-uplink-wrong-area",
+    "topology": "ospf_enterprise_static",
+    "fault_family": "OSPF area mismatch",
+    "prompt_to_agent": "Helpdesk ticket #8874: After a change window this morning, host_2_1_1_1 lost\nall connectivity beyond its gateway 10.2.1.1 -- the server farm and pod 1\nboth time out. Monitoring shows switch_dist_2_1 now has NO OSPF neighbors:\nits adjacency to router_core_2 dropped and never re-formed, yet the physical\nuplink interface still shows UP on both ends. Pod 1 and the server farm are\notherwise healthy. Find what broke the adjacency.",
+    "injection": {
+      "device": "switch_dist_2_1",
+      "action": "move the core-facing uplink network into the wrong OSPF area (area 0 instead of area 1)",
+      "command": "vtysh -c \"configure terminal\" \\\n        -c \"router ospf\" \\\n        -c \"no network 172.16.0.8/31 area 1\" \\\n        -c \"network 172.16.0.8/31 area 0\" \\\n        -c \"exit\" -c \"exit\"\n  vtysh -c \"clear ip ospf process\"",
+      "note": null
+    },
+    "pre_check": [],
+    "post_inject_check": [
+      {
+        "device": "switch_dist_2_1",
+        "command": "vtysh -c \"show running-config\" | grep -c \"network 172.16.0.8/31 area 0\"",
+        "expect": "1"
+      },
+      {
+        "device": "switch_dist_2_1",
+        "command": "vtysh -c \"show ip ospf neighbor\" | grep -c Full",
+        "expect": "0"
+      },
+      {
+        "device": "host_2_1_1_1",
+        "command": "ping -W2 -c2 10.200.0.2",
+        "expect": "loss>0"
+      }
+    ],
+    "ground_truth": "Affected component: switch_dist_2_1 OSPF area assignment on the uplink\n  network 172.16.0.8/31\nMechanism: OSPF requires both ends of a link to agree on the area ID.\n  router_core_2's side of the 172.16.0.8/31 uplink is in area 1;\n  switch_dist_2_1's side was just moved to area 0. Hellos now carry\n  mismatched area IDs and are rejected in both directions, so the adjacency\n  never re-forms even though the link is physically UP. With its only\n  adjacency gone, switch_dist_2_1 learns no remote routes and pod 2\n  (10.2.1.0/24) is isolated; the rest of the network also withdraws pod 2's\n  prefix once router_core_2 stops hearing switch_dist_2_1's LSAs.\nLocalization: switch_dist_2_1\nRoot cause: OSPF area mismatch on the router_core_2<->switch_dist_2_1 uplink\n  (switch_dist_2_1 in area 0, router_core_2 in area 1)\nFix: restore area 1 on switch_dist_2_1 (see [FIX]).",
+    "fix_spec": "On switch_dist_2_1:\n`vtysh -c \"configure terminal\" -c \"router ospf\" -c \"no network 172.16.0.8/31 area 0\" -c \"network 172.16.0.8/31 area 1\"`\n(`service frr restart` also heals it: the change was made only to the running\nconfig, and /etc/frr/frr.conf still has the correct area-1 statement.)",
+    "scoring_axes": [
+      "assert-identifies: switch_dist_2_1",
+      "must-identify-device: switch_dist_2_1",
+      "must-identify-component: OSPF area assignment / area mismatch on the uplink (area 0 vs area 1)",
+      "must-identify-mechanism: hello area-ID mismatch prevents the adjacency from re-forming while the link stays physically UP",
+      "bonus-rules-out-physical: explicitly notes the uplink is UP on both ends, distinguishing the config fault from a cable/interface failure"
+    ],
+    "source_path": "dataset/nika_ospf_Q/base/ospf-enterprise-dist2-uplink-wrong-area.txt",
+    "scenario_class": "base",
+    "ticket_style": "standard"
+  },
+  "agent": "cc-baseline",
+  "timestamp": "2026-08-03T03:29:09.991696+00:00",
+  "phases": {
+    "lstart": {
+      "ok": true,
+      "containers": 15,
+      "expected": 15
+    },
+    "settle": {
+      "converge_wait": 90
+    },
+    "injection": {
+      "applied": true,
+      "skipped_reason": null,
+      "rc": 0,
+      "output": ""
+    },
+    "post_inject_check": {
+      "results": [
+        {
+          "line": {
+            "device": "switch_dist_2_1",
+            "command": "vtysh -c \"show running-config\" | grep -c \"network 172.16.0.8/31 area 0\"",
+            "expect": "1"
+          },
+          "passed": true,
+          "actual": "1",
+          "rationale": "got 1, expected 1"
+        },
+        {
+          "line": {
+            "device": "switch_dist_2_1",
+            "command": "vtysh -c \"show ip ospf neighbor\" | grep -c Full",
+            "expect": "0"
+          },
+          "passed": true,
+          "actual": "0",
+          "rationale": "got 0, expected 0"
+        },
+        {
+          "line": {
+            "device": "host_2_1_1_1",
+            "command": "ping -W2 -c2 10.200.0.2",
+            "expect": "loss>0"
+          },
+          "passed": true,
+          "actual": "PING 10.200.0.2 (10.200.0.2) 56(84) bytes of data.\nFrom 10.2.1.1 icmp_seq=1 Destination Net Unreachable\nFrom 10.2.1.1 icmp_seq=2 Destination Net Unreachable\n\n--- 10.200.0.2 ping statistics ---\n2 packets transmitted, 0 received, +2 errors, 100% packet loss, time 1087ms",
+          "rationale": "loss=100%"
+        }
+      ],
+      "wait_seconds": 0
+    },
+    "agent": {
+      "diagnosis_text": "The OSPF adjacency between switch_dist_2_1 and router_core_2 cannot form because the two ends of the `172.16.0.8/31` link are configured in different OSPF areas. OSPF embeds the area ID in every Hello packet; if the receiving router's matching interface is in a different area, the Hello is silently discarded and the neighbor state machine never advances past Init, leaving the interface permanently in the Waiting state.\n\nDirect evidence: `show ip ospf interface` on switch_dist_2_1 shows eth0 (`172.16.0.9/31`) bound to **Area 0.0.0.0** with 0 neighbors, while the same check on router_core_2 eth2 (`172.16.0.8/31`) shows it bound to **Area 0.0.0.1** with 0 neighbors. The running config of switch_dist_2_1 confirms `network 172.16.0.8/31 area 0`, whereas router_core_2 has `network 172.16.0.8/31 area 1`.\n\nThe intended design is unambiguous from the mirror device: switch_dist_1_1 (pod 1, healthy) uses `network 172.16.0.6/31 area 1` for its uplink, and router_core_2's `show ip ospf` confirms it is an ABR with the backbone (area 0) carrying the two inter-core links and area 1 carrying the single distribution-switch downlink \u2014 exactly consistent with router_core_2 being correct and switch_dist_2_1 being wrong.\n\nRoot cause: During this morning's change window, switch_dist_2_1's OSPF configuration was modified so that its uplink to router_core_2 (`172.16.0.8/31`) was (re-)assigned to area 0 instead of area 1.\n\nCorrective fix: On switch_dist_2_1, replace `network 172.16.0.8/31 area 0` with `network 172.16.0.8/31 area 1` in the OSPF process. The adjacency will re-form within one Hello interval (10 s), restoring full reachability to pod 2, pod 1, and the server farm from host_2_1_1_1.",
+      "is_anomaly": true,
+      "faulty_devices": [
+        "switch_dist_2_1"
+      ],
+      "parsed_ok": true,
+      "in_tokens": 9,
+      "cache_read_tokens": 53653,
+      "cache_write_tokens": 15025,
+      "out_tokens": 5432,
+      "cost_usd": 0.15513265,
+      "tool_calls": 10,
+      "hit_max_turns": false,
+      "error": null
+    },
+    "score": {
+      "must_passed": 4,
+      "must_total": 4,
+      "bonus_passed": 0,
+      "bonus_total": 1,
+      "outcome_score": 0.7,
+      "fix_score": 1.0,
+      "reasoning_score": 0.9333333333333332,
+      "reasoning_dims": {
+        "grounding": 1.0,
+        "causality": 0.9,
+        "coverage": 0.9
+      },
+      "final_score": 0.7,
+      "per_axis": [
+        {
+          "axis": "assert-identifies: switch_dist_2_1",
+          "kind": "assert",
+          "score": 1.0,
+          "rationale": "culprit 'switch_dist_2_1' named (good)"
+        },
+        {
+          "axis": "must-identify-device: switch_dist_2_1",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The agent explicitly names switch_dist_2_1 as the affected device and attributes the OSPF area misconfiguration to it."
+        },
+        {
+          "axis": "must-identify-component: OSPF area assignment / area mismatch on the uplink (area 0 vs area 1)",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The report explicitly identifies the 172.16.0.8/31 uplink area mismatch\u2014switch_dist_2_1 in area 0 vs router_core_2 in area 1\u2014and attributes the adjacency loss to that OSPF area assignment on the uplink."
+        },
+        {
+          "axis": "must-identify-mechanism: hello area-ID mismatch prevents the adjacency from re-forming while the link stays physically UP",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The agent explicitly explains that OSPF Hello packets carry the area ID and that mismatched area IDs cause Hellos to be discarded, preventing adjacency formation despite the interface being physically UP."
+        },
+        {
+          "axis": "bonus-rules-out-physical: explicitly notes the uplink is UP on both ends, distinguishing the config fault from a cable/interface failure",
+          "kind": "bonus",
+          "score": 0.0,
+          "rationale": "The writeup does not explicitly state the physical link is UP on both ends or otherwise distinguish a config mismatch from a cable/interface failure."
+        },
+        {
+          "axis": "[FIX]",
+          "kind": "fix",
+          "score": 1.0,
+          "rationale": "Proposes changing the OSPF area for 172.16.0.8/31 on switch_dist_2_1 to area 1, which matches the expected fix and will restore the adjacency."
+        },
+        {
+          "axis": "reason:grounding",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "The agent's observations (interface OSPF area outputs and neighbor absence) directly support the area-mismatch conclusion; one speculative statement about a morning change is ungrounded but peripheral. Overall the investigation demonstrates the mismatch causing adjacency loss and isolation."
+        },
+        {
+          "axis": "reason:causality",
+          "kind": "reason-dim",
+          "score": 0.9,
+          "rationale": "The agent's observations (interface OSPF area outputs and neighbor absence) directly support the area-mismatch conclusion; one speculative statement about a morning change is ungrounded but peripheral. Overall the investigation demonstrates the mismatch causing adjacency loss and isolation."
+        },
+        {
+          "axis": "reason:coverage",
+          "kind": "reason-dim",
+          "score": 0.9,
+          "rationale": "The agent's observations (interface OSPF area outputs and neighbor absence) directly support the area-mismatch conclusion; one speculative statement about a morning change is ungrounded but peripheral. Overall the investigation demonstrates the mismatch causing adjacency loss and isolation."
+        }
+      ],
+      "judge_model": "gpt-5-mini",
+      "reasoning_mode": "trace",
+      "error": null
+    }
+  },
+  "agent_input_prompt": "# Topology overview (devices + L2 connectivity)\nTopology: ospf_enterprise_static\n\nDevices:\n  Routers (FRR): router_core_1, router_core_2, router_core_3, switch_dist_1_1, switch_dist_2_1, switch_server_access\n  Switches: switch_access_1_1_1, switch_access_2_1_1\n  Hosts: host_1_1_1_1, host_2_1_1_1\n  Dns servers: dns_server\n  Web servers: web_server_0, web_server_1, web_server_2, web_server_3\n\nLinks (device:iface <-> device:iface):\n  router_core_1:eth0 <-> router_core_2:eth0\n  router_core_1:eth1 <-> router_core_3:eth0\n  router_core_1:eth2 <-> switch_dist_1_1:eth0\n  router_core_2:eth1 <-> router_core_3:eth1\n  router_core_2:eth2 <-> switch_dist_2_1:eth0\n  router_core_3:eth2 <-> switch_server_access:eth5\n  switch_access_1_1_1:eth1 <-> host_1_1_1_1:eth0\n  switch_access_2_1_1:eth1 <-> host_2_1_1_1:eth0\n  switch_dist_1_1:eth1 <-> switch_access_1_1_1:eth0\n  switch_dist_2_1:eth1 <-> switch_access_2_1_1:eth0\n  dns_server:eth0 <-> switch_server_access:eth0\n  web_server_0:eth0 <-> switch_server_access:eth1\n  web_server_1:eth0 <-> switch_server_access:eth2\n  web_server_2:eth0 <-> switch_server_access:eth3\n  web_server_3:eth0 <-> switch_server_access:eth4\n\n# Symptom (user report)\nHelpdesk ticket #8874: After a change window this morning, host_2_1_1_1 lost\nall connectivity beyond its gateway 10.2.1.1 -- the server farm and pod 1\nboth time out. Monitoring shows switch_dist_2_1 now has NO OSPF neighbors:\nits adjacency to router_core_2 dropped and never re-formed, yet the physical\nuplink interface still shows UP on both ends. Pod 1 and the server farm are\notherwise healthy. Find what broke the adjacency."
+}

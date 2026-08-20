@@ -1,0 +1,75 @@
+==================================================
+Scenario: simple-bgp-router2-wrong-remote-as
+Topology: simple_bgp
+Fault family: BGP wrong remote-as (ASN mismatch)
+==================================================
+
+[PROMPT-TO-AGENT]
+After a configuration change window on router2, pc1 (195.11.14.2)
+cannot reach pc2 (200.1.1.2) and pc2 cannot reach pc1. Both
+routers are up, and the two ends of the inter-AS link still ping
+each other directly (193.10.11.1 <-> 193.10.11.2), but the eBGP
+session between router1 and router2 will not come up. Investigate.
+
+[INJECTION]
+device: router2
+action: set a wrong remote-as (65001 instead of 1) on router2's neighbor statement for router1
+cmd: |
+  vtysh -c "configure terminal" \
+        -c "router bgp 2" \
+        -c "no neighbor 193.10.11.1" \
+        -c "neighbor 193.10.11.1 remote-as 65001" \
+        -c "exit" -c "exit"
+
+[POST-INJECT-CHECK]
+router2   vtysh -c "show running-config" | grep -c "remote-as 65001"  => expect 1
+pc1       ping -W2 -c2 200.1.1.2                                      => expect loss>0
+
+[GROUND-TRUTH]
+Affected component: router2 BGP configuration (neighbor remote-as)
+Mechanism: router2's config now says `neighbor 193.10.11.1
+  remote-as 65001`, but router1 really is AS 1. During session
+  setup router1's OPEN message carries AS 1; router2 compares it
+  against the configured 65001, rejects the OPEN (bad peer AS
+  notification), and the session never reaches Established. With
+  no session, no prefixes are exchanged: router1 never learns
+  200.1.1.0/24 and router2 never learns 195.11.14.0/24, so pc1 and
+  pc2 cannot reach each other. The underlying link is healthy
+  (direct pings across 193.10.11.0/24 work) and both daemons run.
+Localization: router2
+Root cause: wrong remote-as (65001 instead of 1) on router2's
+  neighbor statement for 193.10.11.1
+Fix: restore remote-as 1 on router2 (see [FIX])
+
+[FIX]
+Restore the correct peer AS on router2:
+`vtysh -c "configure terminal" -c "router bgp 2" -c "no neighbor 193.10.11.1" -c "neighbor 193.10.11.1 remote-as 1"`
+The eBGP session establishes and the inter-AS prefixes are exchanged.
+(A `service frr restart` on router2 also restores it, since /etc/frr/frr.conf
+on disk was never modified.)
+
+[DIAGNOSTIC-PROCESS]
+1. Reproduce on the real path: from pc1, ping pc2 (200.1.1.2) -- it fails, while
+   direct pings between 193.10.11.1 and 193.10.11.2 succeed, so the link and
+   both routers' data planes are fine.
+2. Check the session state: on both routers `show bgp summary` shows the peer
+   never Established; both bgpd processes are running.
+3. Compare the two BGP configs: router1 has `neighbor 193.10.11.2 remote-as 2`
+   (correct -- router2 is AS 2), but router2 has `neighbor 193.10.11.1
+   remote-as 65001` while router1's `router bgp 1` shows it is AS 1.
+4. Localize to the ASN mismatch on router2: router2 rejects router1's OPEN
+   (AS 1 != expected 65001), so the session can never establish; not a link
+   failure, not a daemon crash, and router1's config is unchanged.
+
+[SCORING-AXES]
+assert-identifies: router2
+must-identify-device: router2
+must-identify-component: wrong remote-as (65001 instead of 1) on router2's neighbor statement for 193.10.11.1
+must-identify-mechanism: eBGP AS mismatch -- router1 is AS 1 but router2 expects 65001, so the session never establishes
+bonus-rules-out-lower-layers: notes the inter-AS link and direct 193.10.11.1<->193.10.11.2 reachability are fine, isolating the fault to the BGP session configuration
+
+[NIKA-LABEL]
+nika_label: bgp_asn_misconfig
+nika_category: MISCONFIGURATION
+in_taxonomy: true
+note: partial: NIKA's bgp_asn_misconfig rewrites the router's own ASN; here router2's remote-as for the peer is wrong -- same eBGP ASN-mismatch, session cannot establish

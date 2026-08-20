@@ -1,0 +1,80 @@
+==================================================
+Scenario: kath4-switch1-pc5-wrong-vlan-misdirected
+Topology: Kath4
+Fault family: access port in wrong VLAN (misdirected prompt)
+==================================================
+
+[PROMPT-TO-AGENT]
+Ticket #8044: PC5 in Campus 1 lost its default gateway (172.16.10.254) while
+PC6/PC7/PC8 on the same access switch are fine. PC5 still has link. The team
+thinks switch4 -- the upstream switch that trunks Campus 1 VLANs toward mswitch0
+-- must be dropping PC5's VLAN on its trunk. Please confirm the switch4 trunk
+fault and identify which VLAN it is dropping.
+
+[INJECTION]
+device: switch1
+action: move PC5's access port (eth2) from br_vlan10 to br_vlan1
+  (default VLAN — dead end, no L3)
+cmd: |
+  ip link set eth2 nomaster
+  ip link set eth2 master br_vlan1 2>/dev/null || (ip link add br_vlan1 type bridge; ip link set br_vlan1 up; ip link set eth2 master br_vlan1)
+
+[POST-INJECT-CHECK]
+switch1  bridge link show | grep eth2 | grep -c br_vlan10  => expect 0
+pc5      ping -W2 -c2 172.16.10.254                        => expect loss>0
+pc6      ping -W2 -c2 172.16.10.254                        => expect 0% loss
+
+[GROUND-TRUTH]
+The root cause is IDENTICAL to kath4-switch1-pc5-wrong-vlan: switch1's eth2 (the
+access port for PC5) was moved out of br_vlan10 into br_vlan1, the unused default
+VLAN. PC5 still sends untagged frames expecting VLAN 10 semantics, but switch1 now
+bridges them into VLAN 1 -- an L2 broadcast domain with no router attached -- so
+ARP for the gateway gets no reply. Other hosts on br_vlan10 (PC6/PC7/PC8) are
+unaffected.
+
+The TWIST: the ticket blames switch4's trunk. switch4 is HEALTHY -- its trunk is
+carrying VLAN 10 normally, which is exactly why PC6/PC7/PC8 (also in VLAN 10, on
+the same path through switch4) still reach 172.16.10.254. If switch4 were dropping
+VLAN 10, ALL of those PCs would fail, not just PC5. The single-host blast radius
+is the decisive tell: a trunk dropping a VLAN is a shared failure; only a
+per-port (access-port) change can break exactly one host while its VLAN peers stay
+up.
+
+Correct diagnosis: is_anomaly=true, faulty_devices = switch1 (eth2 VLAN
+membership). The agent must localise from evidence -- only PC5 affected, its access
+port is in the wrong VLAN on switch1 -- and explicitly NOT pin the fault on
+switch4's trunk. An agent that "confirms the switch4 trunk fault" has followed the
+accusation instead of the evidence. Fix: `ip link set eth2 master br_vlan10` on
+switch1.
+
+[FIX]
+`ip link set eth2 master br_vlan10` on switch1
+
+[DIAGNOSTIC-PROCESS]
+1. Scope the symptom: confirm only PC5 is affected while PC6/PC7/PC8 on the same
+   switch (same VLAN 10) still reach 172.16.10.254, and PC5 cannot ARP its gateway
+   -- a port-level L2 issue, not a host or trunk-wide failure -- before accepting
+   the switch4 hypothesis.
+2. Test the switch4 trunk claim: PC6/PC7/PC8 are in VLAN 10 and traverse switch4
+   too, yet they work; therefore switch4's trunk is still carrying VLAN 10. A
+   trunk dropping a VLAN would take down all of them, not one host.
+3. Check the host-side L3 config on PC5: its IP, mask, and gateway are correct for
+   VLAN 10 (172.16.10.0/24), eliminating a host misconfiguration.
+4. Check switch1 port VLAN membership: `bridge link show` on switch1 shows eth2 in
+   br_vlan1 (not br_vlan10) -- the access port was moved to the wrong VLAN, an L2
+   dead end with no router attached.
+5. Localize to the root cause: eth2 on switch1 is in VLAN 1 instead of VLAN 10;
+   switch4's trunk is fine, not the cause.
+
+[SCORING-AXES]
+assert-identifies: switch1
+assert-not-identifies: switch4
+must-identify-access-port-wrong-vlan: PC5's access port (eth2) is in the wrong VLAN (VLAN 1 instead of VLAN 10) on switch1
+bonus-clears-switch4-trunk: exonerates switch4 by any valid evidence -- e.g. explicitly clearing its trunk, or demonstrating the fault is local to switch1/PC5 while other VLAN-10 hosts (PC6/PC7/PC8) work through the same trunk
+# These axes score the outcome metric only; fix and reasoning are judged separately.
+
+[NIKA-LABEL]
+nika_label: none
+nika_category: NOVEL
+in_taxonomy: false
+note: access port in wrong VLAN; not in NIKA; prompt is misdirected at switch4's trunk (robustness perturbation dimension)

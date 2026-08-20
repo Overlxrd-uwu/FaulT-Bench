@@ -1,0 +1,160 @@
+# ----------------------------------------------------
+# Device: sshswitch (Multilayer Switch1)
+# Source: Multilayer Switch1_running-config.txt
+# ----------------------------------------------------
+
+# Enable IP Forwarding
+sysctl -w net.ipv4.ip_forward=1
+
+# ---------------------------
+# 1. Configure EtherChannel (Bonding)
+# ---------------------------
+# Interfaces: Gi1/0/7 (eth6) and Gi1/0/8 (eth7)
+# Mode: On (static) -> Linux Bond Mode 0 (Balance-RR)
+
+modprobe bonding
+ip link add bond0 type bond mode 0
+ip link set bond0 up
+
+# Add physical interfaces to bond
+ip link set eth6 down
+ip link set eth7 down
+ip link set eth6 master bond0
+ip link set eth7 master bond0
+ip link set eth6 up
+ip link set eth7 up
+
+# ---------------------------
+# 2. Configure Switching Bridge
+# ---------------------------
+# The bridge connects the Bond (Trunk), Access Ports, and SVIs.
+
+ip link add br0 type bridge
+ip link set br0 up
+
+# Add Bond (Trunk) to Bridge
+ip link set bond0 master br0
+
+# Add Access Ports (VLAN 100)
+# eth1, eth2, eth3
+# Since these are pure access ports in Linux bridge logic (without hardware VLAN filtering),
+# we often add them to specific bridges. However, for a Multilayer switch with SVIs, 
+# the best approach in Kathara is a VLAN-aware bridge or separate bridges.
+# simpler approach: Separate bridges for Access, linked to Main if needed.
+# BUT, to match the config EXACTLY where ports are assigned specific VLANs:
+
+# -- Strategy: Create VLAN Interfaces on the Bridge for Routing --
+
+# We need to tag frames entering from Access Ports? 
+# In Kathara/Linux, it's easier to use specific bridges for specific VLANs if they don't trunk.
+# However, bond0 is a TRUNK carrying ALL VLANs.
+
+# Let's use the standard "VLAN-Aware Bridge" approach for Linux:
+# (Simulating VLANs by adding sub-interfaces to the bridge is complex).
+# SIMPLIFIED APPROACH: 
+# 1. Create Bridge for VLAN 100. Add eth1, eth2, eth3, and bond0.100
+# 2. Create Bridge for VLAN 200. Add eth4, eth5, and bond0.200
+# 3. Create Bridge for VLAN 1/5/6. Add bond0.1, bond0.5, bond0.6
+
+# --- VLAN 100 Bridge ---
+ip link add br_v100 type bridge
+ip link set br_v100 up
+# Access Ports
+for p in 1 2 3; do ip link set eth$p up; ip link set eth$p master br_v100; done
+# Trunk Component
+ip link add link bond0 name bond0.100 type vlan id 100
+ip link set bond0.100 up
+ip link set bond0.100 master br_v100
+
+# --- VLAN 200 Bridge ---
+ip link add br_v200 type bridge
+ip link set br_v200 up
+# Access Ports
+for p in 4 5; do ip link set eth$p up; ip link set eth$p master br_v200; done
+# Trunk Component
+ip link add link bond0 name bond0.200 type vlan id 200
+ip link set bond0.200 up
+ip link set bond0.200 master br_v200
+
+# --- VLAN 5, 6, 1 (Trunk only) ---
+# VLAN 5
+ip link add br_v5 type bridge
+ip link set br_v5 up
+ip link add link bond0 name bond0.5 type vlan id 5
+ip link set bond0.5 up
+ip link set bond0.5 master br_v5
+
+# VLAN 6
+ip link add br_v6 type bridge
+ip link set br_v6 up
+ip link add link bond0 name bond0.6 type vlan id 6
+ip link set bond0.6 up
+ip link set bond0.6 master br_v6
+
+# VLAN 1 (Native)
+ip link add br_v1 type bridge
+ip link set br_v1 up
+ip link set bond0 master br_v1  # Untagged traffic goes here
+
+# --- eth0 trunk to switch4 ---
+# Without these subinterfaces wired to br_v5/br_v6, Campus-2 PCs in VLAN 5/6
+# on switch4 couldn't reach their SVIs (10.5.0.254 / 10.6.0.254).
+ip link set eth0 up
+ip link add link eth0 name eth0.5 type vlan id 5
+ip link set eth0.5 up
+ip link set eth0.5 master br_v5
+ip link add link eth0 name eth0.6 type vlan id 6
+ip link set eth0.6 up
+ip link set eth0.6 master br_v6
+ip link set eth0 master br_v1  # Native VLAN 1 untagged on eth0
+
+# ---------------------------
+# 3. Configure SVIs (L3 Interfaces)
+# ---------------------------
+# We put the IP addresses on the Bridge Interfaces (br_vX)
+
+# Vlan1
+ip address add 55.5.1.2/24 dev br_v1
+
+# Vlan5
+ip address add 10.5.0.254/24 dev br_v5
+
+# Vlan6
+ip address add 10.6.0.254/24 dev br_v6
+
+# Vlan100
+ip address add 8.8.8.254/24 dev br_v100
+
+# Vlan200
+ip address add 10.200.1.254/24 dev br_v200
+
+# ---------------------------
+# 4. Configure OSPF
+# ---------------------------
+sed -i 's/ospfd=no/ospfd=yes/g' /etc/frr/daemons
+/etc/init.d/frr start
+
+vtysh -c "configure terminal" \
+-c "router ospf" \
+-c "network 10.5.0.0/24 area 0" \
+-c "network 10.6.0.0/24 area 0" \
+-c "network 10.200.1.0/24 area 0" \
+-c "network 8.8.8.0/24 area 0" \
+-c "network 55.5.1.0/24 area 0" \
+-c "exit" \
+-c "exit"
+
+# ---------------------------
+# 5. Configure SSH
+# ---------------------------
+# Source: username cisco, domain project.com, transport input ssh
+
+# Create user
+useradd -m -s /bin/bash cisco
+echo "cisco:cisco" | chpasswd
+
+# Generate Host Keys
+ssh-keygen -A
+
+# Start SSH Service
+/etc/init.d/ssh start

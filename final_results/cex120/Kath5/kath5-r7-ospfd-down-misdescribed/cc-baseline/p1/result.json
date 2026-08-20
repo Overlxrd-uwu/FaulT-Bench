@@ -1,0 +1,151 @@
+{
+  "scenario": {
+    "scenario_id": "kath5-r7-ospfd-down-misdescribed",
+    "topology": "Kath5",
+    "fault_family": "routing daemon down (misdescribed cause)",
+    "prompt_to_agent": "Ticket #9027: After a maintenance window, routes for the R7 region (17.x.x.x,\n67.0.0.0/8, 70.0.0.0/8) vanished from R1's routing table and R6 lost its OSPF\nneighbor R7. The team believes the R6<->R7 link (67.0.0.0/8) went down or was\nunplugged during the maintenance. Please confirm the R6<->R7 link failure and\nidentify the down interface.",
+    "injection": {
+      "device": "r7",
+      "action": "kill ospfd (kill watchfrr first so FRR does not respawn it)",
+      "command": "pkill -9 watchfrr; pkill -9 ospfd",
+      "note": null
+    },
+    "pre_check": [],
+    "post_inject_check": [
+      {
+        "device": "r7",
+        "command": "pgrep ospfd",
+        "expect": "empty"
+      },
+      {
+        "device": "r1",
+        "command": "vtysh -c \"show ip route\" | grep -c \"17\\.\\|70\\.\"",
+        "expect": "0"
+      }
+    ],
+    "ground_truth": "The root cause is IDENTICAL to kath5-r7-ospfd-down: ospfd is dead on R7. With its\nospfd stopped, R6 ages out R7's LSAs and the withdrawals propagate through area 1\nand the backbone, so R1 loses the R7 region (17.x, 67.x, 70.x).\n\nThe TWIST: the ticket asserts the wrong CAUSE -- a downed R6<->R7 link\n(67.0.0.0/8). The link is actually UP and forwarding (R6 and R7 can still reach\neach other's 67.x interface IPs); nothing physical failed. The \"lost adjacency and\nwithdrawn prefixes\" symptom is real, but the narrated cause (a maintenance-window\nlink failure) is a red herring -- the routing daemon stopped, the wire did not.\n\nCorrect diagnosis: is_anomaly=true, faulty_devices = r7 (ospfd not running). The\nagent must check Layer 1/2 (the R6<->R7 link / 67.x interfaces are up), then the\nrouting daemon (ospfd dead on R7), and explicitly reject the \"link down\"\nnarrative. An agent that \"confirms the down link\" has followed the ticket's\nframing instead of the evidence. Fix: `/etc/init.d/frr restart` on R7.\n\nObservable note (lab-verified 2026-07-03): ospfd is killed together with watchfrr (its watchdog), so nothing respawns it. vtysh remains responsive via zebra, `show running-config` simply contains NO `router ospf` section, and `show daemons` no longer lists ospfd. An agent may therefore correctly describe this fault as \"the ospf configuration is missing/empty on r7\" -- that is the same fault observed at the config plane, and must NOT be treated as a wrong root cause.",
+    "fix_spec": "Restart FRR / the ospfd daemon on r7 (e.g. `/etc/init.d/frr restart` on\nr7). Once ospfd is running again it re-advertises and re-learns the\naffected routes, restoring reachability. (The ticket misattributes the fault;\nthe remediation targets r7.)",
+    "scoring_axes": [
+      "assert-identifies: r7",
+      "must-identify-component: ospfd / OSPF routing daemon"
+    ],
+    "source_path": "dataset/kath5_Q/cex/kath5-r7-ospfd-down-misdescribed.txt",
+    "scenario_class": "wrong-cause"
+  },
+  "agent": "cc-baseline",
+  "timestamp": "2026-07-05T20:03:52.573819+00:00",
+  "phases": {
+    "lstart": {
+      "ok": true,
+      "containers": 15,
+      "expected": 15
+    },
+    "settle": {
+      "converge_wait": 90
+    },
+    "injection": {
+      "applied": true,
+      "skipped_reason": null,
+      "rc": 0,
+      "output": ""
+    },
+    "post_inject_check": {
+      "results": [
+        {
+          "line": {
+            "device": "r7",
+            "command": "pgrep ospfd",
+            "expect": "empty"
+          },
+          "passed": true,
+          "actual": "",
+          "rationale": "output empty"
+        },
+        {
+          "line": {
+            "device": "r1",
+            "command": "vtysh -c \"show ip route\" | grep -c \"17\\.\\|70\\.\"",
+            "expect": "0"
+          },
+          "passed": true,
+          "actual": "0",
+          "rationale": "got 0, expected 0"
+        }
+      ],
+      "wait_seconds": 40
+    },
+    "agent": {
+      "diagnosis_text": "The reported symptom \u2014 R6 losing its OSPF neighbour R7 and R1 dropping routes for 17.x.x.x and 70.0.0.0/8 \u2014 is real, but the root cause is **not a physical link failure**. The R6\u2194R7 link (collision domain Y, 67.x.x.x/8) is physically intact on both sides: R6 eth2 (67.1.1.1/8) and R7 eth0 (67.1.1.2/8) are both `UP, LOWER_UP` with packet counters incrementing.\n\nThe actual fault is that the **ospfd process is not running on R7**. A `ps aux` on R7 shows only zebra, mgmtd, and staticd; neither ospfd nor watchfrr is present. Despite this, R7's `/etc/frr/daemons` correctly has `ospfd=yes` and `/etc/frr/frr.conf` contains a complete, valid OSPF configuration (router-id 67.1.1.2, networks 67.0.0.0/8, 70.0.0.0/8, and all four 17.x.x.x/24 loopbacks in area 1). The config was never applied because the daemon is not running.\n\nWithout an ospfd process, R7 never sends OSPF Hellos on eth0, so R6 eth2 never forms an adjacency (confirmed: Neighbor Count = 0 on R6 eth2, DR state, no BDR). Consequently, R7's loopbacks (17.x.x.x) and eth1 (70.0.0.0/8) are never redistributed into OSPF. The 67.0.0.0/8 entry still appears in R1's table because R6 itself owns that prefix as a directly connected network \u2014 not because R7 is advertising it.\n\n**Root cause:** The ospfd daemon on R7 was killed (or never started after a restart during the maintenance window) and watchfrr is absent, so it was not automatically recovered.\n\n**Corrective fix:** On R7, restart the FRR suite: `service frr restart` (or explicitly: `/usr/lib/frr/ospfd -d -F traditional -A 127.0.0.1`, then `vtysh -b` to load frr.conf). ospfd will start, R6 will re-establish the adjacency, and 17.x.x.x / 70.0.0.0/8 routes will re-appear in R1 within one OSPF dead-interval (~40 s).",
+      "is_anomaly": true,
+      "faulty_devices": [
+        "r7"
+      ],
+      "parsed_ok": true,
+      "in_tokens": 11,
+      "cache_read_tokens": 100270,
+      "cache_write_tokens": 19882,
+      "out_tokens": 5520,
+      "cost_usd": 0.1888265,
+      "tool_calls": 14,
+      "hit_max_turns": false,
+      "error": null
+    },
+    "score": {
+      "must_passed": 2,
+      "must_total": 2,
+      "bonus_passed": 0,
+      "bonus_total": 0,
+      "outcome_score": 1.0,
+      "fix_score": 1.0,
+      "reasoning_score": 0.9666666666666667,
+      "reasoning_dims": {
+        "grounding": 0.9,
+        "causality": 1.0,
+        "coverage": 1.0
+      },
+      "final_score": 1.0,
+      "per_axis": [
+        {
+          "axis": "assert-identifies: r7",
+          "kind": "assert",
+          "score": 1.0,
+          "rationale": "culprit 'r7' named (good)"
+        },
+        {
+          "axis": "must-identify-component: ospfd / OSPF routing daemon",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "Agent explicitly identifies the ospfd daemon on R7 as not running (OSP F routing daemon) and attributes the outage to that process being killed/not started."
+        },
+        {
+          "axis": "[FIX]",
+          "kind": "fix",
+          "score": 1.0,
+          "rationale": "Recommends restarting FRR/ospfd on R7 (or starting ospfd explicitly) which will restore the OSPF adjacency and re-advertise the missing routes, matching the expected fix."
+        },
+        {
+          "axis": "reason:grounding",
+          "kind": "reason-dim",
+          "score": 0.9,
+          "rationale": "Investigation log shows interfaces up on both sides, ospfd missing on R7 (ps/ospf commands returning 'ospfd is not running'), and a valid OSPF config present\u2014supporting the agent's conclusion that the daemon, not the link, is the fault. The reasoning correctly links missing ospfd to loss of adjacency and withdrawn LSAs and proposes the correct remediation."
+        },
+        {
+          "axis": "reason:causality",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "Investigation log shows interfaces up on both sides, ospfd missing on R7 (ps/ospf commands returning 'ospfd is not running'), and a valid OSPF config present\u2014supporting the agent's conclusion that the daemon, not the link, is the fault. The reasoning correctly links missing ospfd to loss of adjacency and withdrawn LSAs and proposes the correct remediation."
+        },
+        {
+          "axis": "reason:coverage",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "Investigation log shows interfaces up on both sides, ospfd missing on R7 (ps/ospf commands returning 'ospfd is not running'), and a valid OSPF config present\u2014supporting the agent's conclusion that the daemon, not the link, is the fault. The reasoning correctly links missing ospfd to loss of adjacency and withdrawn LSAs and proposes the correct remediation."
+        }
+      ],
+      "judge_model": "gpt-5-mini",
+      "reasoning_mode": "trace",
+      "error": null
+    }
+  },
+  "agent_input_prompt": "# Topology overview (devices + L2 connectivity)\nTopology: Kath5\n\nDevices:\n  pc0: eth0='E'\n  pc12: eth0=GG\n  r1: eth0=A, eth1=B, eth2=C, eth3=D, eth4=E, eth5=F\n  r10: eth0=I, eth1=DD\n  r11: eth0=EE, eth1=B, eth2=FF\n  r12: eth0=EE, eth1=GG\n  r13: eth0=FF\n  r2: eth0=A, eth1=H, eth2=I\n  r3: eth0=J, eth1=H, eth2=C, eth3=M, eth4=N, eth5=O, eth6=P\n  r4: eth0=M, eth1=R, eth2=S, eth3=T\n  r5: eth0=R, eth1=V, eth2=W, eth3=X\n  r6: eth0=S, eth1=V, eth2=Y, eth3=Z\n  r7: eth0=Y, eth1=AA\n  r8: eth0=W, eth1=BB\n  r9: eth0=J, eth1=CC\n\nCollision domains (shared L2 segments):\n  'E': pc0.eth0\n  A: r1.eth0, r2.eth0\n  AA: r7.eth1\n  B: r1.eth1, r11.eth1\n  BB: r8.eth1\n  C: r1.eth2, r3.eth2\n  CC: r9.eth1\n  D: r1.eth3\n  DD: r10.eth1\n  E: r1.eth4\n  EE: r11.eth0, r12.eth0\n  F: r1.eth5\n  FF: r11.eth2, r13.eth0\n  GG: pc12.eth0, r12.eth1\n  H: r2.eth1, r3.eth1\n  I: r10.eth0, r2.eth2\n  J: r3.eth0, r9.eth0\n  M: r3.eth3, r4.eth0\n  N: r3.eth4\n  O: r3.eth5\n  P: r3.eth6\n  R: r4.eth1, r5.eth0\n  S: r4.eth2, r6.eth0\n  T: r4.eth3\n  V: r5.eth1, r6.eth1\n  W: r5.eth2, r8.eth0\n  X: r5.eth3\n  Y: r6.eth2, r7.eth0\n  Z: r6.eth3\n\n# Symptom (user report)\nTicket #9027: After a maintenance window, routes for the R7 region (17.x.x.x,\n67.0.0.0/8, 70.0.0.0/8) vanished from R1's routing table and R6 lost its OSPF\nneighbor R7. The team believes the R6<->R7 link (67.0.0.0/8) went down or was\nunplugged during the maintenance. Please confirm the R6<->R7 link failure and\nidentify the down interface."
+}

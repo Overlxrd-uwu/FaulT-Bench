@@ -1,0 +1,181 @@
+{
+  "scenario": {
+    "scenario_id": "ospf-enterprise-core2-ospfd-down",
+    "topology": "ospf_enterprise_static",
+    "fault_family": "routing daemon down",
+    "prompt_to_agent": "Helpdesk ticket #8871: host_2_1_1_1 (10.2.1.2) reports it has lost everything\nbeyond its own gateway: every 10.200.0.x server times out, and it cannot reach\nhost_1_1_1_1 in the other pod either. It CAN still ping its gateway 10.2.1.1.\nPod 1 is unaffected -- host_1_1_1_1 reaches the server farm normally. Diagnose.",
+    "injection": {
+      "device": "router_core_2",
+      "action": "kill the OSPF daemon (ospfd) on router_core_2 and stop watchfrr from respawning it",
+      "command": "pkill -9 watchfrr; pkill -9 ospfd",
+      "note": null
+    },
+    "pre_check": [],
+    "post_inject_check": [
+      {
+        "device": "router_core_2",
+        "command": "pgrep ospfd",
+        "expect": "empty"
+      },
+      {
+        "device": "host_2_1_1_1",
+        "command": "ping -W2 -c2 10.200.0.2",
+        "expect": "loss>0"
+      },
+      {
+        "device": "host_1_1_1_1",
+        "command": "ping -W2 -c2 10.200.0.2",
+        "expect": "0% loss   (pod 1 unaffected)"
+      }
+    ],
+    "ground_truth": "Affected component: router_core_2 ospfd\nMechanism: router_core_2 is pod 2's only way out: switch_dist_2_1's single\n  uplink (172.16.0.8/31, area 1) terminates on router_core_2, which as the\n  pod-2 ABR carries 10.2.1.0/24 between area 1 and the area-0 backbone. With\n  ospfd killed, zebra flushes router_core_2's OSPF routes immediately, so\n  pod-2 traffic arriving at router_core_2 has no route and dies there; the\n  other routers then age out router_core_2's LSAs and withdraw 10.2.1.0/24.\n  Pod 1 (host -> switch_dist_1_1 -> router_core_1 -> router_core_3 -> farm)\n  never transits router_core_2, so it stays healthy.\nLocalization: router_core_2\nRoot cause: ospfd not running on router_core_2\nFix: restart FRR on router_core_2 (`service frr restart`).\n\nObservable note (same kill pattern lab-verified on this topology 2026-07-03):\nospfd is killed together with watchfrr (its watchdog), so nothing respawns it.\nvtysh remains responsive via zebra, `show running-config` simply contains NO\n`router ospf` section, and `show daemons` no longer lists ospfd. An agent may\ntherefore correctly describe this fault as \"the ospf configuration is\nmissing/empty on router_core_2\" -- that is the same fault observed at the\nconfig plane, and must NOT be treated as a wrong root cause.",
+    "fix_spec": "Restart FRR / the OSPF daemon on router_core_2 (`service frr restart`).\nUnlike the vtysh-provisioned Kath labs, this topology keeps its OSPF config\nin /etc/frr/frr.conf (the injection killed the process, not the file), so a\nplain restart reloads the full configuration, OSPF re-converges, and pod 2\nregains connectivity.",
+    "scoring_axes": [
+      "assert-identifies: router_core_2",
+      "must-identify-device: router_core_2",
+      "must-identify-component: ospfd / OSPF daemon down",
+      "bonus-scopes-blast-radius: notes pod 1 and the server farm stay healthy, isolating the fault to pod 2's transit through router_core_2"
+    ],
+    "source_path": "dataset/nika_ospf_Q/base/ospf-enterprise-core2-ospfd-down.txt",
+    "scenario_class": "base",
+    "ticket_style": "standard"
+  },
+  "agent": "sade",
+  "timestamp": "2026-08-04T15:09:40.041323+00:00",
+  "phases": {
+    "lstart": {
+      "ok": true,
+      "containers": 15,
+      "expected": 15
+    },
+    "settle": {
+      "converge_wait": 90
+    },
+    "injection": {
+      "applied": true,
+      "skipped_reason": null,
+      "rc": 0,
+      "output": ""
+    },
+    "post_inject_check": {
+      "results": [
+        {
+          "line": {
+            "device": "router_core_2",
+            "command": "pgrep ospfd",
+            "expect": "empty"
+          },
+          "passed": true,
+          "actual": "",
+          "rationale": "output empty"
+        },
+        {
+          "line": {
+            "device": "host_2_1_1_1",
+            "command": "ping -W2 -c2 10.200.0.2",
+            "expect": "loss>0"
+          },
+          "passed": true,
+          "actual": "PING 10.200.0.2 (10.200.0.2) 56(84) bytes of data.\n\n--- 10.200.0.2 ping statistics ---\n2 packets transmitted, 0 received, 100% packet loss, time 1075ms",
+          "rationale": "loss=100%"
+        },
+        {
+          "line": {
+            "device": "host_1_1_1_1",
+            "command": "ping -W2 -c2 10.200.0.2",
+            "expect": "0% loss   (pod 1 unaffected)"
+          },
+          "passed": true,
+          "actual": "PING 10.200.0.2 (10.200.0.2) 56(84) bytes of data.\n64 bytes from 10.200.0.2: icmp_seq=1 ttl=60 time=1.87 ms\n64 bytes from 10.200.0.2: icmp_seq=2 ttl=60 time=2.96 ms\n\n--- 10.200.0.2 ping statistics ---\n2 packets transmitted, 2 received, 0% packet loss, time 1059ms\nrtt min/avg/max/mdev = 1.871/2.415/2.960/0.544 ms",
+          "rationale": "loss=0%"
+        }
+      ],
+      "wait_seconds": 0
+    },
+    "agent": {
+      "diagnosis_text": "**Affected component:** OSPF routing daemon configuration on `router_core_2` \u2014 the FRRouting process is running but the `router ospf` stanza is entirely absent from the running configuration (no `network` statements, no area assignments, no OSPF at all).\n\n**Mechanism:** `router_core_2` sits at the junction of three key links: `eth0` to `router_core_1`, `eth1` to `router_core_3`, and `eth2` to `switch_dist_2_1` (the pod-2 distribution layer). Because it advertises no OSPF networks, it forms zero OSPF adjacencies on all three links. Consequently, `switch_dist_2_1` \u2014 whose only uplink connects to `router_core_2` \u2014 can never form an OSPF adjacency and has no path to any network beyond its two directly connected subnets (`10.2.1.0/24` and `172.16.0.8/31`). Traffic from `host_2_1_1_1` destined for the server farm (10.200.0.x) hits `switch_dist_2_1` with no matching route, which returns ICMP \"Destination Net Unreachable\" from 10.2.1.1. The reverse is also broken: since `router_core_2` never redistributes `10.2.1.0/24` into area 0.0.0.0, no other router in the backbone knows how to reach pod-2, so inbound traffic to `host_2_1_1_1` is dropped at the backbone level. Pod-1 is unaffected because `switch_dist_1_1` has a working OSPF adjacency with `router_core_1` via area 0.0.0.1.\n\n**Localization:** `router_core_2` \u2014 FRR running config has no OSPF stanza. `switch_dist_2_1` \u2014 downstream victim with only 2 routes.\n\n**Root cause:** `router_core_2`'s FRR OSPF configuration was never applied, leaving it as a silent L3 hop that neither learns nor advertises any OSPF routes.\n\n**Fix:** Add a complete `router ospf` block to `router_core_2` with `network` statements for all three point-to-point links (`172.16.0.0/31` and `172.16.0.4/31` in area 0.0.0.0; `172.16.0.8/31` acting as ABR into area 0.0.0.1) so it can form adjacencies with `router_core_1`, `router_core_3`, and `switch_dist_2_1`.",
+      "is_anomaly": true,
+      "faulty_devices": [
+        "router_core_2"
+      ],
+      "parsed_ok": true,
+      "in_tokens": 18,
+      "cache_read_tokens": 124190,
+      "cache_write_tokens": 24614,
+      "out_tokens": 8766,
+      "cost_usd": 0.26227750000000005,
+      "tool_calls": 10,
+      "hit_max_turns": false,
+      "error": null
+    },
+    "score": {
+      "must_passed": 3,
+      "must_total": 3,
+      "bonus_passed": 0,
+      "bonus_total": 1,
+      "outcome_score": 0.7,
+      "fix_score": 0.0,
+      "reasoning_score": 0.9666666666666667,
+      "reasoning_dims": {
+        "grounding": 1.0,
+        "causality": 0.9,
+        "coverage": 1.0
+      },
+      "final_score": 0.7,
+      "per_axis": [
+        {
+          "axis": "assert-identifies: router_core_2",
+          "kind": "assert",
+          "score": 1.0,
+          "rationale": "culprit 'router_core_2' named (good)"
+        },
+        {
+          "axis": "must-identify-device: router_core_2",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The report explicitly localizes the fault to router_core_2 (FRR running config lacks OSPF), matching the required device identification."
+        },
+        {
+          "axis": "must-identify-component: ospfd / OSPF daemon down",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "Agent correctly pinpoints router_core_2's OSPF daemon/config as the fault (no 'router ospf' stanza, so OSPF is not operating), which matches the expected ospfd-related failure."
+        },
+        {
+          "axis": "bonus-scopes-blast-radius: notes pod 1 and the server farm stay healthy, isolating the fault to pod 2's transit through router_core_2",
+          "kind": "bonus",
+          "score": 0.0,
+          "rationale": "The report explicitly says Pod-1 is unaffected but does not clearly state that the server farm remains healthy, so the blast-radius isolation to pod-2 via router_core_2 is not fully noted."
+        },
+        {
+          "axis": "[FIX]",
+          "kind": "fix",
+          "score": 0.0,
+          "rationale": "It recommends adding an OSPF stanza instead of restarting the FRR/OSPF daemon to reload the existing /etc/frr/frr.conf, which is the correct remediation."
+        },
+        {
+          "axis": "reason:grounding",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "The log shows failed pings with 'Destination Net Unreachable', an ospf_snapshot stating router_core_2 has no OSPF/networks and zero neighbors, and router_core_2's running-config lacking any 'router ospf' stanza \u2014 the agent's conclusion that missing OSPF on router_core_2 causes the observed routing loss is well supported."
+        },
+        {
+          "axis": "reason:causality",
+          "kind": "reason-dim",
+          "score": 0.9,
+          "rationale": "The log shows failed pings with 'Destination Net Unreachable', an ospf_snapshot stating router_core_2 has no OSPF/networks and zero neighbors, and router_core_2's running-config lacking any 'router ospf' stanza \u2014 the agent's conclusion that missing OSPF on router_core_2 causes the observed routing loss is well supported."
+        },
+        {
+          "axis": "reason:coverage",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "The log shows failed pings with 'Destination Net Unreachable', an ospf_snapshot stating router_core_2 has no OSPF/networks and zero neighbors, and router_core_2's running-config lacking any 'router ospf' stanza \u2014 the agent's conclusion that missing OSPF on router_core_2 causes the observed routing loss is well supported."
+        }
+      ],
+      "judge_model": "gpt-5-mini",
+      "reasoning_mode": "trace",
+      "error": null
+    }
+  },
+  "agent_input_prompt": "# Topology overview (devices + L2 connectivity)\nTopology: ospf_enterprise_static\n\nDevices:\n  Routers (FRR): router_core_1, router_core_2, router_core_3, switch_dist_1_1, switch_dist_2_1, switch_server_access\n  Switches: switch_access_1_1_1, switch_access_2_1_1\n  Hosts: host_1_1_1_1, host_2_1_1_1\n  Dns servers: dns_server\n  Web servers: web_server_0, web_server_1, web_server_2, web_server_3\n\nLinks (device:iface <-> device:iface):\n  router_core_1:eth0 <-> router_core_2:eth0\n  router_core_1:eth1 <-> router_core_3:eth0\n  router_core_1:eth2 <-> switch_dist_1_1:eth0\n  router_core_2:eth1 <-> router_core_3:eth1\n  router_core_2:eth2 <-> switch_dist_2_1:eth0\n  router_core_3:eth2 <-> switch_server_access:eth5\n  switch_access_1_1_1:eth1 <-> host_1_1_1_1:eth0\n  switch_access_2_1_1:eth1 <-> host_2_1_1_1:eth0\n  switch_dist_1_1:eth1 <-> switch_access_1_1_1:eth0\n  switch_dist_2_1:eth1 <-> switch_access_2_1_1:eth0\n  dns_server:eth0 <-> switch_server_access:eth0\n  web_server_0:eth0 <-> switch_server_access:eth1\n  web_server_1:eth0 <-> switch_server_access:eth2\n  web_server_2:eth0 <-> switch_server_access:eth3\n  web_server_3:eth0 <-> switch_server_access:eth4\n\n# Symptom (user report)\nHelpdesk ticket #8871: host_2_1_1_1 (10.2.1.2) reports it has lost everything\nbeyond its own gateway: every 10.200.0.x server times out, and it cannot reach\nhost_1_1_1_1 in the other pod either. It CAN still ping its gateway 10.2.1.1.\nPod 1 is unaffected -- host_1_1_1_1 reaches the server farm normally. Diagnose."
+}

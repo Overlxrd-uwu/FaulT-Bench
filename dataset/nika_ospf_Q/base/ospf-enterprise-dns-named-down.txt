@@ -1,0 +1,64 @@
+==================================================
+Scenario: ospf-enterprise-dns-named-down
+Topology: ospf_enterprise_static
+Fault family: service down
+==================================================
+
+[PROMPT-TO-AGENT]
+Helpdesk ticket #8879: Users in both pods report that no internal portal
+loads by NAME anymore -- web0.local through web3.local all fail with
+name-resolution errors. Loading a portal directly by its IP address (e.g.
+http://10.200.0.3) still works, and pings to 10.200.0.2 succeed. Diagnose.
+
+[INJECTION]
+device: dns_server
+action: stop the BIND (named) DNS service on dns_server
+cmd: pkill -9 named
+
+[POST-INJECT-CHECK]
+dns_server     pgrep named                                          => expect empty
+host_1_1_1_1   nslookup web0.local 10.200.0.2 | grep -c 10.200.0.3  => expect 0
+host_1_1_1_1   ping -W2 -c2 10.200.0.2                              => expect 0% loss   (server itself still up)
+
+[GROUND-TRUTH]
+Affected component: dns_server BIND (named) DNS service
+Mechanism: the named daemon on dns_server (10.200.0.2) has been killed, so
+  nothing answers on port 53 and every *.local lookup from the pods times
+  out -- which is why the portals fail by name. Everything else is healthy:
+  the host 10.200.0.2 itself is up and pingable, the OSPF path works, and
+  the web servers keep serving HTTP (portals load when addressed by IP).
+  The symptom is purely dead name resolution.
+Localization: dns_server
+Root cause: named not running on dns_server (port 53 closed)
+Fix: `systemctl start named` on dns_server
+
+[FIX]
+Restart the BIND DNS service on dns_server (e.g. `systemctl start named`).
+Once named is answering again, web0.local..web3.local resolve to their
+10.200.0.x addresses and the portals load by name. The web servers and the
+network need no change.
+
+[DIAGNOSTIC-PROCESS]
+1. Reproduce on the real path: from host_1_1_1_1, nslookup web0.local
+   against 10.200.0.2 times out, while ping 10.200.0.2 succeeds and
+   http://10.200.0.3 loads -- so the network path and the web service are
+   healthy and only resolution is broken.
+2. Separate the layers: reachable server + no port-53 answers means the DNS
+   daemon itself is down, not the network and not the web servers.
+3. Test the service directly: on dns_server, `pgrep named` is empty -- the
+   BIND daemon is not running.
+4. Localize to dns_server (named): the dead DNS service fully explains the
+   by-name failures with by-IP success; exonerate the web servers and the
+   OSPF core.
+
+[SCORING-AXES]
+assert-identifies: dns_server
+must-identify-device: dns_server
+must-identify-component: BIND/named DNS service down (name resolution dead, port 53 closed)
+bonus-rules-out-network: notes 10.200.0.2 is reachable and portals load by IP, so the network and web servers are healthy -- only resolution is broken
+# These axes score the outcome metric only; fix and reasoning are judged separately.
+
+[NIKA-LABEL]
+nika_label: service_down
+nika_category: NETWORK_NODE_ERROR
+in_taxonomy: true

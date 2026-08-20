@@ -1,0 +1,181 @@
+{
+  "scenario": {
+    "scenario_id": "kath1-keepalived-master-down",
+    "topology": "Kath1",
+    "fault_family": "VRRP daemon down (master)",
+    "prompt_to_agent": "Office A users report a brief connectivity outage to their\ndefault gateway (10.1.0.1, 10.6.0.1, 10.0.0.1), then service\nrestored. After the event, traffic appears to take a slightly\nlonger path. The gateways still respond. Find what caused the\nevent.",
+    "injection": {
+      "device": "dswa1",
+      "action": "stop keepalived (kills all VRRP instances on the MASTER)",
+      "command": "pkill -9 keepalived",
+      "note": null
+    },
+    "pre_check": [],
+    "post_inject_check": [
+      {
+        "device": "dswa1",
+        "command": "pgrep keepalived",
+        "expect": "empty"
+      },
+      {
+        "device": "pc1",
+        "command": "ping -W2 -c2 10.1.0.1",
+        "expect": "0% loss (BACKUP took over)"
+      },
+      {
+        "device": "dswa2",
+        "command": "ip -br addr show br0.10 | grep 10.1.0.1",
+        "expect": "non-empty"
+      }
+    ],
+    "ground_truth": "Affected component: dswa1 keepalived process (VRRP daemon)\nMechanism: dswa1 was VRRP MASTER for VIs 10, 20, 40, 99 on\n  Office A side (priorities 105 / 1 / 1 / 105). Killing\n  keepalived stops VRRP advertisements; after the dead\n  interval (~3s) dswa2 takes over MASTER for all of them.\n  Briefly during failover, packets to VIPs are dropped.\n  Steady state restores once dswa2 owns the VIPs.\nLocalization: dswa1\nRoot cause: keepalived not running on dswa1\nFix: `/etc/init.d/keepalived start` on dswa1",
+    "fix_spec": "`/etc/init.d/keepalived start` on dswa1",
+    "scoring_axes": [
+      "assert-identifies: dswa1",
+      "must-identify-device: dswa1",
+      "must-identify-component: keepalived / VRRP",
+      "must-explain-failover-pattern"
+    ],
+    "source_path": "dataset/kath1_Q/base/kath1-keepalived-master-down.txt",
+    "scenario_class": "base",
+    "ticket_style": "standard"
+  },
+  "agent": "sade",
+  "timestamp": "2026-07-31T05:55:16.475179+00:00",
+  "phases": {
+    "lstart": {
+      "ok": true,
+      "containers": 20,
+      "expected": 20
+    },
+    "settle": {
+      "converge_wait": 90
+    },
+    "injection": {
+      "applied": true,
+      "skipped_reason": null,
+      "rc": 0,
+      "output": ""
+    },
+    "post_inject_check": {
+      "results": [
+        {
+          "line": {
+            "device": "dswa1",
+            "command": "pgrep keepalived",
+            "expect": "empty"
+          },
+          "passed": true,
+          "actual": "",
+          "rationale": "output empty"
+        },
+        {
+          "line": {
+            "device": "pc1",
+            "command": "ping -W2 -c2 10.1.0.1",
+            "expect": "0% loss (BACKUP took over)"
+          },
+          "passed": true,
+          "actual": "PING 10.1.0.1 (10.1.0.1) 56(84) bytes of data.\n64 bytes from 10.1.0.1: icmp_seq=1 ttl=64 time=0.881 ms\n64 bytes from 10.1.0.1: icmp_seq=2 ttl=64 time=2.39 ms\n\n--- 10.1.0.1 ping statistics ---\n2 packets transmitted, 2 received, 0% packet loss, time 1049ms\nrtt min/avg/max/mdev = 0.881/1.633/2.386/0.752 ms",
+          "rationale": "loss=0%"
+        },
+        {
+          "line": {
+            "device": "dswa2",
+            "command": "ip -br addr show br0.10 | grep 10.1.0.1",
+            "expect": "non-empty"
+          },
+          "passed": true,
+          "actual": "br0.10@br0       UP             10.1.0.3/24 10.1.0.1/32",
+          "rationale": "output present"
+        }
+      ],
+      "wait_seconds": 10
+    },
+    "agent": {
+      "diagnosis_text": "**Affected component:** The keepalived VRRP daemon on dswa1 has stopped running. dswa1 is configured as the high-priority MASTER (priority 105) for VRRP instances VI_10 (VIP 10.1.0.1) and VI_99 (VIP 10.0.0.1), while dswa2 is the low-priority backup (priority 1) for those same instances.\n\n**Mechanism:** When dswa1's keepalived process exited, it did so without executing a clean SIGTERM shutdown. As a result, the VIP addresses (10.1.0.1/32 on br0.10, 10.0.0.1/32 on br0.99) were **never removed** from dswa1's interfaces. After the VRRP dead interval (advert_int=4 \u00d7 3 \u2248 12 seconds), dswa2's keepalived detected no MASTER advertisements for VI_10 and VI_99, promoted itself, and added those same VIPs to its own br0.10 and br0.99. Now both dswa1 and dswa2 simultaneously have 10.1.0.1/32 on the same VLAN 10 broadcast domain \u2014 a live IP conflict.\n\n**Localization:** dswa1 \u2014 no keepalived process running, stale 10.1.0.1/32 and 10.0.0.1/32 retained on br0.10/br0.99. dswa2 \u2014 keepalived running, legitimately holds those same VIPs as elected master. ARP requests for 10.1.0.1 are answered by both devices with their respective physical MACs, causing infra_sweep's `arp_gateway_divergence` flag: pc1 caches dswa2's MAC (STALE), pc2 caches dswa1's MAC (REACHABLE).\n\n**Root cause:** dswa1's keepalived daemon died without cleaning up its VRRP VIP addresses, causing simultaneous dual-ownership of 10.1.0.1 and 10.0.0.1, a VRRP failover-induced brief outage (\u224812 s dead interval), and a persistent ARP conflict that makes traffic to these gateway IPs non-deterministically split between the two distribution switches \u2014 explaining the \"slightly longer path\" observed after recovery.\n\n**Fix:** Restart keepalived on dswa1 (`systemctl start keepalived`). dswa1 will resume sending higher-priority VRRP advertisements; dswa2 will relinquish VI_10/VI_99 mastership and remove those VIPs from its interfaces, restoring unambiguous ARP ownership and consistent gateway paths.",
+      "is_anomaly": true,
+      "faulty_devices": [
+        "dswa1"
+      ],
+      "parsed_ok": true,
+      "in_tokens": 25,
+      "cache_read_tokens": 462870,
+      "cache_write_tokens": 67727,
+      "out_tokens": 45619,
+      "cost_usd": 1.07984925,
+      "tool_calls": 26,
+      "hit_max_turns": false,
+      "error": null
+    },
+    "score": {
+      "must_passed": 3,
+      "must_total": 4,
+      "bonus_passed": 0,
+      "bonus_total": 0,
+      "outcome_score": 0.7499999999999999,
+      "fix_score": 1.0,
+      "reasoning_score": 0.8666666666666667,
+      "reasoning_dims": {
+        "grounding": 0.8,
+        "causality": 0.9,
+        "coverage": 0.9
+      },
+      "final_score": 0.7499999999999999,
+      "per_axis": [
+        {
+          "axis": "assert-identifies: dswa1",
+          "kind": "assert",
+          "score": 1.0,
+          "rationale": "culprit 'dswa1' named (good)"
+        },
+        {
+          "axis": "must-identify-device: dswa1",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The report explicitly names dswa1 as the affected device (keepalived stopped, stale VIPs present) so it correctly identifies dswa1."
+        },
+        {
+          "axis": "must-identify-component: keepalived / VRRP",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The report explicitly names the keepalived VRRP daemon on dswa1 as the failed component and discusses VRRP behavior and VIP ownership."
+        },
+        {
+          "axis": "must-explain-failover-pattern",
+          "kind": "must",
+          "score": 0.0,
+          "rationale": "The agent describes persistent dual-ownership/ARP conflict rather than the expected failover pattern where dswa2 becomes sole MASTER after the dead interval, causing only a brief outage."
+        },
+        {
+          "axis": "[FIX]",
+          "kind": "fix",
+          "score": 1.0,
+          "rationale": "Recommends starting/restarting keepalived on dswa1 (systemctl start), which matches the expected fix to restore VRRP ownership and clear the IP conflict."
+        },
+        {
+          "axis": "reason:grounding",
+          "kind": "reason-dim",
+          "score": 0.8,
+          "rationale": "The agent's investigation log contains direct observations (ARP divergence, interface IPs, missing keepalived process on dswa1, dswa2 holding the VIPs, OSPF uptime gap) that support the conclusion that dswa1's keepalived stopped and dswa2 promoted itself, producing a brief failover and persistent ARP conflict. A few minor claims (exact shutdown signal) are asserted without explicit evidence, but the core causal chain is well supported and alternatives were checked."
+        },
+        {
+          "axis": "reason:causality",
+          "kind": "reason-dim",
+          "score": 0.9,
+          "rationale": "The agent's investigation log contains direct observations (ARP divergence, interface IPs, missing keepalived process on dswa1, dswa2 holding the VIPs, OSPF uptime gap) that support the conclusion that dswa1's keepalived stopped and dswa2 promoted itself, producing a brief failover and persistent ARP conflict. A few minor claims (exact shutdown signal) are asserted without explicit evidence, but the core causal chain is well supported and alternatives were checked."
+        },
+        {
+          "axis": "reason:coverage",
+          "kind": "reason-dim",
+          "score": 0.9,
+          "rationale": "The agent's investigation log contains direct observations (ARP divergence, interface IPs, missing keepalived process on dswa1, dswa2 holding the VIPs, OSPF uptime gap) that support the conclusion that dswa1's keepalived stopped and dswa2 promoted itself, producing a brief failover and persistent ARP conflict. A few minor claims (exact shutdown signal) are asserted without explicit evidence, but the core causal chain is well supported and alternatives were checked."
+        }
+      ],
+      "judge_model": "gpt-5-mini",
+      "reasoning_mode": "trace",
+      "error": null
+    }
+  },
+  "agent_input_prompt": "# Topology overview (devices + L2 connectivity)\nTopology: Kath1\n\nDevices:\n  aswa1: eth0=CD_CLIENT_A1, eth1=CD_LINK_A2, eth2=CD_DSW_1_A1, eth3=CD_DSW_2_A1\n  aswa2: eth0=link_a2_pc, eth1=CD_DSW_1_A2, eth2=CD_DSW_2_A2\n  aswa3: eth0=CD_CLIENT_A3, eth1=CD_DSW_1_A3, eth2=CD_DSW_2_A3\n  aswb1: eth0=CD_CLIENT_B1, eth1=CD_DSW_1_B1, eth2=CD_DSW_2_B1\n  aswb2: eth0=CD_CLIENT_B2, eth1=CD_DSW_1_B2, eth2=CD_DSW_2_B2\n  aswb3: eth0=CD_CLIENT_B3, eth1=CD_DSW_1_B3, eth2=CD_DSW_2_B3\n  csw1: eth0=CD_WAN_LINK_1, eth1=CD_CORE_PEER_1, eth2=CD_CORE_PEER_2, eth3=CD_CORE_1_DSW1, eth4=CD_CORE_1_DSW2, eth5=CD_CORE_1_DSWB1, eth6=CD_CORE_1_DSWB2\n  csw2: eth0=CD_WAN_LINK_2, eth1=CD_CORE_PEER_1, eth2=CD_CORE_PEER_2, eth3=CD_CORE_2_DSW1, eth4=CD_CORE_2_DSW2, eth5=CD_CORE_2_DSWB1, eth6=CD_CORE_2_DSWB2\n  dswa1: eth0=CD_DSW_1_A1, eth1=CD_DSW_1_A2, eth2=CD_DSW_1_A3, eth3=CD_DSW_PEER_1, eth4=CD_DSW_PEER_2, eth5=CD_CORE_1_DSW1, eth6=CD_CORE_2_DSW1\n  dswa2: eth0=CD_DSW_2_A1, eth1=CD_DSW_2_A2, eth2=CD_DSW_2_A3, eth3=CD_DSW_PEER_1, eth4=CD_DSW_PEER_2, eth5=CD_CORE_1_DSW2, eth6=CD_CORE_2_DSW2\n  dswb1: eth0=CD_DSW_1_B1, eth1=CD_DSW_1_B2, eth2=CD_DSW_1_B3, eth3=CD_DSW_PEER_B_1, eth4=CD_DSW_PEER_B_2, eth5=CD_CORE_1_DSWB1, eth6=CD_CORE_2_DSWB1\n  dswb2: eth0=CD_DSW_2_B1, eth1=CD_DSW_2_B2, eth2=CD_DSW_2_B3, eth3=CD_DSW_PEER_B_1, eth4=CD_DSW_PEER_B_2, eth5=CD_CORE_1_DSWB2, eth6=CD_CORE_2_DSWB2\n  ispa: eth0=CD_ISP_R1, eth1=CD_ISPA_ISPB\n  ispb: eth0=CD_ISPB_R1, eth1=CD_ISPA_ISPB\n  laptop1: eth0=CD_LINK_A2\n  pc1: eth0=link_a2_pc\n  pc2: eth0=CD_CLIENT_A3\n  pc3: eth0=CD_CLIENT_B2\n  r1: eth0=CD_WAN_LINK_1, eth1=CD_WAN_LINK_2, eth2=CD_ISP_R1, eth3=CD_ISPB_R1\n  srv1: eth0=CD_CLIENT_B3\n\nCollision domains (shared L2 segments):\n  CD_CLIENT_A1: aswa1.eth0\n  CD_CLIENT_A3: aswa3.eth0, pc2.eth0\n  CD_CLIENT_B1: aswb1.eth0\n  CD_CLIENT_B2: aswb2.eth0, pc3.eth0\n  CD_CLIENT_B3: aswb3.eth0, srv1.eth0\n  CD_CORE_1_DSW1: csw1.eth3, dswa1.eth5\n  CD_CORE_1_DSW2: csw1.eth4, dswa2.eth5\n  CD_CORE_1_DSWB1: csw1.eth5, dswb1.eth5\n  CD_CORE_1_DSWB2: csw1.eth6, dswb2.eth5\n  CD_CORE_2_DSW1: csw2.eth3, dswa1.eth6\n  CD_CORE_2_DSW2: csw2.eth4, dswa2.eth6\n  CD_CORE_2_DSWB1: csw2.eth5, dswb1.eth6\n  CD_CORE_2_DSWB2: csw2.eth6, dswb2.eth6\n  CD_CORE_PEER_1: csw1.eth1, csw2.eth1\n  CD_CORE_PEER_2: csw1.eth2, csw2.eth2\n  CD_DSW_1_A1: aswa1.eth2, dswa1.eth0\n  CD_DSW_1_A2: aswa2.eth1, dswa1.eth1\n  CD_DSW_1_A3: aswa3.eth1, dswa1.eth2\n  CD_DSW_1_B1: aswb1.eth1, dswb1.eth0\n  CD_DSW_1_B2: aswb2.eth1, dswb1.eth1\n  CD_DSW_1_B3: aswb3.eth1, dswb1.eth2\n  CD_DSW_2_A1: aswa1.eth3, dswa2.eth0\n  CD_DSW_2_A2: aswa2.eth2, dswa2.eth1\n  CD_DSW_2_A3: aswa3.eth2, dswa2.eth2\n  CD_DSW_2_B1: aswb1.eth2, dswb2.eth0\n  CD_DSW_2_B2: aswb2.eth2, dswb2.eth1\n  CD_DSW_2_B3: aswb3.eth2, dswb2.eth2\n  CD_DSW_PEER_1: dswa1.eth3, dswa2.eth3\n  CD_DSW_PEER_2: dswa1.eth4, dswa2.eth4\n  CD_DSW_PEER_B_1: dswb1.eth3, dswb2.eth3\n  CD_DSW_PEER_B_2: dswb1.eth4, dswb2.eth4\n  CD_ISPA_ISPB: ispa.eth1, ispb.eth1\n  CD_ISPB_R1: ispb.eth0, r1.eth3\n  CD_ISP_R1: ispa.eth0, r1.eth2\n  CD_LINK_A2: aswa1.eth1, laptop1.eth0\n  CD_WAN_LINK_1: csw1.eth0, r1.eth0\n  CD_WAN_LINK_2: csw2.eth0, r1.eth1\n  link_a2_pc: aswa2.eth0, pc1.eth0\n\n# Symptom (user report)\nOffice A users report a brief connectivity outage to their\ndefault gateway (10.1.0.1, 10.6.0.1, 10.0.0.1), then service\nrestored. After the event, traffic appears to take a slightly\nlonger path. The gateways still respond. Find what caused the\nevent."
+}

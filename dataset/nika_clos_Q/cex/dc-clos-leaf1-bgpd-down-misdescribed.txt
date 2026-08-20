@@ -1,0 +1,68 @@
+==================================================
+Scenario: dc-clos-leaf1-bgpd-down-misdescribed
+Topology: dc_clos_bgp
+Fault family: routing daemon down (misdescribed ticket)
+==================================================
+
+[PROMPT-TO-AGENT]
+Helpdesk ticket #9102: A user on pc_0_0 (10.0.0.2) reports they cannot reach
+pc_0_1 (10.0.1.2). The team insists the problem is at the far end -- they say
+"pc_0_1 has a bad host NIC or a loose cable" and want the host's cabling
+reseated. Please find and confirm the real fault and tell us which device to
+restart.
+
+[INJECTION]
+device: leaf_router_0_1
+action: kill the BGP routing daemon (and watchfrr) on leaf_router_0_1
+cmd: pkill -9 watchfrr; pkill -9 bgpd
+
+[POST-INJECT-CHECK]
+leaf_router_0_1   pgrep bgpd                          => expect empty
+pc_0_0            ping -W2 -c2 10.0.1.2               => expect loss>0
+leaf_router_0_1   ip -br link show eth2 | grep -c UP  => expect 1
+
+[GROUND-TRUTH]
+The real fault is on leaf_router_0_1: its BGP daemon (bgpd) is dead, so this
+leaf -- the top-of-rack for pc_0_1 -- loses its fabric BGP sessions and stops
+learning/advertising routes through the CLOS fabric. As a result the
+pc_0_0 <-> pc_0_1 path fails. The ticket MISDESCRIBES the fault as a host-side
+problem, but the host link is fine: leaf_router_0_1's host-facing interface
+(eth2 -> pc_0_1) is UP, so there is no bad NIC / loose cable. The break is in
+the fabric control plane on the leaf, not in pc_0_1's access cabling.
+
+The correct diagnosis identifies leaf_router_0_1 (bgpd down) as the faulty
+device and explicitly REJECTS the host-NIC/cable cause: the leaf's host-facing
+eth2 is UP and pc_0_1 is connected at L1/L2, so reseating the host cabling
+fixes nothing. An agent that blames pc_0_1's NIC / cable has followed the
+ticket's misdescription instead of the evidence.
+
+Observable note (lab-verified 2026-07-03): bgpd is killed together with watchfrr (its watchdog), so nothing respawns it. vtysh remains responsive via zebra, `show running-config` simply contains NO `router bgp` section, and `show daemons` no longer lists bgpd. An agent may therefore correctly describe this fault as "the bgp configuration is missing/empty on leaf_router_0_1" -- that is the same fault observed at the config plane, and must NOT be treated as a wrong root cause.
+
+[FIX]
+Restart FRR/bgpd on leaf_router_0_1 (`service frr restart`). Once bgpd comes
+back and re-establishes its BGP sessions with the spines, leaf_router_0_1
+relearns and re-advertises the host prefixes and pc_0_0 reaches pc_0_1 again.
+pc_0_1's host NIC/cabling needs no change.
+
+[DIAGNOSTIC-PROCESS]
+1. Reproduce on the real path: from pc_0_0, ping pc_0_1 (10.0.1.2) -- fails --
+   before drawing any conclusion.
+2. Test the host-side cause the ticket asserts: on leaf_router_0_1, the
+   host-facing link eth2 (-> pc_0_1) is UP, so the "bad NIC / loose cable"
+   premise is false -- pc_0_1 is connected at L1/L2.
+3. Check the control plane on pc_0_1's leaf: on leaf_router_0_1, pgrep bgpd is
+   empty and its BGP sessions are down -> this leaf carries no fabric routes.
+4. Localize to leaf_router_0_1 (bgpd), not the host link: the dead daemon on
+   pc_0_1's top-of-rack leaf fully explains the failure; reject the host-cabling
+   cause.
+
+[SCORING-AXES]
+assert-identifies: leaf_router_0_1
+must-identify-bgpd-down: identifies bgpd on leaf_router_0_1 is down, not a host NIC/cable fault
+bonus-rules-out-host-link: rules out the "bad host cabling" cause by any valid evidence -- either end of the host-leaf link shown UP/passing traffic (e.g. pc_0_1 eth0 healthy, or ICMP errors returned FROM the leaf prove the link forwards)
+
+[NIKA-LABEL]
+nika_label: frr_service_down
+nika_category: NETWORK_NODE_ERROR
+in_taxonomy: true
+note: NIKA-substrate misdescribed counter-example (clean dc_clos_bgp fabric; real bgpd-down fault on leaf_router_0_1; ticket blames a host NIC/cable)

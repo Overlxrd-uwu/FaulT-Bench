@@ -1,0 +1,166 @@
+{
+  "scenario": {
+    "scenario_id": "simple-bgp-router1-bgpd-down",
+    "topology": "simple_bgp",
+    "fault_family": "routing daemon down",
+    "prompt_to_agent": "The user on pc1 (195.11.14.2) reports they suddenly cannot reach\npc2 (200.1.1.2) or anything else in the partner AS. pc1 can still\nping its own gateway 195.11.14.1 normally. The partner operator\nreports their side is healthy internally: pc2 still reaches its\ngateway 200.1.1.1 fine. Diagnose.",
+    "injection": {
+      "device": "router1",
+      "action": "kill the BGP routing daemon (and its watchdog) on router1",
+      "command": "pkill -9 watchfrr; pkill -9 bgpd",
+      "note": null
+    },
+    "pre_check": [],
+    "post_inject_check": [
+      {
+        "device": "router1",
+        "command": "pgrep bgpd",
+        "expect": "empty"
+      },
+      {
+        "device": "pc1",
+        "command": "ping -W2 -c2 200.1.1.2",
+        "expect": "loss>0"
+      }
+    ],
+    "ground_truth": "Affected component: router1 bgpd\nMechanism: router1 (AS 1) is pc1's only gateway and the local eBGP\n  speaker toward router2 (AS 2) over the 193.10.11.0/24 inter-AS\n  link. With bgpd dead on router1, the eBGP session to router2\n  drops: router1 loses the learned route to 200.1.1.0/24 and stops\n  advertising 195.11.14.0/24, so router2 withdraws it too. Traffic\n  between pc1 and pc2 fails in both directions. Local segments are\n  unaffected (pc1<->195.11.14.1 and pc2<->200.1.1.1 still work).\nLocalization: router1\nRoot cause: bgpd not running on router1\nFix: restart FRR on router1 (`service frr restart`)\n\nObservable note (lab-verified 2026-07-03): bgpd is killed together with watchfrr (its watchdog), so nothing respawns it. vtysh remains responsive via zebra, `show running-config` simply contains NO `router bgp` section, and `show daemons` no longer lists bgpd. An agent may therefore correctly describe this fault as \"the bgp configuration is missing/empty on router1\" -- that is the same fault observed at the config plane, and must NOT be treated as a wrong root cause.",
+    "fix_spec": "Restart FRR/bgpd on router1 (`service frr restart`). Once bgpd is running again,\nthe eBGP session to router2 re-establishes, router1 re-learns and re-advertises\nthe inter-AS prefixes, and pc1 reaches pc2 normally. router2 needs no change.",
+    "scoring_axes": [
+      "assert-identifies: router1",
+      "must-identify-device: router1",
+      "must-identify-component: bgpd / BGP daemon not running",
+      "bonus-rules-out-link: notes the inter-AS link (router1 eth0) is UP, distinguishing a daemon failure from a link cut"
+    ],
+    "source_path": "dataset/nika_bgp_Q/base/simple-bgp-router1-bgpd-down.txt",
+    "scenario_class": "base",
+    "ticket_style": "standard"
+  },
+  "agent": "cc-baseline",
+  "timestamp": "2026-08-03T07:25:46.679048+00:00",
+  "phases": {
+    "lstart": {
+      "ok": true,
+      "containers": 4,
+      "expected": 4
+    },
+    "settle": {
+      "converge_wait": 90
+    },
+    "injection": {
+      "applied": true,
+      "skipped_reason": null,
+      "rc": 0,
+      "output": ""
+    },
+    "post_inject_check": {
+      "results": [
+        {
+          "line": {
+            "device": "router1",
+            "command": "pgrep bgpd",
+            "expect": "empty"
+          },
+          "passed": true,
+          "actual": "",
+          "rationale": "output empty"
+        },
+        {
+          "line": {
+            "device": "pc1",
+            "command": "ping -W2 -c2 200.1.1.2",
+            "expect": "loss>0"
+          },
+          "passed": true,
+          "actual": "PING 200.1.1.2 (200.1.1.2) 56(84) bytes of data.\nFrom 195.11.14.1 icmp_seq=1 Destination Net Unreachable\nFrom 195.11.14.1 icmp_seq=2 Destination Net Unreachable\n\n--- 200.1.1.2 ping statistics ---\n2 packets transmitted, 0 received, +2 errors, 100% packet loss, time 1071ms",
+          "rationale": "loss=100%"
+        }
+      ],
+      "wait_seconds": 0
+    },
+    "agent": {
+      "diagnosis_text": "The fault is the complete absence of the bgpd process on router1. The FRR\nservice on router1 is in an \"inactive (dead)\" state, meaning bgpd was killed\nor crashed and was never restarted. Without bgpd, router1 cannot open a BGP\nTCP session on port 179 toward router2 (193.10.11.2). Router2's BGP daemon\n(AS 2, router-id 200.1.1.1) is healthy and keeps retrying the connection to\n193.10.11.1, but because nothing is listening on that address, the session\nnever leaves the Active state and no prefixes are exchanged in either\ndirection.\n\nAs a consequence, router1's RIB contains only its two directly connected\nprefixes (193.10.11.0/24 and 195.11.14.0/24) \u2014 there is no route to\n200.1.1.0/24, so any packet from pc1 (195.11.14.2) destined for pc2\n(200.1.1.2) is silently black-holed at router1. Symmetrically, router2 never\nlearns 195.11.14.0/24, so return traffic would also fail. This fully explains\nwhy pc1 can reach its own gateway (router1's eth1, 195.11.14.1 \u2014 reachable\nvia a connected route) but cannot reach anything beyond it in AS 2.\n\nThe valid BGP configuration already exists on disk in router1's /etc/frr/frr.conf\n(router bgp 1, neighbor 193.10.11.2 remote-as 2, network 195.11.14.0/24, no\nbgp ebgp-requires-policy), so no configuration repair is needed.\n\nRoot cause: bgpd was killed on router1 and the FRR service is dead.\n\nCorrective fix: Run `systemctl start frr` on router1. This will restart bgpd,\nwhich will load frr.conf, establish the eBGP session with router2, and\nexchange the two prefixes (195.11.14.0/24 \u2194 200.1.1.0/24), fully restoring\npc1-to-pc2 connectivity.",
+      "is_anomaly": true,
+      "faulty_devices": [
+        "router1"
+      ],
+      "parsed_ok": true,
+      "in_tokens": 13,
+      "cache_read_tokens": 79916,
+      "cache_write_tokens": 13789,
+      "out_tokens": 4154,
+      "cost_usd": 0.13876755,
+      "tool_calls": 16,
+      "hit_max_turns": false,
+      "error": null
+    },
+    "score": {
+      "must_passed": 3,
+      "must_total": 3,
+      "bonus_passed": 1,
+      "bonus_total": 1,
+      "outcome_score": 1.0,
+      "fix_score": 1.0,
+      "reasoning_score": 1.0,
+      "reasoning_dims": {
+        "grounding": 1.0,
+        "causality": 1.0,
+        "coverage": 1.0
+      },
+      "final_score": 1.0,
+      "per_axis": [
+        {
+          "axis": "assert-identifies: router1",
+          "kind": "assert",
+          "score": 1.0,
+          "rationale": "culprit 'router1' named (good)"
+        },
+        {
+          "axis": "must-identify-device: router1",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The report explicitly names router1 as the affected device (bgpd/FRR dead on router1)."
+        },
+        {
+          "axis": "must-identify-component: bgpd / BGP daemon not running",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The report explicitly identifies that bgpd (the BGP daemon) on router1 is absent/killed and FRR is dead, matching the required component identification."
+        },
+        {
+          "axis": "bonus-rules-out-link: notes the inter-AS link (router1 eth0) is UP, distinguishing a daemon failure from a link cut",
+          "kind": "bonus",
+          "score": 1.0,
+          "rationale": "The writeup explicitly notes router2 is actively retrying connections to 193.10.11.1 and that 193.10.11.0/24 is a directly connected prefix on router1, which demonstrates the inter\u2011AS link (router1 eth0) is up and distinguishes a daemon failure from a link cut."
+        },
+        {
+          "axis": "[FIX]",
+          "kind": "fix",
+          "score": 1.0,
+          "rationale": "The agent recommends starting/restarting the FRR service on router1 (systemctl start frr), which will restore bgpd and re-establish the eBGP session as required."
+        },
+        {
+          "axis": "reason:grounding",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "The investigation log shows bgpd is absent on router1 (service inactive, ps lacks bgpd, 'show bgp summary' returns 'bgpd is not running'), a valid on-disk BGP config exists, and router2's session is stuck in Active; the agent's inference that bgpd being dead on router1 caused the BGP adjacency and route loss (and thus pc1\u2194pc2 failure) is directly supported and complete."
+        },
+        {
+          "axis": "reason:causality",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "The investigation log shows bgpd is absent on router1 (service inactive, ps lacks bgpd, 'show bgp summary' returns 'bgpd is not running'), a valid on-disk BGP config exists, and router2's session is stuck in Active; the agent's inference that bgpd being dead on router1 caused the BGP adjacency and route loss (and thus pc1\u2194pc2 failure) is directly supported and complete."
+        },
+        {
+          "axis": "reason:coverage",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "The investigation log shows bgpd is absent on router1 (service inactive, ps lacks bgpd, 'show bgp summary' returns 'bgpd is not running'), a valid on-disk BGP config exists, and router2's session is stuck in Active; the agent's inference that bgpd being dead on router1 caused the BGP adjacency and route loss (and thus pc1\u2194pc2 failure) is directly supported and complete."
+        }
+      ],
+      "judge_model": "gpt-5-mini",
+      "reasoning_mode": "trace",
+      "error": null
+    }
+  },
+  "agent_input_prompt": "# Topology overview (devices + L2 connectivity)\nTopology: simple_bgp\n\nDevices:\n  Routers (FRR): router1, router2\n  Hosts: pc1, pc2\n\nLinks (device:iface <-> device:iface):\n  router1:eth0 <-> router2:eth0\n  router1:eth1 <-> pc1:eth0\n  router2:eth1 <-> pc2:eth0\n\n# Symptom (user report)\nThe user on pc1 (195.11.14.2) reports they suddenly cannot reach\npc2 (200.1.1.2) or anything else in the partner AS. pc1 can still\nping its own gateway 195.11.14.1 normally. The partner operator\nreports their side is healthy internally: pc2 still reaches its\ngateway 200.1.1.1 fine. Diagnose."
+}

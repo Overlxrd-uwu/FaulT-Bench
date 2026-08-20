@@ -1,0 +1,68 @@
+==================================================
+Scenario: dc-clos-leaf0-bgpd-down-misdirected
+Topology: dc_clos_bgp
+Fault family: routing daemon down (misdirected ticket)
+==================================================
+
+[PROMPT-TO-AGENT]
+Helpdesk ticket #9101: A user on pc_0_0 (10.0.0.2) reports they lost reach to
+pc_0_1 (10.0.1.2) across the data-center fabric. The team is convinced a spine
+is at fault -- they say "spine_router_0_0 must have dropped its BGP sessions"
+and want that spine restarted. Please find and confirm the real fault and tell
+us which device to restart.
+
+[INJECTION]
+device: leaf_router_0_0
+action: kill the BGP routing daemon (and watchfrr) on leaf_router_0_0
+cmd: pkill -9 watchfrr; pkill -9 bgpd
+
+[POST-INJECT-CHECK]
+leaf_router_0_0   pgrep bgpd              => expect empty
+pc_0_0            ping -W2 -c2 10.0.1.2   => expect loss>0
+
+[GROUND-TRUTH]
+The real fault is on leaf_router_0_0: its BGP daemon (bgpd) is dead, so this
+leaf -- the top-of-rack for pc_0_0 -- loses its fabric BGP sessions and stops
+learning/advertising routes through the CLOS fabric. As a result pc_0_0
+(10.0.0.2) is isolated and cannot reach pc_0_1 (10.0.1.2). The ticket MISDIRECTS
+to a spine, but the spines are healthy: the CLOS fabric is redundant and the
+OTHER leaf (leaf_router_0_1) still reaches the fabric normally through both
+spines, which it could not do if spine_router_0_0 were down. The symptom is
+purely the dead bgpd on pc_0_0's own leaf, not a spine fault.
+
+The correct diagnosis identifies leaf_router_0_0 (bgpd down) as the faulty
+device and explicitly EXONERATES spine_router_0_0: the spines still carry the
+fabric for the other leaf, so the user's "spine dropped its sessions" hypothesis
+is wrong. An agent that restarts / blames spine_router_0_0 has followed the
+ticket's misdirection instead of the evidence.
+
+Observable note (lab-verified 2026-07-03): bgpd is killed together with watchfrr (its watchdog), so nothing respawns it. vtysh remains responsive via zebra, `show running-config` simply contains NO `router bgp` section, and `show daemons` no longer lists bgpd. An agent may therefore correctly describe this fault as "the bgp configuration is missing/empty on leaf_router_0_0" -- that is the same fault observed at the config plane, and must NOT be treated as a wrong root cause.
+
+[FIX]
+Restart FRR/bgpd on leaf_router_0_0 (`service frr restart`). Once bgpd comes
+back and re-establishes its BGP sessions with the spines, leaf_router_0_0
+relearns and re-advertises the host prefixes and pc_0_0 reaches pc_0_1 again.
+spine_router_0_0 needs no change.
+
+[DIAGNOSTIC-PROCESS]
+1. Reproduce on the real path: from pc_0_0, ping pc_0_1 (10.0.1.2) -- fails --
+   before drawing any conclusion.
+2. Test the spine the ticket blames: spine_router_0_0 is healthy -- the other
+   leaf (leaf_router_0_1) still reaches the fabric through both spines, so the
+   ticket's "spine dropped its sessions" premise is false.
+3. Check the control plane on pc_0_0's leaf: on leaf_router_0_0, pgrep bgpd is
+   empty and its BGP sessions are down -> this leaf carries no fabric routes.
+4. Localize to leaf_router_0_0 (bgpd), not a spine: the dead daemon on pc_0_0's
+   top-of-rack leaf fully explains the isolation; exonerate spine_router_0_0.
+
+[SCORING-AXES]
+assert-identifies: leaf_router_0_0
+assert-not-identifies: spine_router_0_0
+must-identify-bgpd-down: identifies bgpd on leaf_router_0_0 (pc_0_0's ToR leaf) is down, not a spine fault
+bonus-exonerates-spine: explicitly notes the spines still carry the fabric for the other leaf, rejecting the ticket's spine hypothesis
+
+[NIKA-LABEL]
+nika_label: frr_service_down
+nika_category: NETWORK_NODE_ERROR
+in_taxonomy: true
+note: NIKA-substrate misdirected counter-example (clean dc_clos_bgp fabric; real bgpd-down fault on leaf_router_0_0; ticket blames a spine)

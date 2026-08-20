@@ -1,0 +1,86 @@
+==================================================
+Scenario: dc-clos-spine1-wrong-remote-as
+Topology: dc_clos_bgp
+Fault family: BGP config error (wrong remote-as on a neighbor)
+==================================================
+
+[PROMPT-TO-AGENT]
+Since a config push this morning, the BGP session between
+spine_router_0_1 and leaf_router_0_1 will not come up: it cycles
+without ever reaching Established, and the leaf's log shows its OPEN
+being rejected by the spine with an AS error. Every other session in
+the fabric is Established, all interfaces are UP, and users report at
+most a brief blip -- pc_0_0 (10.0.0.2) and pc_0_1 (10.0.1.2) still
+reach each other. Find the fault.
+
+[INJECTION]
+device: spine_router_0_1
+action: misconfigure the remote-as of the leaf_router_0_1 neighbor
+cmd: |
+  vtysh -c "configure terminal" \
+        -c "router bgp 65101" \
+        -c "neighbor 172.16.0.11 remote-as 65999" \
+        -c "exit" -c "exit"
+
+[POST-INJECT-CHECK]
+spine_router_0_1   vtysh -c "show running-config" | grep -c "remote-as 65999"  => expect 1
+pc_0_0             ping -W2 -c2 10.0.1.2                                       => expect 0% loss   (still OK -- path via spine_router_0_0)
+
+[GROUND-TRUTH]
+Affected component: spine_router_0_1 BGP neighbor remote-as
+Mechanism: spine_router_0_1 (AS 65101) peers with leaf_router_0_1 at
+  172.16.0.11, whose real AS is 65201. The neighbor statement was
+  changed to `remote-as 65999`, so when the leaf's OPEN arrives
+  announcing AS 65201, spine_router_0_1 rejects it with an OPEN error
+  (Bad Peer AS) notification and the session can never establish --
+  it cycles between Idle/Active/OpenSent. The CLOS fabric is
+  redundant: leaf_router_0_1 still peers with spine_router_0_0, so
+  both host prefixes stay reachable and the impact is loss of the
+  second spine path for leaf_router_0_1, not an outage.
+Localization: spine_router_0_1 (the misconfigured side; leaf_router_0_1's
+  own config is unchanged and correct)
+Root cause: neighbor 172.16.0.11 configured with remote-as 65999
+  instead of 65201 on spine_router_0_1
+Fix: set the neighbor's remote-as back to 65201 on spine_router_0_1
+  (see [FIX]).
+
+[FIX]
+Correct the remote-as on spine_router_0_1:
+`vtysh -c "configure terminal" -c "router bgp 65101"
+ -c "neighbor 172.16.0.11 remote-as 65201"`
+Note: the injection changed only the running config; the intended
+config is still intact in /etc/frr/frr.conf, so `service frr restart`
+on spine_router_0_1 is an equally correct fix.
+
+[DIAGNOSTIC-PROCESS]
+1. Scope the symptom: exactly one session (spine_router_0_1 <->
+   leaf_router_0_1, the 172.16.0.10/31 link) fails to establish; all
+   other fabric sessions are Established and pc_0_0 still reaches
+   pc_0_1 -- a targeted control-plane fault, not a device or link outage.
+2. Rule out layer 1/2: both ends of the 172.16.0.10/31 link are UP and
+   the /31 peers can ping each other -- TCP can flow, so the failure is
+   in the BGP OPEN exchange.
+3. Read the session state and logs: spine_router_0_1 shows the neighbor
+   cycling (never Established) and sends a Bad Peer AS notification;
+   leaf_router_0_1 logs its OPEN being rejected.
+4. Compare configured vs actual AS: spine_router_0_1's running config
+   says `neighbor 172.16.0.11 remote-as 65999`, but leaf_router_0_1
+   runs `router bgp 65201` -- the expected and announced AS numbers
+   disagree on the spine side only.
+5. Localize to the wrong remote-as on spine_router_0_1: the leaf's
+   config is unchanged, so the fix belongs on the spine.
+
+[SCORING-AXES]
+assert-identifies: spine_router_0_1
+must-identify-device: spine_router_0_1
+must-identify-component: BGP neighbor remote-as mismatch / AS number misconfiguration
+must-distinguish-symptom-pattern: only the spine_router_0_1 <-> leaf_router_0_1 session is affected while links are UP and all other sessions are Established
+bonus-cites-mismatch-values: cites the configured remote-as 65999 vs leaf_router_0_1's actual AS 65201
+bonus-exonerates-leaf: notes leaf_router_0_1's own configuration is correct/unchanged, so the misconfiguration is on the spine side
+# These axes score the outcome metric only; fix and reasoning are judged separately.
+
+[NIKA-LABEL]
+nika_label: bgp_asn_misconfig
+nika_category: MISCONFIGURATION
+in_taxonomy: true
+note: partial: NIKA's bgp_asn_misconfig rewrites the router's own local ASN; here the neighbor remote-as statement is wrong -- same AS-mismatch session failure observed from the peer

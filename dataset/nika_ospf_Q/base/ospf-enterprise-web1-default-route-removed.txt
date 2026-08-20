@@ -1,0 +1,71 @@
+==================================================
+Scenario: ospf-enterprise-web1-default-route-removed
+Topology: ospf_enterprise_static
+Fault family: host static route removed
+==================================================
+
+[PROMPT-TO-AGENT]
+Helpdesk ticket #8875: Users in both pods report the "web1.local" portal
+stopped loading. DNS still resolves web1.local to 10.200.0.4, and the other
+portals (web0/web2/web3) all load fine. From user machines, ping 10.200.0.4
+gets no reply -- yet the server team says web_server_1 is up, Apache is
+running, and the dns_server can still ping 10.200.0.4 from inside the farm.
+Diagnose.
+
+[INJECTION]
+device: web_server_1
+action: delete the server's default (gateway) route
+cmd: ip route del default
+
+[POST-INJECT-CHECK]
+web_server_1   ip route | grep -c default   => expect 0
+host_1_1_1_1   ping -W2 -c2 10.200.0.4      => expect loss>0
+host_1_1_1_1   ping -W2 -c2 10.200.0.3      => expect 0% loss   (web0 still fine)
+
+[GROUND-TRUTH]
+Affected component: web_server_1 default-route (gateway) configuration
+Mechanism: web_server_1 (10.200.0.4) normally reaches off-subnet clients via
+  its default route through the farm gateway 10.200.0.1 on
+  switch_server_access. With the default route deleted, the server can only
+  talk to 10.200.0.0/24. Requests from the user pods still ARRIVE (the OSPF
+  path and DNS are healthy), but every reply to a 10.1.1.x / 10.2.1.x source
+  is unroutable on the server and is dropped -- so pings time out and HTTP
+  never completes, while intra-farm reachability (dns_server -> 10.200.0.4)
+  keeps working. Scope is exactly one server; web0/web2/web3 are untouched.
+Localization: web_server_1
+Root cause: default route (via 10.200.0.1) missing on web_server_1
+Fix: `ip route add default via 10.200.0.1 dev eth0` on web_server_1
+
+[FIX]
+`ip route add default via 10.200.0.1 dev eth0` on web_server_1
+
+[DIAGNOSTIC-PROCESS]
+1. Scope the symptom: only web1.local / 10.200.0.4 is affected, from BOTH
+   pods; DNS resolves correctly and the rest of the farm is reachable -- so
+   the network path and DNS are healthy and the problem is specific to
+   web_server_1.
+2. Note the asymmetry clue: the dns_server (same subnet) can ping
+   10.200.0.4, but off-subnet clients cannot -- intra-subnet works,
+   off-subnet replies do not, pointing at the server's own routing.
+3. Inspect web_server_1's routing table: `ip route` shows only the connected
+   10.200.0.0/24 route -- the default route via 10.200.0.1 is missing.
+4. Confirm the mechanism: incoming requests arrive, but replies to
+   10.1.1.x/10.2.1.x have no route and are dropped on the server; Apache is
+   running the whole time.
+5. Localize to web_server_1's host config: rule out DNS (correct A record),
+   OSPF/core (web0/web2/web3 fine), and the farm switch (intra-farm pings
+   work).
+
+[SCORING-AXES]
+assert-identifies: web_server_1
+must-identify-device: web_server_1
+must-identify-component: missing default (gateway) route on the server
+must-identify-mechanism: requests arrive but replies to off-subnet clients are unroutable -- a reply-path failure on the server itself
+bonus-exonerates-network: notes DNS resolution, the OSPF path, and the other web servers are healthy, so nothing network-side needs fixing
+# These axes score the outcome metric only; fix and reasoning are judged separately.
+
+[NIKA-LABEL]
+nika_label: host_incorrect_gateway
+nika_category: END_HOST_FAILURE
+in_taxonomy: true
+note: partial: the host's default (gateway) route is deleted rather than pointed at a wrong IP; closest NIKA host-gateway fault

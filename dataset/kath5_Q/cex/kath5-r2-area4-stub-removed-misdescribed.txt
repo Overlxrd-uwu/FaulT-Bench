@@ -1,0 +1,90 @@
+==================================================
+Scenario: kath5-r2-area4-stub-removed-misdescribed
+Topology: Kath5
+Fault family: OSPF area stub config removed (misdescribed cause)
+==================================================
+
+[PROMPT-TO-AGENT]
+Ticket #9078: After a config change on R2, R10 (which is in area 4) dropped its
+OSPF adjacency to R2 and lost every route beyond area 4 -- hosts behind R10 can
+no longer reach the backbone. The team believes R2's ospfd crashed with corrupt
+state and that the daemon needs to be killed and restarted to bring the
+adjacency back. Please confirm the R2 ospfd crash and restart it.
+
+[INJECTION]
+device: r2
+action: remove `area 4 stub` from OSPF config
+cmd: |
+  vtysh -c "configure terminal" \
+        -c "router ospf" \
+        -c "no area 4 stub" \
+        -c "exit" -c "exit"
+
+[POST-INJECT-CHECK]
+r2   vtysh -c "show running-config" | grep -c "area 4 stub"   => expect 0
+r10  vtysh -c "show ip ospf neighbor" | grep -c Full           => expect 0
+
+[GROUND-TRUTH]
+The root cause is IDENTICAL to kath5-r2-area4-stub-removed: `area 4 stub` was
+removed from R2's OSPF process. Area 4 was originally a stub on BOTH R2 (the ABR)
+and R10 (internal). Stub areas block external (E1/E2) routes from flooding in --
+internal routers use a default route instead, keeping RIB size and SPF cost low.
+With `area 4 stub` dropped on R2 while R10 keeps it, the Hello stub-flag (E-bit)
+MISMATCHES: R10 rejects R2's Hellos and the r2<->r10 adjacency drops after the
+dead interval (~40 s). R2 is R10's only OSPF neighbor, so area 4 is isolated --
+R10's OSPF RIB collapses to intra-area entries (lab-verified 2026-07-12:
+61 -> 13 route lines, empty neighbor table, zero external LSAs) -- exactly the
+reported adjacency loss and route collapse.
+
+The TWIST: the ticket asserts the wrong CAUSE -- a crashed ospfd on R2. The daemon
+is actually RUNNING and healthy: `pgrep ospfd` on R2 is non-empty, its uptime shows
+no recent restart, and its OTHER adjacencies (areas 0/1/2/3) are still Full -- only
+the area-4 adjacency to R10 is down, and it fails for a CONFIG reason (the
+stub-flag mismatch), not a process reason. Killing and restarting the daemon would
+NOT help -- the running-config no longer contains `area 4 stub`, so a restart
+reloads the same mismatched config and the adjacency stays down. The symptom
+(adjacency loss, route collapse) is real, but the narrated cause (a daemon crash)
+is a red herring -- a specific configuration line was removed, the process did not
+crash.
+
+Correct diagnosis: is_anomaly=true, faulty_devices = r2 (missing `area 4 stub`).
+The agent must verify ospfd is alive on R2, then inspect the OSPF config to find
+`area 4 stub` missing, and explicitly reject the "ospfd crashed" narrative. A
+decisive tell: ospfd is up, R2's other adjacencies are Full, and ONLY the area-4
+adjacency is down with a Hello/stub mismatch -- a config change, not a process
+crash; a restart would not restore the stub. An
+agent that "confirms the ospfd crash and restarts it" has followed the ticket's
+framing instead of the evidence. Fix: re-add `area 4 stub` to R2's OSPF block.
+
+[FIX]
+`vtysh -c "router ospf" -c "area 4 stub"` on r2
+
+[DIAGNOSTIC-PROCESS]
+1. Scope the symptom: confirm R10 (area 4, internal/non-ABR) lost its adjacency
+   to R2 and its routes beyond area 4 -- then TEST the ticket's "ospfd crashed"
+   claim rather than assuming it.
+2. Check the daemon first (as accused): `pgrep ospfd` on R2 is non-empty, uptime
+   shows no recent restart, and R2's non-area-4 adjacencies are still Full.
+   ospfd did not crash.
+3. Check OSPF state on R10: the neighbor table is empty (the adjacency to R2
+   died) while R10 itself still declares area 4 as stub -- the failure is at
+   the Hello/adjacency level, selective to area 4.
+4. Inspect the ABR configuration: `show running-config` on R2 | grep "area 4"
+   confirms `area 4 stub` is missing. The stub flag (Hello E-bit) must match on
+   both ends; with R2 non-stub and R10 stub, R10 rejects R2's Hellos and the
+   adjacency drops after the dead interval, isolating area 4.
+5. Localize to the lowest-layer root cause: missing `area 4 stub` on R2 -- NOT an
+   ospfd crash. The daemon is healthy; restarting it would just reload the same
+   mismatched config. The fix is to re-add the stub config line.
+
+[SCORING-AXES]
+assert-identifies: r2
+must-identify-stub-config: OSPF area 4 stub flag
+bonus-rules-out-ospfd-down: rules out the ticket's ospfd-crash story by any valid evidence (daemon alive via pgrep/uptime, R2's non-area-4 adjacencies still Full, or explicitly stating a restart cannot restore a removed config line)
+# These axes score the outcome metric only; fix and reasoning are judged separately.
+
+[NIKA-LABEL]
+nika_label: ospf_area_misconfiguration
+nika_category: MISCONFIGURATION
+in_taxonomy: true
+note: fault maps; prompt misdescribes the cause as an R2 ospfd crash (robustness perturbation dimension)

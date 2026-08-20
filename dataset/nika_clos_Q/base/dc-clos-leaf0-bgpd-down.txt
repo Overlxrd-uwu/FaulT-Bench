@@ -1,0 +1,78 @@
+==================================================
+Scenario: dc-clos-leaf0-bgpd-down
+Topology: dc_clos_bgp
+Fault family: routing daemon down
+==================================================
+
+[PROMPT-TO-AGENT]
+A user on pc_0_0 (10.0.0.2) reports they lost all reach across the
+data-center fabric -- pc_0_1 (10.0.1.2) is unreachable, though pc_0_0
+can still ping its own gateway 10.0.0.1. The NOC adds that both
+spine routers reported their BGP session toward leaf_router_0_0 going
+down at the same moment, while the leaf's uplink interfaces still
+show UP. Diagnose.
+
+[INJECTION]
+device: leaf_router_0_0
+action: kill the BGP routing daemon (and watchfrr) on leaf_router_0_0
+cmd: pkill -9 watchfrr; pkill -9 bgpd
+
+[POST-INJECT-CHECK]
+leaf_router_0_0   pgrep bgpd              => expect empty
+pc_0_0            ping -W2 -c2 10.0.1.2   => expect loss>0
+
+[GROUND-TRUTH]
+Affected component: leaf_router_0_0 bgpd
+Mechanism: leaf_router_0_0 is the top-of-rack leaf for pc_0_0
+  (host subnet 10.0.0.0/24 on eth2). Its only fabric attachment is
+  EBGP: neighbor 172.16.0.4 (spine_router_0_0, AS 65100) on eth0 and
+  neighbor 172.16.0.8 (spine_router_0_1, AS 65101) on eth1. With bgpd
+  dead the leaf stops learning 10.0.1.0/24 and stops advertising
+  10.0.0.0/24, so pc_0_0 is isolated from the fabric even though every
+  physical link is still UP.
+Localization: leaf_router_0_0
+Root cause: bgpd not running on leaf_router_0_0
+Fix: restart FRR on leaf_router_0_0 (`service frr restart`) -- this lab
+  keeps its config in /etc/frr/frr.conf, so a restart fully restores
+  the BGP configuration and sessions.
+
+Observable note (lab-verified 2026-07-03 on this fabric): bgpd is killed
+together with watchfrr (its watchdog), so nothing respawns it. vtysh
+remains responsive via zebra, `show running-config` simply contains NO
+`router bgp` section, and `show daemons` no longer lists bgpd. An agent
+may therefore correctly describe this fault as "the bgp configuration is
+missing/empty on leaf_router_0_0" -- that is the same fault observed at
+the config plane, and must NOT be treated as a wrong root cause.
+
+[FIX]
+`service frr restart` on leaf_router_0_0. Unlike the vtysh-configured
+kath labs, this lab has a persistent /etc/frr/frr.conf, so the restart
+brings bgpd back WITH its full BGP configuration; the sessions to both
+spines re-establish and pc_0_0 reaches pc_0_1 again.
+
+[DIAGNOSTIC-PROCESS]
+1. Reproduce the symptom: from pc_0_0, ping 10.0.1.2 -- fails; ping the
+   gateway 10.0.0.1 -- succeeds. The break is beyond the leaf's host port.
+2. Check the fabric control plane from the healthy side: both spines show
+   their session toward leaf_router_0_0 down (Idle/Active), while their
+   sessions to leaf_router_0_1 and the super-spine remain Established --
+   the fault is localized to leaf_router_0_0, not the fabric.
+3. Check layer 1/2: leaf_router_0_0's eth0/eth1 uplinks are UP with no
+   carrier transitions -- not a link fault.
+4. Check the daemon on leaf_router_0_0: `pgrep bgpd` is empty (and
+   `show daemons` no longer lists bgpd) -- the BGP daemon is dead.
+5. Localize to leaf_router_0_0 bgpd: a dead daemon on pc_0_0's own
+   top-of-rack leaf fully explains the isolation; exonerate the spines,
+   the links, and the hosts.
+
+[SCORING-AXES]
+assert-identifies: leaf_router_0_0
+must-identify-device: leaf_router_0_0
+must-identify-component: bgpd / BGP daemon down
+bonus-exonerates-fabric: notes the spines, the super-spine and leaf_router_0_1 are healthy (their other sessions stay Established), so the fault is only on leaf_router_0_0
+# These axes score the outcome metric only; fix and reasoning are judged separately.
+
+[NIKA-LABEL]
+nika_label: frr_service_down
+nika_category: NETWORK_NODE_ERROR
+in_taxonomy: true

@@ -1,0 +1,82 @@
+==================================================
+Scenario: dc-clos-leaf0-network-missing
+Topology: dc_clos_bgp
+Fault family: BGP config error (network advertisement missing)
+==================================================
+
+[PROMPT-TO-AGENT]
+Users on pc_0_0 (10.0.0.2) and pc_0_1 (10.0.1.2) report they cannot
+reach each other, though each can still ping its own gateway (10.0.0.1
+and 10.0.1.1). The odd part, per the NOC: every BGP session in the
+fabric is Established and no interface has flapped -- but the spines'
+routing tables no longer contain the 10.0.0.0/24 prefix at all, while
+10.0.1.0/24 is still there. Investigate.
+
+[INJECTION]
+device: leaf_router_0_0
+action: remove the host-subnet network advertisement from BGP
+cmd: |
+  vtysh -c "configure terminal" \
+        -c "router bgp 65200" \
+        -c "no network 10.0.0.0/24" \
+        -c "exit" -c "exit"
+
+[POST-INJECT-CHECK]
+leaf_router_0_0   vtysh -c "show running-config" | grep -c "network 10.0.0.0/24"  => expect 0
+pc_0_1            ping -W2 -c2 10.0.0.2                                           => expect loss>0
+pc_0_1            ping -W2 -c2 10.0.1.1                                           => expect 0% loss   (own gateway still OK)
+
+[GROUND-TRUTH]
+Affected component: leaf_router_0_0 BGP network advertisement
+Mechanism: leaf_router_0_0 (AS 65200) is supposed to advertise its host
+  subnet with `network 10.0.0.0/24` under `router bgp 65200`. That
+  statement was removed, so bgpd immediately withdrew the prefix; the
+  spines, the super-spine and leaf_router_0_1 all lose their route to
+  10.0.0.0/24 while every session stays Established. Traffic from
+  pc_0_0 toward pc_0_1 is still delivered (leaf_router_0_0 still learns
+  10.0.1.0/24), but the return traffic has no route back to
+  10.0.0.0/24 and dies in the fabric -- so the ping fails in both
+  directions.
+Localization: leaf_router_0_0
+Root cause: `network 10.0.0.0/24` missing from `router bgp 65200` on
+  leaf_router_0_0
+Fix: re-add the network statement on leaf_router_0_0 (see [FIX]).
+
+[FIX]
+Re-add the advertisement on leaf_router_0_0:
+`vtysh -c "configure terminal" -c "router bgp 65200"
+ -c "network 10.0.0.0/24"`
+Note: the injection changed only the running config; the intended
+config is still intact in /etc/frr/frr.conf, so `service frr restart`
+on leaf_router_0_0 is an equally correct fix.
+
+[DIAGNOSTIC-PROCESS]
+1. Scope the symptom: pc_0_0 <-> pc_0_1 fails in both directions while
+   each host reaches its own gateway -- the break is inside the fabric.
+2. Check the control plane: every BGP session (leaf <-> spine and
+   spine <-> super-spine) is Established and no link is down -- this is
+   not a session, daemon or link fault.
+3. Follow the missing route: the spines and leaf_router_0_1 carry
+   10.0.1.0/24 but have NO route to 10.0.0.0/24 -- exactly one prefix
+   vanished, the one originated by leaf_router_0_0.
+4. Inspect the origin: on leaf_router_0_0, `show running-config` shows
+   `router bgp 65200` with neighbors intact but NO
+   `network 10.0.0.0/24` statement -- the leaf has stopped advertising
+   its host subnet.
+5. Localize to the missing advertisement on leaf_router_0_0: forward
+   traffic still flows toward 10.0.1.0/24 but return traffic is
+   unroutable, which explains the bidirectional ping failure with a
+   fully Established control plane.
+
+[SCORING-AXES]
+assert-identifies: leaf_router_0_0
+must-identify-device: leaf_router_0_0
+must-identify-component: missing BGP network advertisement for 10.0.0.0/24
+must-distinguish-symptom-pattern: all BGP sessions Established and links UP while exactly one prefix (10.0.0.0/24) is absent from the fabric tables
+bonus-explains-return-path: explains that packets toward pc_0_1 are still delivered but replies have no route back to 10.0.0.0/24 (or equivalently that only the withdrawn direction is unroutable)
+# These axes score the outcome metric only; fix and reasoning are judged separately.
+
+[NIKA-LABEL]
+nika_label: bgp_missing_route_advertisement
+nika_category: MISCONFIGURATION
+in_taxonomy: true

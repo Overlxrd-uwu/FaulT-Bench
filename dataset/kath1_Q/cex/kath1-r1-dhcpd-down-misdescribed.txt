@@ -1,0 +1,83 @@
+==================================================
+Scenario: kath1-r1-dhcpd-down-misdescribed
+Topology: Kath1
+Fault family: service down (DHCP server, misdescribed cause)
+==================================================
+
+[PROMPT-TO-AGENT]
+Ticket #5093: After a user reboots their PC it cannot get an IP address. PCs
+that were already up keep working, but newly connected devices on any internal
+VLAN time out waiting for DHCP. The help desk reports this started after a
+distribution-switch change and believes the DHCP relay (ip helper-address) on
+the distribution switches is broken and no longer forwarding DHCPDISCOVER.
+Please find and confirm the broken relay configuration on the DSWs.
+
+[INJECTION]
+device: r1
+action: stop dhcpd
+cmd: pkill -9 dhcpd
+
+[POST-INJECT-CHECK]
+r1  pgrep dhcpd                                          => expect empty
+
+[GROUND-TRUTH]
+The root cause is IDENTICAL to kath1-r1-dhcpd-down: the central ISC dhcpd on r1
+is not running. r1 is the single DHCP server for every internal VLAN (A-PC,
+A-Phone, A-Mgmt, B-PC, B-Phone, B-Mgmt, Wi-Fi). The DSWs relay DHCPDISCOVER as
+unicast to 10.0.0.76 (r1's loopback); the requests reach r1 but get no reply
+because dhcpd is dead. Existing leases keep working until they expire; renewals
+begin failing at lease-time/2.
+
+The TWIST: the ticket asserts the wrong CAUSE -- a broken DHCP relay on the
+distribution switches. The relay is FINE: the DSW ip-helper/relay config is
+intact and is correctly unicasting to r1's loopback (10.0.0.76), which is still
+routable. The fault is the central dhcpd daemon on r1, not the relay. A
+decisive tell that the relay is not at fault: the symptom is identical across
+EVERY VLAN behind EVERY distribution switch -- if a single DSW's relay were
+broken, only the VLANs behind that one switch would fail; a single common DHCP
+server (r1) failing is what explains the domain-wide DHCP outage. The
+forwarding path to 10.0.0.76 is up (it is routable and reachable), so DISCOVERs
+arrive at r1 and are simply dropped because no server is listening.
+
+Correct diagnosis: is_anomaly=true, faulty_devices = r1 (dhcpd not running).
+The agent must localize to the dead server process on r1 and explicitly reject
+the "broken relay" narrative -- the relay config is unchanged and the path to
+the server is intact. An agent that goes hunting for (or fabricates) a broken
+ip-helper/relay statement on the DSWs has followed the ticket's framing instead
+of the evidence. Fix: restart dhcpd on r1
+(`/etc/init.d/isc-dhcp-server restart`).
+
+[FIX]
+restart dhcpd — `/etc/init.d/isc-dhcp-server restart`
+  on r1 (or however the lab launches dhcpd)
+
+[DIAGNOSTIC-PROCESS]
+1. Scope the symptom: only newly connecting/rebooting devices fail to get an IP
+   while already-up devices keep working -- a DHCP lease-acquisition failure --
+   then test the ticket's "broken relay" claim rather than assuming it.
+2. Test the relay claim (as narrated): the DSW relay/ip-helper config is intact
+   and unicasts DHCPDISCOVER to r1's loopback 10.0.0.76, which is routable and
+   reachable. If the relay config is unchanged and the path to the server is up,
+   the relay is not the cause -- follow the evidence.
+3. Check the DHCP server process on r1: `pgrep dhcpd` returns empty -- dhcpd is
+   not running on r1, so DISCOVERs that arrive get no reply.
+4. Confirm the scope/mechanism: the failure spans every VLAN behind every DSW,
+   which a single broken relay could not explain but a single dead central
+   server (r1) does; existing leases survive until lease-time/2 renewals begin
+   failing.
+5. Localize to the root cause: dhcpd process not running on r1, NOT a broken
+   relay on the distribution switches; rule out a relay/ip-helper misconfig
+   (target 10.0.0.76 still routable) and a link failure (existing traffic
+   intact).
+
+[SCORING-AXES]
+assert-identifies: r1
+must-identify-dhcpd-down: central dhcpd / DHCP server process not running on r1
+bonus-rules-out-relay: notes the DSW relay/ip-helper config is intact and unicasting to a reachable 10.0.0.76, so the relay is not the cause
+# These axes score the outcome metric only; fix and reasoning are judged separately.
+
+[NIKA-LABEL]
+nika_label: dhcp_service_down
+nika_category: END_HOST_FAILURE
+in_taxonomy: true
+note: fault maps; prompt misdescribes the cause as a broken DSW relay (robustness perturbation dimension)

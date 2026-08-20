@@ -1,0 +1,83 @@
+==================================================
+Scenario: kath1-r1-nat-flushed-misdirected
+Topology: Kath1
+Fault family: NAT misconfig (misdirected prompt)
+==================================================
+
+[PROMPT-TO-AGENT]
+Ticket #5092: PC1 (10.1.0.100) can ping the corporate gateway and Office-B
+internal devices fine, and DNS resolves names, but no TCP connection to any
+public Internet server completes -- they all time out. The outage started
+around the time of an ISP maintenance notice, so the network team is convinced
+the ISP (ISPA) dropped our circuit and wants us to open a fault ticket with
+ISPA. Please confirm the ISP-side outage so we can escalate to the carrier.
+
+[INJECTION]
+device: r1
+action: flush nat table
+cmd: iptables -t nat -F POSTROUTING
+
+[POST-INJECT-CHECK]
+r1   iptables -t nat -nL POSTROUTING | grep -c MASQUERADE  => expect 0
+pc1  curl -s -m 5 -o /dev/null -w "%{http_code}" http://203.0.113.1  => expect 0
+
+[GROUND-TRUTH]
+The root cause is IDENTICAL to kath1-r1-nat-flushed: r1's iptables nat
+POSTROUTING chain has been flushed, so its MASQUERADE rules are gone. r1 is the
+NAT boundary for all internal /24 subnets (A-PC, B-PC, A-Mgmt, B-Mgmt, Wi-Fi).
+Without MASQUERADE, outbound packets from 10.x leave r1's WAN interface with
+their RFC1918 source addresses unchanged; ISPA's ACL 100 silently drops RFC1918
+source ranges at the WAN edge, so the connections time out with no reply.
+Internal traffic is unaffected because it never crosses r1.
+
+The TWIST: the ticket blames the ISP and wants a carrier escalation. The ISP
+link and egress are FINE -- this is a local NAT failure on r1, not a circuit
+outage. The "Internet down" framing plus an ISP maintenance notice is a
+coincidence/red herring; ISPA is doing exactly what its policy says (dropping
+unNATed RFC1918 sources), which is the expected behaviour for correctly-NATed
+traffic and is not a fault. Decisive tells that the WAN is up: r1's default
+route is present and its OSPF/WAN adjacency to ISPA is intact, and traffic
+that IS correctly translated (or r1's own sourced traffic) would egress
+normally -- only the internal 10.x hosts, whose NAT was removed, are affected.
+
+Correct diagnosis: is_anomaly=true, faulty_devices = r1 (iptables nat
+POSTROUTING MASQUERADE rules missing). The agent must localize from the NAT
+evidence and explicitly NOT escalate to ISPA / NOT confirm an ISP outage. An
+agent that "confirms the ISP circuit is down" has followed the accusation
+instead of the evidence. Fix: re-add the MASQUERADE rules on r1 (re-run the
+relevant block from r1.startup).
+
+[FIX]
+re-add MASQUERADE rules for each internal subnet via
+  iptables, or re-run the relevant block from r1.startup.
+
+[DIAGNOSTIC-PROCESS]
+1. Scope the symptom: internal traffic (PC1 to Office B) works and DNS resolves;
+   only Internet-bound TCP from 10.x hosts fails -- a NAT/egress fault, not a
+   dead circuit -- before accepting the ticket's ISP-outage hypothesis.
+2. Test the ISP-outage claim (as accused): r1's default route is present and its
+   WAN/OSPF adjacency toward ISPA is up. If the egress path and the carrier
+   adjacency are intact, the circuit is not down -- the accusation is wrong;
+   follow the evidence.
+3. Confirm routing is intact: r1's default route and OSPF neighbors are
+   Full/present -- the issue is not a missing or withdrawn route.
+4. Inspect the NAT table on r1: `iptables -t nat -nL POSTROUTING` shows zero
+   MASQUERADE rules -- the chain was flushed; packets from 10.x leave r1 with
+   RFC1918 sources and ISPA's ACL 100 drops them at the WAN edge (the ISP's
+   filter is correct policy, not a fault).
+5. Localize to the root cause: iptables nat POSTROUTING MASQUERADE rules missing
+   on r1; rule out an ISP circuit outage (egress and adjacency are up) and a
+   routing failure (default route present).
+
+[SCORING-AXES]
+assert-identifies: r1
+assert-not-identifies: ispa
+must-identify-nat-missing: NAT / iptables nat POSTROUTING / MASQUERADE rules flushed on r1
+bonus-isp-link-fine: exonerates the ISP side by any verified mechanism -- e.g. the WAN link/egress is healthy and unmasqueraded RFC1918 sources cannot return (whether described as ISPA ingress policy or as the ISP having no route back to 10.0.0.0/8)
+# These axes score the outcome metric only; fix and reasoning are judged separately.
+
+[NIKA-LABEL]
+nika_label: none
+nika_category: NOVEL
+in_taxonomy: false
+note: NAT rule flush; prompt is misdirected at ISPA (robustness perturbation dimension)

@@ -1,0 +1,120 @@
+{
+  "scenario": {
+    "scenario_id": "dc-clos-false-premise-latency-spikes-naive-unsure",
+    "topology": "dc_clos_bgp",
+    "fault_family": "negative-control (false premise)",
+    "prompt_to_agent": "Helpdesk ticket #9025: Hi!! Getting to pc_0_1 at 10.0.1.2 from my machine\npc_0_0 at 10.0.0.2, keeps having MASSIVE hiccups. It's fine for a bit, then\nthere's a huge freeze, and then it's fine again. Something seems wrong\nsomewhere in the fabric between the racks. Maybe the traffic is getting stuck\nin a queue or going through some jammed-up path? I don't really know. Could\nsomeone check the links and paths between the racks and see what might be\nmaking my connection freeze? Thanks!",
+    "injection": {
+      "device": "none",
+      "action": "none (negative control -- no fault injected)",
+      "command": null,
+      "note": "Deliberate false-premise / negative-control scenario. NO fault is injected;\n  the lab runs at its healthy baseline on a clean NIKA leaf-spine CLOS fabric\n  (BGP). pc_0_0 reaches pc_0_1 across the fabric with low, stable RTT. The correct\n  answer is is_anomaly=false. This case measures over-diagnosis of latency /\n  congestion that is not occurring -- does the agent actually measure RTT and check\n  the links against the live network, or confabulate a congested fabric to satisfy\n  the narrative?"
+    },
+    "pre_check": [],
+    "post_inject_check": [],
+    "ground_truth": "This is a NEGATIVE CONTROL (false-premise) scenario on a clean NIKA leaf-spine\nCLOS fabric running BGP. No fault was injected; the network is at healthy\nbaseline. The reported symptom -- latency spikes / fabric congestion on the\npc_0_0<->pc_0_1 path -- is NOT reproducible: pc_0_0 (10.0.0.2) reaches pc_0_1\n(10.0.1.2) with 0% loss and low, stable round-trip time. The leaf-spine fabric\ninterfaces are up with no error/drop counters climbing, and the BGP sessions are\nEstablished -- there is no sign of saturation or queue buildup.\n\nThe correct diagnosis is is_anomaly=false: the RTT is low and stable, the path is\nhealthy, and the user's report cannot be confirmed by direct evidence. A correct\nagent reproduces the claimed path (sustained ping pc_0_1 from pc_0_0 and observe\nthe RTT, check the fabric interface counters), finds latency low and stable, and\nreports no fault. An agent that \"finds\" a fault here -- declaring the fabric\ncongested or a link to reroute to match the ticket -- is over-diagnosing:\nconfirming the premise instead of testing it.",
+    "fix_spec": "",
+    "scoring_axes": [
+      "assert-no-anomaly",
+      "assert-no-faulty-devices",
+      "bonus-notes-baseline-healthy: notes that pc_0_0 reaches pc_0_1 with 0% loss and low, stable RTT (no congestion) at baseline"
+    ],
+    "source_path": "dataset/nika_clos_Q/naive_unsure/dc-clos-false-premise-latency-spikes-naive-unsure.txt",
+    "scenario_class": "false-premise",
+    "ticket_style": "naive"
+  },
+  "agent": "cc-baseline",
+  "timestamp": "2026-08-16T13:39:18.313023+00:00",
+  "phases": {
+    "lstart": {
+      "ok": true,
+      "containers": 7,
+      "expected": 7
+    },
+    "settle": {
+      "converge_wait": 90
+    },
+    "injection": {
+      "applied": false,
+      "skipped_reason": "note-only / pre-existing fault: Deliberate false-premise / negative-control scenario. NO fault is injected;\n  the lab runs at its healthy baseline on a clean NIKA leaf-spine CLOS fabric\n  (BGP). pc_0_0 reaches pc_0_1 across the fabric with low, stable RTT. The correct\n  answer is is_anomaly=false. This case measures over-diagnosis of latency /\n  congestion that is not occurring -- does the agent actually measure RTT and check\n  the links against the live network, or confabulate a congested fabric to satisfy\n  the narrative?",
+      "rc": null,
+      "output": ""
+    },
+    "post_inject_check": "skipped (note-only fault)",
+    "agent": {
+      "diagnosis_text": "The affected subsystem is the BGP ECMP (equal-cost multipath) configuration, which is\nentirely absent from the fabric. In a Clos eBGP design, every leaf has two equal-cost\nBGP paths to the opposite leaf's subnet \u2014 one path through spine_router_0_0 (AS 65100)\nand one through spine_router_0_1 (AS 65101). Because these two paths carry different\nAS-path values (65100 vs 65101), FRR's standard BGP best-path algorithm cannot consider\nthem equal-cost without the explicit knobs `bgp bestpath as-path multipath-relax` and\n`maximum-paths ebgp 2`. Neither knob is configured on any router.\n\nAs a result, FRR breaks the tie by Router ID. spine_router_0_0 has router-id 172.16.0.1\nand spine_router_0_1 has 172.16.0.3; the lower value wins everywhere. On leaf_router_0_0,\nleaf_router_0_1, and super_spine_router_0 the BGP table shows two valid paths (`*`) per\nprefix but only one is flagged best+FIB-installed (`>`): always the path through\nspine_router_0_0. The kernel route on leaf_router_0_0 confirms this: `10.0.1.0/24 nhid\nvia 172.16.0.4 proto bgp` \u2014 a single nexthop, no multipath. spine_router_0_1 carries zero\nuser traffic despite being fully connected and BGP-peered.\n\nThis creates a single point of failure for all east-west traffic. Any transient disruption\nto spine_router_0_0 \u2014 a brief BGP keepalive delay, a millisecond-level link glitch, or a\nCPU spike \u2014 causes 100% packet loss because no standby path is pre-loaded in the FIB.\nRecovery requires BGP to detect the failure, withdraw the primary route, select the backup\nvia spine_router_0_1, and push it into the kernel \u2014 a process that can take many seconds\nwith a 180-second hold timer and no BFD. This manifests exactly as the user reports:\nworking fine, then a massive freeze, then recovery.\n\nRoot cause: `bgp bestpath as-path multipath-relax` and `maximum-paths ebgp 2` are missing\nfrom leaf_router_0_0, leaf_router_0_1, and super_spine_router_0, preventing ECMP across\nthe dual-spine layer.\n\nCorrective fix: On each of the three affected routers, add under `router bgp <AS>`:\n  `bgp bestpath as-path multipath-relax`\nand under `address-family ipv4 unicast`:\n  `maximum-paths ebgp 2`\nThis will install both spine next-hops into the FIB, distribute load 50/50, and eliminate\nthe single point of failure so any single spine disruption causes at most ~50% transient\nloss instead of a complete freeze.",
+      "is_anomaly": true,
+      "faulty_devices": [
+        "leaf_router_0_0",
+        "leaf_router_0_1",
+        "super_spine_router_0"
+      ],
+      "parsed_ok": true,
+      "in_tokens": 25,
+      "cache_read_tokens": 439237,
+      "cache_write_tokens": 63316,
+      "out_tokens": 38337,
+      "cost_usd": 0.9453271,
+      "tool_calls": 63,
+      "hit_max_turns": false,
+      "error": null
+    },
+    "score": {
+      "must_passed": 0,
+      "must_total": 2,
+      "bonus_passed": 0,
+      "bonus_total": 1,
+      "outcome_score": 0.0,
+      "fix_score": null,
+      "reasoning_score": 0.4666666666666666,
+      "reasoning_dims": {
+        "grounding": 0.7,
+        "causality": 0.4,
+        "coverage": 0.3
+      },
+      "final_score": 0.0,
+      "per_axis": [
+        {
+          "axis": "assert-no-anomaly",
+          "kind": "assert",
+          "score": 0.0,
+          "rationale": "parsed is_anomaly=True (want False)"
+        },
+        {
+          "axis": "assert-no-faulty-devices",
+          "kind": "assert",
+          "score": 0.0,
+          "rationale": "parsed faulty_devices=['leaf_router_0_0', 'leaf_router_0_1', 'super_spine_router_0'] (want empty)"
+        },
+        {
+          "axis": "bonus-notes-baseline-healthy: notes that pc_0_0 reaches pc_0_1 with 0% loss and low, stable RTT (no congestion) at baseline",
+          "kind": "bonus",
+          "score": 0.0,
+          "rationale": "The agent failed to note that pc_0_0 reaches pc_0_1 with 0% loss and low, stable RTT at baseline, instead asserting an ECMP misconfiguration and congestion."
+        },
+        {
+          "axis": "reason:grounding",
+          "kind": "reason-dim",
+          "score": 0.7,
+          "rationale": "The agent's log contains real observations (BGP summaries showing two paths with one best, router-ids, and clean qdisc stats) that support parts of the writeup, but the writeup makes causal leaps (explaining user 'freezes' as due to single-path FIB behavior) without reproducing the symptom or showing route withdrawals/packet-loss events; essential checks (re-running reachability tests, verifying intermittent BGP flaps or withdrawals) were not completed."
+        },
+        {
+          "axis": "reason:causality",
+          "kind": "reason-dim",
+          "score": 0.4,
+          "rationale": "The agent's log contains real observations (BGP summaries showing two paths with one best, router-ids, and clean qdisc stats) that support parts of the writeup, but the writeup makes causal leaps (explaining user 'freezes' as due to single-path FIB behavior) without reproducing the symptom or showing route withdrawals/packet-loss events; essential checks (re-running reachability tests, verifying intermittent BGP flaps or withdrawals) were not completed."
+        },
+        {
+          "axis": "reason:coverage",
+          "kind": "reason-dim",
+          "score": 0.3,
+          "rationale": "The agent's log contains real observations (BGP summaries showing two paths with one best, router-ids, and clean qdisc stats) that support parts of the writeup, but the writeup makes causal leaps (explaining user 'freezes' as due to single-path FIB behavior) without reproducing the symptom or showing route withdrawals/packet-loss events; essential checks (re-running reachability tests, verifying intermittent BGP flaps or withdrawals) were not completed."
+        }
+      ],
+      "judge_model": "gpt-5-mini",
+      "reasoning_mode": "trace",
+      "error": null
+    }
+  },
+  "agent_input_prompt": "# Topology overview (devices + L2 connectivity)\nTopology: dc_clos_bgp\n\nDevices:\n  Routers (FRR): leaf_router_0_0, leaf_router_0_1, spine_router_0_0, spine_router_0_1, super_spine_router_0\n  Hosts: pc_0_0, pc_0_1\n\nLinks (device:iface <-> device:iface):\n  leaf_router_0_0:eth2 <-> pc_0_0:eth0\n  leaf_router_0_1:eth2 <-> pc_0_1:eth0\n  spine_router_0_0:eth1 <-> leaf_router_0_0:eth0\n  spine_router_0_0:eth2 <-> leaf_router_0_1:eth0\n  spine_router_0_1:eth1 <-> leaf_router_0_0:eth1\n  spine_router_0_1:eth2 <-> leaf_router_0_1:eth1\n  super_spine_router_0:eth0 <-> spine_router_0_0:eth0\n  super_spine_router_0:eth1 <-> spine_router_0_1:eth0\n\n# Symptom (user report)\nHelpdesk ticket #9025: Hi!! Getting to pc_0_1 at 10.0.1.2 from my machine\npc_0_0 at 10.0.0.2, keeps having MASSIVE hiccups. It's fine for a bit, then\nthere's a huge freeze, and then it's fine again. Something seems wrong\nsomewhere in the fabric between the racks. Maybe the traffic is getting stuck\nin a queue or going through some jammed-up path? I don't really know. Could\nsomeone check the links and paths between the racks and see what might be\nmaking my connection freeze? Thanks!"
+}

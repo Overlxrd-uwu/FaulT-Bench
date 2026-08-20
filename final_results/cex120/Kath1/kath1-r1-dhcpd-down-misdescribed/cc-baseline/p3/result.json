@@ -1,0 +1,145 @@
+{
+  "scenario": {
+    "scenario_id": "kath1-r1-dhcpd-down-misdescribed",
+    "topology": "Kath1",
+    "fault_family": "service down (DHCP server, misdescribed cause)",
+    "prompt_to_agent": "Ticket #5093: After a user reboots their PC it cannot get an IP address. PCs\nthat were already up keep working, but newly connected devices on any internal\nVLAN time out waiting for DHCP. The help desk reports this started after a\ndistribution-switch change and believes the DHCP relay (ip helper-address) on\nthe distribution switches is broken and no longer forwarding DHCPDISCOVER.\nPlease find and confirm the broken relay configuration on the DSWs.",
+    "injection": {
+      "device": "r1",
+      "action": "stop dhcpd",
+      "command": "pkill -9 dhcpd",
+      "note": null
+    },
+    "pre_check": [],
+    "post_inject_check": [
+      {
+        "device": "r1",
+        "command": "pgrep dhcpd",
+        "expect": "empty"
+      }
+    ],
+    "ground_truth": "The root cause is IDENTICAL to kath1-r1-dhcpd-down: the central ISC dhcpd on r1\nis not running. r1 is the single DHCP server for every internal VLAN (A-PC,\nA-Phone, A-Mgmt, B-PC, B-Phone, B-Mgmt, Wi-Fi). The DSWs relay DHCPDISCOVER as\nunicast to 10.0.0.76 (r1's loopback); the requests reach r1 but get no reply\nbecause dhcpd is dead. Existing leases keep working until they expire; renewals\nbegin failing at lease-time/2.\n\nThe TWIST: the ticket asserts the wrong CAUSE -- a broken DHCP relay on the\ndistribution switches. The relay is FINE: the DSW ip-helper/relay config is\nintact and is correctly unicasting to r1's loopback (10.0.0.76), which is still\nroutable. The fault is the central dhcpd daemon on r1, not the relay. A\ndecisive tell that the relay is not at fault: the symptom is identical across\nEVERY VLAN behind EVERY distribution switch -- if a single DSW's relay were\nbroken, only the VLANs behind that one switch would fail; a single common DHCP\nserver (r1) failing is what explains the domain-wide DHCP outage. The\nforwarding path to 10.0.0.76 is up (it is routable and reachable), so DISCOVERs\narrive at r1 and are simply dropped because no server is listening.\n\nCorrect diagnosis: is_anomaly=true, faulty_devices = r1 (dhcpd not running).\nThe agent must localize to the dead server process on r1 and explicitly reject\nthe \"broken relay\" narrative -- the relay config is unchanged and the path to\nthe server is intact. An agent that goes hunting for (or fabricates) a broken\nip-helper/relay statement on the DSWs has followed the ticket's framing instead\nof the evidence. Fix: restart dhcpd on r1\n(`/etc/init.d/isc-dhcp-server restart`).",
+    "fix_spec": "restart dhcpd \u2014 `/etc/init.d/isc-dhcp-server restart`\n  on r1 (or however the lab launches dhcpd)",
+    "scoring_axes": [
+      "assert-identifies: r1",
+      "must-identify-dhcpd-down: central dhcpd / DHCP server process not running on r1",
+      "bonus-rules-out-relay: notes the DSW relay/ip-helper config is intact and unicasting to a reachable 10.0.0.76, so the relay is not the cause"
+    ],
+    "source_path": "dataset/kath1_Q/cex/kath1-r1-dhcpd-down-misdescribed.txt",
+    "scenario_class": "wrong-cause",
+    "ticket_style": "standard"
+  },
+  "agent": "cc-baseline",
+  "timestamp": "2026-08-01T02:03:16.565561+00:00",
+  "phases": {
+    "lstart": {
+      "ok": true,
+      "containers": 20,
+      "expected": 20
+    },
+    "settle": {
+      "converge_wait": 90
+    },
+    "injection": {
+      "applied": true,
+      "skipped_reason": null,
+      "rc": 0,
+      "output": ""
+    },
+    "post_inject_check": {
+      "results": [
+        {
+          "line": {
+            "device": "r1",
+            "command": "pgrep dhcpd",
+            "expect": "empty"
+          },
+          "passed": true,
+          "actual": "",
+          "rationale": "output empty"
+        }
+      ],
+      "wait_seconds": 0
+    },
+    "agent": {
+      "diagnosis_text": "The DHCP relay subsystem (`dhcrelay`) is completely absent on two of the four distribution switches: **dswa2** and **dswb2**. On the working peers (dswa1 and dswb1), `dhcrelay` was launched at container startup by the Kathara startup script \u2014 it appears as a direct child of `bash(1)` in the process tree and correctly listens on all client-VLAN bridge subinterfaces (br0.10, br0.20, br0.30/40, br0.99) plus the uplinks to the core (eth5, eth6), forwarding discovers to the DHCP server at 10.0.0.76. On dswa2 and dswb2 the `bash(1)` PID spawned only the FRR routing daemons and keepalived \u2014 no `dhcrelay` process exists in either container. The `/etc/default/isc-dhcp-relay` config on both faulty switches has blank `SERVERS=` and `INTERFACES=` fields, and the systemd unit is `disabled / inactive (dead)`. No alternative mechanism (`rc.local`, etc.) compensates. The effect is that any DHCPDISCOVER broadcast that arrives exclusively at dswa2 or dswb2 \u2014 which occurs for VLANs on which those switches hold the VRRP virtual-IP (dswa2 is the VRRP active gateway for VLANs 20 and 40; dswb2 similarly for B-side VLANs) and for any access-switch uplink segment where STP has designated dswa2/dswb2 as the forwarding path \u2014 is silently discarded and never forwarded to the DHCP server. Existing leases continue because the lease renewal unicasts are routed successfully; only the initial broadcast-based DISCOVER from newly connected devices fails. Root cause: the Kathara startup scripts for dswa2 and dswb2 are missing the `dhcrelay` invocation that is present on dswa1 and dswb1, almost certainly omitted during the distribution-switch configuration change referenced in the ticket. Corrective fix: on dswa2 run `dhcrelay -i br0.10 -i br0.20 -i br0.40 -i br0.99 -i eth5 -i eth6 10.0.0.76`; on dswb2 run `dhcrelay -i br0.10 -i br0.20 -i br0.30 -i br0.99 -i eth5 -i eth6 10.0.0.76`; persist both commands in the respective `.startup` files.",
+      "is_anomaly": true,
+      "faulty_devices": [
+        "dswa2",
+        "dswb2"
+      ],
+      "parsed_ok": true,
+      "in_tokens": 15,
+      "cache_read_tokens": 193432,
+      "cache_write_tokens": 26710,
+      "out_tokens": 13247,
+      "cost_usd": 0.3596151,
+      "tool_calls": 10,
+      "hit_max_turns": false,
+      "error": null
+    },
+    "score": {
+      "must_passed": 0,
+      "must_total": 2,
+      "bonus_passed": 0,
+      "bonus_total": 1,
+      "outcome_score": 0.0,
+      "fix_score": 0.0,
+      "reasoning_score": 0.4666666666666666,
+      "reasoning_dims": {
+        "grounding": 0.7,
+        "causality": 0.4,
+        "coverage": 0.3
+      },
+      "final_score": 0.0,
+      "per_axis": [
+        {
+          "axis": "assert-identifies: r1",
+          "kind": "assert",
+          "score": 0.0,
+          "rationale": "culprit 'r1' NOT named"
+        },
+        {
+          "axis": "must-identify-dhcpd-down: central dhcpd / DHCP server process not running on r1",
+          "kind": "must",
+          "score": 0.0,
+          "rationale": "The diagnosis blames missing dhcrelay on dswa2/dswb2 and never identifies or states that the central dhcpd on r1 is down."
+        },
+        {
+          "axis": "bonus-rules-out-relay: notes the DSW relay/ip-helper config is intact and unicasting to a reachable 10.0.0.76, so the relay is not the cause",
+          "kind": "bonus",
+          "score": 0.0,
+          "rationale": "The writeup blames missing dhcrelay on dswa2/dswb2 and never acknowledges that the DSW relay/ip-helper is intact and unicasting to a reachable 10.0.0.76, so it fails this axis."
+        },
+        {
+          "axis": "[FIX]",
+          "kind": "fix",
+          "score": 0.0,
+          "rationale": "The agent recommends starting dhcrelay on dswa2/dswb2 and persisting it, but the expected remediation is to restart the isc-dhcp-server on r1, so the proposed fix does not match."
+        },
+        {
+          "axis": "reason:grounding",
+          "kind": "reason-dim",
+          "score": 0.7,
+          "rationale": "The log reliably shows dhcrelay present on dswa1/dswb1 and absent + disabled on dswa2/dswb2 (and blank configs), so the agent's core observation about missing relays is well-grounded. However the agent never checked the central DHCP server (r1) or demonstrated that the two dead relays alone explain the domain-wide outage, and it asserts VRRP/mastership and network-wide impact without logged evidence, so causal linkage and coverage are incomplete."
+        },
+        {
+          "axis": "reason:causality",
+          "kind": "reason-dim",
+          "score": 0.4,
+          "rationale": "The log reliably shows dhcrelay present on dswa1/dswb1 and absent + disabled on dswa2/dswb2 (and blank configs), so the agent's core observation about missing relays is well-grounded. However the agent never checked the central DHCP server (r1) or demonstrated that the two dead relays alone explain the domain-wide outage, and it asserts VRRP/mastership and network-wide impact without logged evidence, so causal linkage and coverage are incomplete."
+        },
+        {
+          "axis": "reason:coverage",
+          "kind": "reason-dim",
+          "score": 0.3,
+          "rationale": "The log reliably shows dhcrelay present on dswa1/dswb1 and absent + disabled on dswa2/dswb2 (and blank configs), so the agent's core observation about missing relays is well-grounded. However the agent never checked the central DHCP server (r1) or demonstrated that the two dead relays alone explain the domain-wide outage, and it asserts VRRP/mastership and network-wide impact without logged evidence, so causal linkage and coverage are incomplete."
+        }
+      ],
+      "judge_model": "gpt-5-mini",
+      "reasoning_mode": "trace",
+      "error": null
+    }
+  },
+  "agent_input_prompt": "# Topology overview (devices + L2 connectivity)\nTopology: Kath1\n\nDevices:\n  aswa1: eth0=CD_CLIENT_A1, eth1=CD_LINK_A2, eth2=CD_DSW_1_A1, eth3=CD_DSW_2_A1\n  aswa2: eth0=link_a2_pc, eth1=CD_DSW_1_A2, eth2=CD_DSW_2_A2\n  aswa3: eth0=CD_CLIENT_A3, eth1=CD_DSW_1_A3, eth2=CD_DSW_2_A3\n  aswb1: eth0=CD_CLIENT_B1, eth1=CD_DSW_1_B1, eth2=CD_DSW_2_B1\n  aswb2: eth0=CD_CLIENT_B2, eth1=CD_DSW_1_B2, eth2=CD_DSW_2_B2\n  aswb3: eth0=CD_CLIENT_B3, eth1=CD_DSW_1_B3, eth2=CD_DSW_2_B3\n  csw1: eth0=CD_WAN_LINK_1, eth1=CD_CORE_PEER_1, eth2=CD_CORE_PEER_2, eth3=CD_CORE_1_DSW1, eth4=CD_CORE_1_DSW2, eth5=CD_CORE_1_DSWB1, eth6=CD_CORE_1_DSWB2\n  csw2: eth0=CD_WAN_LINK_2, eth1=CD_CORE_PEER_1, eth2=CD_CORE_PEER_2, eth3=CD_CORE_2_DSW1, eth4=CD_CORE_2_DSW2, eth5=CD_CORE_2_DSWB1, eth6=CD_CORE_2_DSWB2\n  dswa1: eth0=CD_DSW_1_A1, eth1=CD_DSW_1_A2, eth2=CD_DSW_1_A3, eth3=CD_DSW_PEER_1, eth4=CD_DSW_PEER_2, eth5=CD_CORE_1_DSW1, eth6=CD_CORE_2_DSW1\n  dswa2: eth0=CD_DSW_2_A1, eth1=CD_DSW_2_A2, eth2=CD_DSW_2_A3, eth3=CD_DSW_PEER_1, eth4=CD_DSW_PEER_2, eth5=CD_CORE_1_DSW2, eth6=CD_CORE_2_DSW2\n  dswb1: eth0=CD_DSW_1_B1, eth1=CD_DSW_1_B2, eth2=CD_DSW_1_B3, eth3=CD_DSW_PEER_B_1, eth4=CD_DSW_PEER_B_2, eth5=CD_CORE_1_DSWB1, eth6=CD_CORE_2_DSWB1\n  dswb2: eth0=CD_DSW_2_B1, eth1=CD_DSW_2_B2, eth2=CD_DSW_2_B3, eth3=CD_DSW_PEER_B_1, eth4=CD_DSW_PEER_B_2, eth5=CD_CORE_1_DSWB2, eth6=CD_CORE_2_DSWB2\n  ispa: eth0=CD_ISP_R1, eth1=CD_ISPA_ISPB\n  ispb: eth0=CD_ISPB_R1, eth1=CD_ISPA_ISPB\n  laptop1: eth0=CD_LINK_A2\n  pc1: eth0=link_a2_pc\n  pc2: eth0=CD_CLIENT_A3\n  pc3: eth0=CD_CLIENT_B2\n  r1: eth0=CD_WAN_LINK_1, eth1=CD_WAN_LINK_2, eth2=CD_ISP_R1, eth3=CD_ISPB_R1\n  srv1: eth0=CD_CLIENT_B3\n\nCollision domains (shared L2 segments):\n  CD_CLIENT_A1: aswa1.eth0\n  CD_CLIENT_A3: aswa3.eth0, pc2.eth0\n  CD_CLIENT_B1: aswb1.eth0\n  CD_CLIENT_B2: aswb2.eth0, pc3.eth0\n  CD_CLIENT_B3: aswb3.eth0, srv1.eth0\n  CD_CORE_1_DSW1: csw1.eth3, dswa1.eth5\n  CD_CORE_1_DSW2: csw1.eth4, dswa2.eth5\n  CD_CORE_1_DSWB1: csw1.eth5, dswb1.eth5\n  CD_CORE_1_DSWB2: csw1.eth6, dswb2.eth5\n  CD_CORE_2_DSW1: csw2.eth3, dswa1.eth6\n  CD_CORE_2_DSW2: csw2.eth4, dswa2.eth6\n  CD_CORE_2_DSWB1: csw2.eth5, dswb1.eth6\n  CD_CORE_2_DSWB2: csw2.eth6, dswb2.eth6\n  CD_CORE_PEER_1: csw1.eth1, csw2.eth1\n  CD_CORE_PEER_2: csw1.eth2, csw2.eth2\n  CD_DSW_1_A1: aswa1.eth2, dswa1.eth0\n  CD_DSW_1_A2: aswa2.eth1, dswa1.eth1\n  CD_DSW_1_A3: aswa3.eth1, dswa1.eth2\n  CD_DSW_1_B1: aswb1.eth1, dswb1.eth0\n  CD_DSW_1_B2: aswb2.eth1, dswb1.eth1\n  CD_DSW_1_B3: aswb3.eth1, dswb1.eth2\n  CD_DSW_2_A1: aswa1.eth3, dswa2.eth0\n  CD_DSW_2_A2: aswa2.eth2, dswa2.eth1\n  CD_DSW_2_A3: aswa3.eth2, dswa2.eth2\n  CD_DSW_2_B1: aswb1.eth2, dswb2.eth0\n  CD_DSW_2_B2: aswb2.eth2, dswb2.eth1\n  CD_DSW_2_B3: aswb3.eth2, dswb2.eth2\n  CD_DSW_PEER_1: dswa1.eth3, dswa2.eth3\n  CD_DSW_PEER_2: dswa1.eth4, dswa2.eth4\n  CD_DSW_PEER_B_1: dswb1.eth3, dswb2.eth3\n  CD_DSW_PEER_B_2: dswb1.eth4, dswb2.eth4\n  CD_ISPA_ISPB: ispa.eth1, ispb.eth1\n  CD_ISPB_R1: ispb.eth0, r1.eth3\n  CD_ISP_R1: ispa.eth0, r1.eth2\n  CD_LINK_A2: aswa1.eth1, laptop1.eth0\n  CD_WAN_LINK_1: csw1.eth0, r1.eth0\n  CD_WAN_LINK_2: csw2.eth0, r1.eth1\n  link_a2_pc: aswa2.eth0, pc1.eth0\n\n# Symptom (user report)\nTicket #5093: After a user reboots their PC it cannot get an IP address. PCs\nthat were already up keep working, but newly connected devices on any internal\nVLAN time out waiting for DHCP. The help desk reports this started after a\ndistribution-switch change and believes the DHCP relay (ip helper-address) on\nthe distribution switches is broken and no longer forwarding DHCPDISCOVER.\nPlease find and confirm the broken relay configuration on the DSWs."
+}

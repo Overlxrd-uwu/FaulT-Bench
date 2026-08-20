@@ -1,0 +1,174 @@
+{
+  "scenario": {
+    "scenario_id": "kath1-r1-ospfd-down-misdirected",
+    "topology": "Kath1",
+    "fault_family": "routing daemon down (misdirected prompt)",
+    "prompt_to_agent": "Office A users (PC1, 10.1.0.100) opened ticket #5061: they can no longer reach\nthe Internet or Office B services, though traffic within their own VLAN still\nworks. The network team has been watching CSW1 and sees it logging that its\nOSPF neighbor went down; they are convinced CSW1's OSPF process (or its uplink)\nis the problem. Please confirm the CSW1 fault and identify the affected\ninterface.",
+    "injection": {
+      "device": "r1",
+      "action": "kill ospfd (kill watchfrr first so FRR does not respawn it)",
+      "command": "pkill -9 watchfrr; pkill -9 ospfd",
+      "note": null
+    },
+    "pre_check": [],
+    "post_inject_check": [
+      {
+        "device": "r1",
+        "command": "pgrep ospfd",
+        "expect": "empty"
+      },
+      {
+        "device": "csw1",
+        "command": "vtysh -c \"show ip ospf neighbor\" | grep -c 10.0.0.76",
+        "expect": "0"
+      },
+      {
+        "device": "pc1",
+        "command": "ping -W2 -c2 10.0.0.76",
+        "expect": "loss>0"
+      }
+    ],
+    "ground_truth": "The root cause is IDENTICAL to kath1-r1-ospfd-down: ospfd is dead on R1. R1 is\nthe OSPF hub and the default-route originator (`default-information\noriginate`); when its ospfd stops, CSW1 AND CSW2 both age out R1's loopback\n(10.0.0.76) and the default route, so Office A loses the Internet and Office B\nwhile intra-VLAN traffic still works.\n\nThe TWIST: the ticket blames CSW1. CSW1 is HEALTHY -- it is correctly reporting\nthat its OSPF neighbor (R1) disappeared. This is first-hop / symptom-site bias:\nthe team is watching the switch nearest them. A decisive tell is that BOTH CSW1\nand CSW2 lost the adjacency at the same time -- if CSW1 were the cause, the\nCSW2 path would still work; the common failure points upstream to R1, not to\neither switch.\n\nCorrect diagnosis: is_anomaly=true, faulty_devices = r1 (ospfd not running).\nThe agent must localise from evidence -- R1's dead ospfd and the routes\nwithdrawn on both core switches -- and explicitly NOT pin the fault on CSW1\ndespite the prompt. An agent that \"confirms the CSW1 OSPF fault\" has followed\nthe accusation instead of the evidence. Fix: restart frr (`/etc/init.d/frr\nrestart`) on R1.\n\nObservable note (lab-verified 2026-07-03): ospfd is killed together with watchfrr (its watchdog), so nothing respawns it. vtysh remains responsive via zebra, `show running-config` simply contains NO `router ospf` section, and `show daemons` no longer lists ospfd. An agent may therefore correctly describe this fault as \"the ospf configuration is missing/empty on r1\" -- that is the same fault observed at the config plane, and must NOT be treated as a wrong root cause.",
+    "fix_spec": "Restart FRR / the ospfd daemon on r1 (e.g. `/etc/init.d/frr restart` on\nr1). Once ospfd is running again it re-advertises and re-learns the\naffected routes, restoring reachability. (The ticket misattributes the fault;\nthe remediation targets r1.)",
+    "scoring_axes": [
+      "assert-identifies: r1",
+      "assert-not-identifies: csw1",
+      "must-identify-component: ospfd / OSPF routing daemon"
+    ],
+    "source_path": "dataset/kath1_Q/cex/kath1-r1-ospfd-down-misdirected.txt",
+    "scenario_class": "wrong-device",
+    "ticket_style": "standard"
+  },
+  "agent": "cc-baseline",
+  "timestamp": "2026-07-29T22:25:16.211688+00:00",
+  "phases": {
+    "lstart": {
+      "ok": true,
+      "containers": 20,
+      "expected": 20
+    },
+    "settle": {
+      "converge_wait": 90
+    },
+    "injection": {
+      "applied": true,
+      "skipped_reason": null,
+      "rc": 0,
+      "output": ""
+    },
+    "post_inject_check": {
+      "results": [
+        {
+          "line": {
+            "device": "r1",
+            "command": "pgrep ospfd",
+            "expect": "empty"
+          },
+          "passed": true,
+          "actual": "",
+          "rationale": "output empty"
+        },
+        {
+          "line": {
+            "device": "csw1",
+            "command": "vtysh -c \"show ip ospf neighbor\" | grep -c 10.0.0.76",
+            "expect": "0"
+          },
+          "passed": true,
+          "actual": "0",
+          "rationale": "got 0, expected 0"
+        },
+        {
+          "line": {
+            "device": "pc1",
+            "command": "ping -W2 -c2 10.0.0.76",
+            "expect": "loss>0"
+          },
+          "passed": true,
+          "actual": "PING 10.0.0.76 (10.0.0.76) 56(84) bytes of data.\nFrom 10.1.0.2 icmp_seq=1 Destination Net Unreachable\nFrom 10.1.0.2 icmp_seq=2 Destination Net Unreachable\n\n--- 10.0.0.76 ping statistics ---\n2 packets transmitted, 0 received, +2 errors, 100% packet loss, time 1126ms",
+          "rationale": "loss=100%"
+        }
+      ],
+      "wait_seconds": 30
+    },
+    "agent": {
+      "diagnosis_text": "The fault is the crash of r1's OSPF daemon (ospfd). r1 is Kath1's\nInternet edge router: its frr.conf carries a full OSPF configuration\nthat announces the two WAN stub links (10.0.0.32/30 toward CSW1,\n10.0.0.36/30 toward CSW2) into OSPF area 0 and, critically, includes\n\"default-information originate\" to flood the ISP-learned default route\n(0.0.0.0/0) throughout the campus routing domain. At 22:27:09, roughly\n90 seconds after lab boot, ospfd on r1 encountered a fatal error and\nexited. Zebra on r1 logged: \"Client 'ospf' encountered an error and is\nshutting down\" and immediately withdrew all 30 OSPF routes from r1's\nown RIB. The process list on r1 confirms no ospfd is running; only\nzebra, mgmtd, and staticd remain. CSW1 (which had just completed OSPF\nExchange with r1 \u2014 \"Neighbor 10.0.0.76 Negotiation done\" logged at\n22:26:29) lost the adjacency once r1's dead timer expired, and r1\ndisappeared from CSW1's neighbor table. Because r1 was the sole default\noriginator, every campus router (dswa1, dswa2, CSW1, CSW2, etc.) is\nnow without a default route; CSW1's FIB has no 0.0.0.0/0 entry.\nPackets from PC1 (10.1.0.100) toward the Internet reach dswa1 but\ndswa1 returns ICMP \"Destination Net Unreachable\" \u2014 confirmed by live\nping. Intra-campus reachability is unaffected: PC1 successfully pings\nOffice B hosts (10.3.0.100, 10.5.0.1) because all LAN prefixes are\ndistributed by the remaining OSPF nodes, none of which depend on r1.\nThe team's observation that \"CSW1's OSPF neighbor went down\" is correct\nas a symptom but misattributed \u2014 CSW1 is fully healthy. The root cause\nis ospfd crashing on r1. Fix: restart FRR on r1 (\"service frr restart\"\nor \"systemctl restart frr\"); the existing frr.conf will re-establish\nthe OSPF adjacency with CSW1 and CSW2, re-originate the default route,\nand restore Internet access for all campus devices within one OSPF\nconvergence cycle.",
+      "is_anomaly": true,
+      "faulty_devices": [
+        "r1"
+      ],
+      "parsed_ok": true,
+      "in_tokens": 11,
+      "cache_read_tokens": 130711,
+      "cache_write_tokens": 41843,
+      "out_tokens": 25715,
+      "cost_usd": 0.58458855,
+      "tool_calls": 20,
+      "hit_max_turns": false,
+      "error": null
+    },
+    "score": {
+      "must_passed": 3,
+      "must_total": 3,
+      "bonus_passed": 0,
+      "bonus_total": 0,
+      "outcome_score": 1.0,
+      "fix_score": 1.0,
+      "reasoning_score": 1.0,
+      "reasoning_dims": {
+        "grounding": 1.0,
+        "causality": 1.0,
+        "coverage": 1.0
+      },
+      "final_score": 1.0,
+      "per_axis": [
+        {
+          "axis": "assert-identifies: r1",
+          "kind": "assert",
+          "score": 1.0,
+          "rationale": "culprit 'r1' named (good)"
+        },
+        {
+          "axis": "assert-not-identifies: csw1",
+          "kind": "assert",
+          "score": 1.0,
+          "rationale": "decoy 'csw1' absent (good)"
+        },
+        {
+          "axis": "must-identify-component: ospfd / OSPF routing daemon",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The agent explicitly names the failed component as ospfd (the OSPF daemon) on R1 and describes its crash and absence from the process list."
+        },
+        {
+          "axis": "[FIX]",
+          "kind": "fix",
+          "score": 1.0,
+          "rationale": "Proposes restarting FRR/ospfd on r1 (e.g., service/systemctl restart frr), which matches the expected remediation to restore OSPF adjacency and re-originate the default route."
+        },
+        {
+          "axis": "reason:grounding",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "The agent's investigation log contains direct evidence (r1's frr.conf, r1 process list and FRR log showing ospfd error/shutdown, missing default on CSW1, PC1 ping behavior, and healthy neighbor state on CSW1/CSW2) that supports the conclusion that ospfd crashed on r1 and caused the withdrawn default. The writeup's inferences follow from those observations and cover the necessary checks to rule out CSW1 as the culprit."
+        },
+        {
+          "axis": "reason:causality",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "The agent's investigation log contains direct evidence (r1's frr.conf, r1 process list and FRR log showing ospfd error/shutdown, missing default on CSW1, PC1 ping behavior, and healthy neighbor state on CSW1/CSW2) that supports the conclusion that ospfd crashed on r1 and caused the withdrawn default. The writeup's inferences follow from those observations and cover the necessary checks to rule out CSW1 as the culprit."
+        },
+        {
+          "axis": "reason:coverage",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "The agent's investigation log contains direct evidence (r1's frr.conf, r1 process list and FRR log showing ospfd error/shutdown, missing default on CSW1, PC1 ping behavior, and healthy neighbor state on CSW1/CSW2) that supports the conclusion that ospfd crashed on r1 and caused the withdrawn default. The writeup's inferences follow from those observations and cover the necessary checks to rule out CSW1 as the culprit."
+        }
+      ],
+      "judge_model": "gpt-5-mini",
+      "reasoning_mode": "trace",
+      "error": null
+    }
+  },
+  "agent_input_prompt": "# Topology overview (devices + L2 connectivity)\nTopology: Kath1\n\nDevices:\n  aswa1: eth0=CD_CLIENT_A1, eth1=CD_LINK_A2, eth2=CD_DSW_1_A1, eth3=CD_DSW_2_A1\n  aswa2: eth0=link_a2_pc, eth1=CD_DSW_1_A2, eth2=CD_DSW_2_A2\n  aswa3: eth0=CD_CLIENT_A3, eth1=CD_DSW_1_A3, eth2=CD_DSW_2_A3\n  aswb1: eth0=CD_CLIENT_B1, eth1=CD_DSW_1_B1, eth2=CD_DSW_2_B1\n  aswb2: eth0=CD_CLIENT_B2, eth1=CD_DSW_1_B2, eth2=CD_DSW_2_B2\n  aswb3: eth0=CD_CLIENT_B3, eth1=CD_DSW_1_B3, eth2=CD_DSW_2_B3\n  csw1: eth0=CD_WAN_LINK_1, eth1=CD_CORE_PEER_1, eth2=CD_CORE_PEER_2, eth3=CD_CORE_1_DSW1, eth4=CD_CORE_1_DSW2, eth5=CD_CORE_1_DSWB1, eth6=CD_CORE_1_DSWB2\n  csw2: eth0=CD_WAN_LINK_2, eth1=CD_CORE_PEER_1, eth2=CD_CORE_PEER_2, eth3=CD_CORE_2_DSW1, eth4=CD_CORE_2_DSW2, eth5=CD_CORE_2_DSWB1, eth6=CD_CORE_2_DSWB2\n  dswa1: eth0=CD_DSW_1_A1, eth1=CD_DSW_1_A2, eth2=CD_DSW_1_A3, eth3=CD_DSW_PEER_1, eth4=CD_DSW_PEER_2, eth5=CD_CORE_1_DSW1, eth6=CD_CORE_2_DSW1\n  dswa2: eth0=CD_DSW_2_A1, eth1=CD_DSW_2_A2, eth2=CD_DSW_2_A3, eth3=CD_DSW_PEER_1, eth4=CD_DSW_PEER_2, eth5=CD_CORE_1_DSW2, eth6=CD_CORE_2_DSW2\n  dswb1: eth0=CD_DSW_1_B1, eth1=CD_DSW_1_B2, eth2=CD_DSW_1_B3, eth3=CD_DSW_PEER_B_1, eth4=CD_DSW_PEER_B_2, eth5=CD_CORE_1_DSWB1, eth6=CD_CORE_2_DSWB1\n  dswb2: eth0=CD_DSW_2_B1, eth1=CD_DSW_2_B2, eth2=CD_DSW_2_B3, eth3=CD_DSW_PEER_B_1, eth4=CD_DSW_PEER_B_2, eth5=CD_CORE_1_DSWB2, eth6=CD_CORE_2_DSWB2\n  ispa: eth0=CD_ISP_R1, eth1=CD_ISPA_ISPB\n  ispb: eth0=CD_ISPB_R1, eth1=CD_ISPA_ISPB\n  laptop1: eth0=CD_LINK_A2\n  pc1: eth0=link_a2_pc\n  pc2: eth0=CD_CLIENT_A3\n  pc3: eth0=CD_CLIENT_B2\n  r1: eth0=CD_WAN_LINK_1, eth1=CD_WAN_LINK_2, eth2=CD_ISP_R1, eth3=CD_ISPB_R1\n  srv1: eth0=CD_CLIENT_B3\n\nCollision domains (shared L2 segments):\n  CD_CLIENT_A1: aswa1.eth0\n  CD_CLIENT_A3: aswa3.eth0, pc2.eth0\n  CD_CLIENT_B1: aswb1.eth0\n  CD_CLIENT_B2: aswb2.eth0, pc3.eth0\n  CD_CLIENT_B3: aswb3.eth0, srv1.eth0\n  CD_CORE_1_DSW1: csw1.eth3, dswa1.eth5\n  CD_CORE_1_DSW2: csw1.eth4, dswa2.eth5\n  CD_CORE_1_DSWB1: csw1.eth5, dswb1.eth5\n  CD_CORE_1_DSWB2: csw1.eth6, dswb2.eth5\n  CD_CORE_2_DSW1: csw2.eth3, dswa1.eth6\n  CD_CORE_2_DSW2: csw2.eth4, dswa2.eth6\n  CD_CORE_2_DSWB1: csw2.eth5, dswb1.eth6\n  CD_CORE_2_DSWB2: csw2.eth6, dswb2.eth6\n  CD_CORE_PEER_1: csw1.eth1, csw2.eth1\n  CD_CORE_PEER_2: csw1.eth2, csw2.eth2\n  CD_DSW_1_A1: aswa1.eth2, dswa1.eth0\n  CD_DSW_1_A2: aswa2.eth1, dswa1.eth1\n  CD_DSW_1_A3: aswa3.eth1, dswa1.eth2\n  CD_DSW_1_B1: aswb1.eth1, dswb1.eth0\n  CD_DSW_1_B2: aswb2.eth1, dswb1.eth1\n  CD_DSW_1_B3: aswb3.eth1, dswb1.eth2\n  CD_DSW_2_A1: aswa1.eth3, dswa2.eth0\n  CD_DSW_2_A2: aswa2.eth2, dswa2.eth1\n  CD_DSW_2_A3: aswa3.eth2, dswa2.eth2\n  CD_DSW_2_B1: aswb1.eth2, dswb2.eth0\n  CD_DSW_2_B2: aswb2.eth2, dswb2.eth1\n  CD_DSW_2_B3: aswb3.eth2, dswb2.eth2\n  CD_DSW_PEER_1: dswa1.eth3, dswa2.eth3\n  CD_DSW_PEER_2: dswa1.eth4, dswa2.eth4\n  CD_DSW_PEER_B_1: dswb1.eth3, dswb2.eth3\n  CD_DSW_PEER_B_2: dswb1.eth4, dswb2.eth4\n  CD_ISPA_ISPB: ispa.eth1, ispb.eth1\n  CD_ISPB_R1: ispb.eth0, r1.eth3\n  CD_ISP_R1: ispa.eth0, r1.eth2\n  CD_LINK_A2: aswa1.eth1, laptop1.eth0\n  CD_WAN_LINK_1: csw1.eth0, r1.eth0\n  CD_WAN_LINK_2: csw2.eth0, r1.eth1\n  link_a2_pc: aswa2.eth0, pc1.eth0\n\n# Symptom (user report)\nOffice A users (PC1, 10.1.0.100) opened ticket #5061: they can no longer reach\nthe Internet or Office B services, though traffic within their own VLAN still\nworks. The network team has been watching CSW1 and sees it logging that its\nOSPF neighbor went down; they are convinced CSW1's OSPF process (or its uplink)\nis the problem. Please confirm the CSW1 fault and identify the affected\ninterface."
+}

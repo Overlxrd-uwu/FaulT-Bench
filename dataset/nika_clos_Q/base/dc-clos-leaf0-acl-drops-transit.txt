@@ -1,0 +1,82 @@
+==================================================
+Scenario: dc-clos-leaf0-acl-drops-transit
+Topology: dc_clos_bgp
+Fault family: ACL drops legitimate transit (iptables FORWARD)
+==================================================
+
+[PROMPT-TO-AGENT]
+Users on pc_0_0 (10.0.0.2) and pc_0_1 (10.0.1.2) report they cannot
+reach each other in either direction. Both hosts can still ping their
+own gateways (10.0.0.1 and 10.0.1.1). The NOC insists the fabric is
+healthy: every BGP session is Established, all routes are present on
+every router, no interface has flapped, and all FRR daemons are
+running. Identify what is silently eating the traffic.
+
+[INJECTION]
+device: leaf_router_0_0
+action: add a FORWARD DROP rule for pc_0_0 -> pc_0_1 transit
+cmd: iptables -A FORWARD -s 10.0.0.0/24 -d 10.0.1.0/24 -j DROP
+
+[POST-INJECT-CHECK]
+leaf_router_0_0   iptables -S FORWARD | grep -c "10.0.1.0/24"  => expect 1
+pc_0_0            ping -W2 -c2 10.0.1.2                        => expect loss>0
+pc_0_0            ping -W2 -c2 10.0.0.1                        => expect 0% loss   (gateway still OK -- INPUT chain untouched)
+
+[GROUND-TRUTH]
+Affected component: leaf_router_0_0 iptables FORWARD chain
+Mechanism: a DROP rule on leaf_router_0_0 discards every forwarded
+  packet with source in 10.0.0.0/24 and destination in 10.0.1.0/24.
+  All pc_0_0 traffic must transit leaf_router_0_0 (its only gateway),
+  so pc_0_0 -> pc_0_1 packets die there. The reverse direction fails
+  too, despite matching no rule on its way in: pc_0_1's echo requests
+  ARE delivered to pc_0_0, but pc_0_0's replies (src 10.0.0.2, dst
+  10.0.1.2) match the rule and are dropped -- a one-directional filter
+  breaks bidirectional traffic. Routing and BGP are completely
+  healthy; the drop is at the firewall layer. Local delivery to the
+  gateway itself uses the INPUT chain, which is untouched, so both
+  hosts still ping their gateways.
+Localization: leaf_router_0_0
+Root cause: extraneous iptables FORWARD DROP rule
+  (-s 10.0.0.0/24 -d 10.0.1.0/24) on leaf_router_0_0
+Fix: `iptables -D FORWARD -s 10.0.0.0/24 -d 10.0.1.0/24 -j DROP` on
+  leaf_router_0_0
+
+[FIX]
+remove the DROP rule on leaf_router_0_0 --
+`iptables -D FORWARD -s 10.0.0.0/24 -d 10.0.1.0/24 -j DROP`
+
+[DIAGNOSTIC-PROCESS]
+1. Scope the failure: pc_0_0 <-> pc_0_1 fails both ways while each host
+   reaches its own gateway, and the control plane is fully healthy
+   (sessions Established, routes present) -- packets are being dropped
+   in the forwarding path, not misrouted.
+2. Verify routing end to end: every router holds correct routes for
+   both /24s and the daemons are running -- the loss is not explained
+   at the routing layer.
+3. Inspect packet filters along the path, starting at the first-hop
+   transit device: run `iptables -nL FORWARD` (or `iptables -S
+   FORWARD`; same rules under the iptables-nft backend) on
+   leaf_router_0_0 -- a DROP rule matches -s 10.0.0.0/24
+   -d 10.0.1.0/24.
+4. Confirm the mechanism, including the asymmetry: pc_0_1's requests
+   reach pc_0_0 (no rule matches inbound), but the replies match the
+   rule and die on leaf_router_0_0 -- which is why BOTH directions of
+   the ping fail from a single unidirectional rule.
+5. Localize to the iptables FORWARD rule on leaf_router_0_0: rule out
+   link, daemon and BGP-config faults, since all of those are
+   demonstrably healthy while the FORWARD counter on the DROP rule
+   climbs.
+
+[SCORING-AXES]
+assert-identifies: leaf_router_0_0
+must-identify-device: leaf_router_0_0
+must-identify-component: iptables FORWARD DROP / firewall filter
+must-recognize-filter-pattern: recognizes healthy routing + healthy BGP with silent forwarding loss as a packet-filter fault, not a routing fault
+bonus-explains-asymmetric-drop: explains that the single directional rule (10.0.0.0/24 -> 10.0.1.0/24) also kills the reverse ping because replies match it
+# These axes score the outcome metric only; fix and reasoning are judged separately.
+
+[NIKA-LABEL]
+nika_label: icmp_acl_block
+nika_category: MISCONFIGURATION
+in_taxonomy: true
+note: partial: the DROP rule blocks ALL forwarded traffic between the two host subnets (NIKA acl_block labels are per-protocol; the observed symptom here is ICMP)

@@ -1,0 +1,188 @@
+{
+  "scenario": {
+    "scenario_id": "simple-bgp-router2-iptables-icmp-drop",
+    "topology": "simple_bgp",
+    "fault_family": "ACL drops transit ICMP",
+    "prompt_to_agent": "After an overnight maintenance window, pc1 (195.11.14.2) reports\npings to pc2 (200.1.1.2) are 100% lost, and pc2 reports the same\ntoward pc1. Yet monitoring shows the router1<->router2 eBGP\nsession Established with prefixes exchanged, and pc1 can still\nping BOTH of router2's addresses (193.10.11.2 and 200.1.1.1).\nIdentify what is dropping the traffic.",
+    "injection": {
+      "device": "router2",
+      "action": "add an iptables FORWARD rule dropping all transit ICMP",
+      "command": "iptables -A FORWARD -p icmp -j DROP",
+      "note": null
+    },
+    "pre_check": [],
+    "post_inject_check": [
+      {
+        "device": "router2",
+        "command": "iptables -S FORWARD | grep -c icmp",
+        "expect": "1"
+      },
+      {
+        "device": "pc1",
+        "command": "ping -W2 -c2 200.1.1.2",
+        "expect": "loss>0"
+      },
+      {
+        "device": "pc1",
+        "command": "ping -W2 -c2 193.10.11.2",
+        "expect": "0% loss"
+      }
+    ],
+    "ground_truth": "Affected component: router2 iptables FORWARD chain\nMechanism: a DROP rule for protocol icmp sits in router2's FORWARD\n  chain, so any ICMP packet router2 must FORWARD (pc1<->pc2 transit\n  in either direction) is discarded at the firewall layer. Traffic\n  addressed TO router2 itself traverses INPUT, not FORWARD, which\n  is why pc1 can still ping 193.10.11.2 and 200.1.1.1. The BGP\n  session is TCP, not ICMP, so it stays Established and all\n  prefixes remain exchanged -- routing is completely healthy; the\n  drop is purely at the packet-filter layer.\nLocalization: router2\nRoot cause: extraneous iptables FORWARD DROP rule for ICMP on\n  router2\nFix: `iptables -D FORWARD -p icmp -j DROP` on router2",
+    "fix_spec": "Remove the DROP rule on router2 -- `iptables -D FORWARD -p icmp -j DROP`.\nTransit pings between pc1 and pc2 succeed again immediately; no routing or\nBGP change is needed.",
+    "scoring_axes": [
+      "assert-identifies: router2",
+      "must-identify-device: router2",
+      "must-identify-component: iptables FORWARD rule dropping ICMP / firewall filter",
+      "must-recognize-filter-pattern: recognizes that routing and BGP are healthy (session Established, router2's own addresses reachable) and only transit ICMP is dropped",
+      "bonus-cites-rule: shows the DROP rule via iptables -S/-nL FORWARD (or nft list ruleset)"
+    ],
+    "source_path": "dataset/nika_bgp_Q/base/simple-bgp-router2-iptables-icmp-drop.txt",
+    "scenario_class": "base",
+    "ticket_style": "standard"
+  },
+  "agent": "sade",
+  "timestamp": "2026-08-04T14:32:34.087642+00:00",
+  "phases": {
+    "lstart": {
+      "ok": true,
+      "containers": 4,
+      "expected": 4
+    },
+    "settle": {
+      "converge_wait": 90
+    },
+    "injection": {
+      "applied": true,
+      "skipped_reason": null,
+      "rc": 0,
+      "output": ""
+    },
+    "post_inject_check": {
+      "results": [
+        {
+          "line": {
+            "device": "router2",
+            "command": "iptables -S FORWARD | grep -c icmp",
+            "expect": "1"
+          },
+          "passed": true,
+          "actual": "1",
+          "rationale": "got 1, expected 1"
+        },
+        {
+          "line": {
+            "device": "pc1",
+            "command": "ping -W2 -c2 200.1.1.2",
+            "expect": "loss>0"
+          },
+          "passed": true,
+          "actual": "PING 200.1.1.2 (200.1.1.2) 56(84) bytes of data.\n\n--- 200.1.1.2 ping statistics ---\n2 packets transmitted, 0 received, 100% packet loss, time 1090ms",
+          "rationale": "loss=100%"
+        },
+        {
+          "line": {
+            "device": "pc1",
+            "command": "ping -W2 -c2 193.10.11.2",
+            "expect": "0% loss"
+          },
+          "passed": true,
+          "actual": "PING 193.10.11.2 (193.10.11.2) 56(84) bytes of data.\n64 bytes from 193.10.11.2: icmp_seq=1 ttl=63 time=0.536 ms\n64 bytes from 193.10.11.2: icmp_seq=2 ttl=63 time=0.811 ms\n\n--- 193.10.11.2 ping statistics ---\n2 packets transmitted, 2 received, 0% packet loss, time 1075ms\nrtt min/avg/max/mdev = 0.536/0.673/0.811/0.137 ms",
+          "rationale": "loss=0%"
+        }
+      ],
+      "wait_seconds": 0
+    },
+    "agent": {
+      "diagnosis_text": "**Affected component:** The `FORWARD` chain in router2's netfilter stack \u2014 implemented identically in both iptables (protocol 1 DROP) and nftables (`table ip filter \u2192 chain FORWARD \u2192 meta l4proto icmp drop`).\n\n**Mechanism:** Any packet that router2 must *forward* (i.e. route from one interface to another) passes through the FORWARD chain. A rule placed there during the maintenance window matches all ICMP traffic (`meta l4proto icmp`) and drops it unconditionally. Packets destined *to* router2 itself (e.g., pings to 193.10.11.2 or 200.1.1.1) bypass FORWARD entirely and enter the INPUT chain, which has a default ACCEPT policy and no rules \u2014 explaining why pc1 can still reach both of router2's own addresses.\n\n**Localization:** router2 \u2014 nftables `ip filter` table, `FORWARD` chain (hook priority: filter), rule: `meta l4proto icmp counter packets 12 bytes 1008 drop`. The 12-packet counter is direct evidence of my own ping probes being silently discarded.\n\n**Root cause:** A blanket ICMP-DROP rule was inserted into router2's FORWARD chain during the overnight maintenance window, causing all transit ICMP traffic (pc1\u2194pc2 in both directions) to be silently discarded while BGP (TCP/179) and locally-terminated ICMP remain unaffected.\n\n**Fix:** Remove the offending rule on router2: `nft delete rule ip filter FORWARD handle <handle>` (obtain handle via `nft -a list chain ip filter FORWARD`) and/or `iptables -D FORWARD -p icmp -j DROP`.",
+      "is_anomaly": true,
+      "faulty_devices": [
+        "router2"
+      ],
+      "parsed_ok": true,
+      "in_tokens": 20,
+      "cache_read_tokens": 144015,
+      "cache_write_tokens": 24261,
+      "out_tokens": 10844,
+      "cost_usd": 0.29766325,
+      "tool_calls": 16,
+      "hit_max_turns": false,
+      "error": null
+    },
+    "score": {
+      "must_passed": 4,
+      "must_total": 4,
+      "bonus_passed": 1,
+      "bonus_total": 1,
+      "outcome_score": 1.0,
+      "fix_score": 1.0,
+      "reasoning_score": 0.9666666666666667,
+      "reasoning_dims": {
+        "grounding": 1.0,
+        "causality": 1.0,
+        "coverage": 0.9
+      },
+      "final_score": 1.0,
+      "per_axis": [
+        {
+          "axis": "assert-identifies: router2",
+          "kind": "assert",
+          "score": 1.0,
+          "rationale": "culprit 'router2' named (good)"
+        },
+        {
+          "axis": "must-identify-device: router2",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The agent explicitly identifies router2 as the affected device multiple times (e.g., 'FORWARD chain in router2' and 'Localization: router2')."
+        },
+        {
+          "axis": "must-identify-component: iptables FORWARD rule dropping ICMP / firewall filter",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "Identifies router2's FORWARD-chain firewall (iptables/nftables) containing a rule that drops ICMP as the root cause."
+        },
+        {
+          "axis": "must-recognize-filter-pattern: recognizes that routing and BGP are healthy (session Established, router2's own addresses reachable) and only transit ICMP is dropped",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The report explicitly notes that the DROP is in FORWARD (affecting transit ICMP only), that INPUT accepts locally-terminated ICMP (so router IPs remain reachable), and that BGP/TCP is unaffected (routing/BGP healthy)."
+        },
+        {
+          "axis": "bonus-cites-rule: shows the DROP rule via iptables -S/-nL FORWARD (or nft list ruleset)",
+          "kind": "bonus",
+          "score": 1.0,
+          "rationale": "The agent included the nftables FORWARD rule line (meta l4proto icmp counter packets 12 bytes 1008 drop), effectively showing the DROP rule as would be output by 'nft list'."
+        },
+        {
+          "axis": "[FIX]",
+          "kind": "fix",
+          "score": 1.0,
+          "rationale": "Proposes removing the FORWARD-chain ICMP DROP on router2 (via nft delete rule or iptables -D), which restores transit pings."
+        },
+        {
+          "axis": "reason:grounding",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "The log contains direct observations: bidirectional pings failed, routing and ip_forward are correct, and router2's FORWARD chain has an ICMP drop rule with packet counters. The agent's inference that this rule explains the symptom and that removing it fixes transit ICMP is logically supported and the investigation covers the plausible alternatives."
+        },
+        {
+          "axis": "reason:causality",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "The log contains direct observations: bidirectional pings failed, routing and ip_forward are correct, and router2's FORWARD chain has an ICMP drop rule with packet counters. The agent's inference that this rule explains the symptom and that removing it fixes transit ICMP is logically supported and the investigation covers the plausible alternatives."
+        },
+        {
+          "axis": "reason:coverage",
+          "kind": "reason-dim",
+          "score": 0.9,
+          "rationale": "The log contains direct observations: bidirectional pings failed, routing and ip_forward are correct, and router2's FORWARD chain has an ICMP drop rule with packet counters. The agent's inference that this rule explains the symptom and that removing it fixes transit ICMP is logically supported and the investigation covers the plausible alternatives."
+        }
+      ],
+      "judge_model": "gpt-5-mini",
+      "reasoning_mode": "trace",
+      "error": null
+    }
+  },
+  "agent_input_prompt": "# Topology overview (devices + L2 connectivity)\nTopology: simple_bgp\n\nDevices:\n  Routers (FRR): router1, router2\n  Hosts: pc1, pc2\n\nLinks (device:iface <-> device:iface):\n  router1:eth0 <-> router2:eth0\n  router1:eth1 <-> pc1:eth0\n  router2:eth1 <-> pc2:eth0\n\n# Symptom (user report)\nAfter an overnight maintenance window, pc1 (195.11.14.2) reports\npings to pc2 (200.1.1.2) are 100% lost, and pc2 reports the same\ntoward pc1. Yet monitoring shows the router1<->router2 eBGP\nsession Established with prefixes exchanged, and pc1 can still\nping BOTH of router2's addresses (193.10.11.2 and 200.1.1.1).\nIdentify what is dropping the traffic."
+}

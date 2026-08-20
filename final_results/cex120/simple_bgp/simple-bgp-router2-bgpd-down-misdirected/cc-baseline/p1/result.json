@@ -1,0 +1,180 @@
+{
+  "scenario": {
+    "scenario_id": "simple-bgp-router2-bgpd-down-misdirected",
+    "topology": "simple_bgp",
+    "fault_family": "routing daemon down (misdirected ticket)",
+    "prompt_to_agent": "Helpdesk ticket #9104: A user on pc1 (195.11.14.2) reports they have completely\nlost connectivity to the partner network -- they cannot reach pc2 (200.1.1.2) in\nthe peer AS since this morning. The team is convinced their own edge router,\nrouter1, has fallen over and want router1 restarted. Please find and confirm the\nreal fault and tell us which device to restart.",
+    "injection": {
+      "device": "router2",
+      "action": "kill the BGP routing daemon (and its watchdog) on router2",
+      "command": "pkill -9 watchfrr; pkill -9 bgpd",
+      "note": null
+    },
+    "pre_check": [],
+    "post_inject_check": [
+      {
+        "device": "router2",
+        "command": "pgrep bgpd",
+        "expect": "empty"
+      },
+      {
+        "device": "pc1",
+        "command": "ping -W2 -c2 200.1.1.2",
+        "expect": "loss>0"
+      },
+      {
+        "device": "router2",
+        "command": "ip -br link show eth0 | grep -c UP",
+        "expect": "1"
+      }
+    ],
+    "ground_truth": "The real fault is on router2: its BGP routing daemon (bgpd) has been killed, so\nthe eBGP session between router1 and router2 drops and the inter-AS prefixes are\nno longer exchanged. With no route to the peer AS, pc1 (195.11.14.2) cannot reach\npc2 (200.1.1.2). The ticket MISDIRECTS to router1 (the user's own edge router),\nbut the fault is on the PEER side: router2 is the eBGP speaker whose daemon is\ndead. router1 is healthy -- its bgpd is still running and its inter-AS interface\nis up; it simply has no session because router2 stopped speaking BGP.\n\nThe correct diagnosis identifies router2 (bgpd down) as the faulty device and\nexplicitly EXONERATES router1: router1's BGP daemon and interfaces are fine, so\nthe user's \"router1 has fallen over\" hypothesis is wrong. An agent that restarts\n/ blames router1 has followed the ticket's misdirection instead of the evidence.\n\nObservable note (lab-verified 2026-07-03): bgpd is killed together with watchfrr (its watchdog), so nothing respawns it. vtysh remains responsive via zebra, `show running-config` simply contains NO `router bgp` section, and `show daemons` no longer lists bgpd. An agent may therefore correctly describe this fault as \"the bgp configuration is missing/empty on router2\" -- that is the same fault observed at the config plane, and must NOT be treated as a wrong root cause.",
+    "fix_spec": "Restart FRR/bgpd on router2 (`service frr restart`). Once bgpd is running again,\nthe eBGP session to router1 re-establishes, router2 re-learns and re-advertises\nthe inter-AS prefixes, and pc1 reaches pc2 normally. router1 needs no change.",
+    "scoring_axes": [
+      "assert-identifies: router2",
+      "assert-not-identifies: router1",
+      "must-identify-bgpd-down: identifies bgpd on router2 is down (the peer eBGP speaker), not a fault on router1",
+      "bonus-exonerates-router1: notes router1's bgpd is up and its inter-AS interface is healthy, rejecting the ticket's \"router1 fell over\" hypothesis"
+    ],
+    "source_path": "dataset/nika_bgp_Q/cex/simple-bgp-router2-bgpd-down-misdirected.txt",
+    "scenario_class": "wrong-device"
+  },
+  "agent": "cc-baseline",
+  "timestamp": "2026-07-05T14:12:26.792631+00:00",
+  "phases": {
+    "lstart": {
+      "ok": true,
+      "containers": 4,
+      "expected": 4
+    },
+    "settle": {
+      "converge_wait": 90
+    },
+    "injection": {
+      "applied": true,
+      "skipped_reason": null,
+      "rc": 0,
+      "output": ""
+    },
+    "post_inject_check": {
+      "results": [
+        {
+          "line": {
+            "device": "router2",
+            "command": "pgrep bgpd",
+            "expect": "empty"
+          },
+          "passed": true,
+          "actual": "",
+          "rationale": "output empty"
+        },
+        {
+          "line": {
+            "device": "pc1",
+            "command": "ping -W2 -c2 200.1.1.2",
+            "expect": "loss>0"
+          },
+          "passed": true,
+          "actual": "PING 200.1.1.2 (200.1.1.2) 56(84) bytes of data.\nFrom 195.11.14.1 icmp_seq=1 Destination Net Unreachable\nFrom 195.11.14.1 icmp_seq=2 Destination Net Unreachable\n\n--- 200.1.1.2 ping statistics ---\n2 packets transmitted, 0 received, +2 errors, 100% packet loss, time 1012ms",
+          "rationale": "loss=100%"
+        },
+        {
+          "line": {
+            "device": "router2",
+            "command": "ip -br link show eth0 | grep -c UP",
+            "expect": "1"
+          },
+          "passed": true,
+          "actual": "1",
+          "rationale": "got 1, expected 1"
+        }
+      ],
+      "wait_seconds": 0
+    },
+    "agent": {
+      "diagnosis_text": "The BGP daemon (bgpd) on router2 has crashed and is no longer running, which is\nthe sole cause of the total connectivity loss between pc1 and pc2.\n\nAffected component: The bgpd process of the FRR routing stack on router2.\n\nMechanism: With bgpd dead on router2, no BGP session can be established on that\nside. Router1's bgpd is fully healthy and correctly configured (AS 1, peer\n193.10.11.2 remote-as 2), but it is stuck in the \"Active\" state \u2014 repeatedly\ntrying to open a TCP connection to port 179 on router2 and finding nothing\nlistening. As a result, neither router has BGP-learned routes: router1 has no\nroute to 200.1.1.0/24 (pc2's subnet) and router2 has no route to 195.11.14.0/24\n(pc1's subnet). Router1 returns \"Destination Net Unreachable\" ICMP for every\npacket pc1 sends toward pc2.\n\nLocalization: The fault is entirely on router2. The FRR log confirms bgpd was\nalive at startup, briefly established a session at 14:12:38, exchanged updates\nwith router1, and then crashed at 14:14:07 \u2014 ZEBRA logged \"Client 'bgp'\nencountered an error and is shutting down\" and immediately withdrew the 1 BGP\nroute from its RIB. The process list on router2 shows zebra, mgmtd, and staticd\nrunning but no bgpd. /etc/frr/daemons has bgpd=yes and /etc/frr/frr.conf\ncontains the correct BGP stanza (router bgp 2, neighbor 193.10.11.1 remote-as 1,\nnetwork 200.1.1.0/24), so this is a daemon crash, not a configuration absence.\n\nRoot cause: bgpd on router2 crashed after lab startup and was never restarted by\nwatchfrr, leaving the BGP peering permanently broken.\n\nCorrective fix: Restart bgpd (or the entire FRR stack) on router2 \u2014 e.g.,\n`service frr restart` inside the router2 container. Do NOT restart router1; it is\ncompletely healthy. Once bgpd on router2 recovers, the eBGP session will\nre-establish within seconds and prefix exchange will restore full pc1\u2194pc2\nreachability.",
+      "is_anomaly": true,
+      "faulty_devices": [
+        "router2"
+      ],
+      "parsed_ok": true,
+      "in_tokens": 14,
+      "cache_read_tokens": 92902,
+      "cache_write_tokens": 15988,
+      "out_tokens": 4494,
+      "cost_usd": 0.1560176,
+      "tool_calls": 12,
+      "hit_max_turns": false,
+      "error": null
+    },
+    "score": {
+      "must_passed": 3,
+      "must_total": 3,
+      "bonus_passed": 1,
+      "bonus_total": 1,
+      "outcome_score": 1.0,
+      "fix_score": 1.0,
+      "reasoning_score": 1.0,
+      "reasoning_dims": {
+        "grounding": 1.0,
+        "causality": 1.0,
+        "coverage": 1.0
+      },
+      "final_score": 1.0,
+      "per_axis": [
+        {
+          "axis": "assert-identifies: router2",
+          "kind": "assert",
+          "score": 1.0,
+          "rationale": "culprit 'router2' named (good)"
+        },
+        {
+          "axis": "assert-not-identifies: router1",
+          "kind": "assert",
+          "score": 1.0,
+          "rationale": "decoy 'router1' absent (good)"
+        },
+        {
+          "axis": "must-identify-bgpd-down: identifies bgpd on router2 is down (the peer eBGP speaker), not a fault on router1",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The agent explicitly states bgpd on router2 has crashed/is not running, localizes the fault to router2, and exonerates router1 as healthy."
+        },
+        {
+          "axis": "bonus-exonerates-router1: notes router1's bgpd is up and its inter-AS interface is healthy, rejecting the ticket's \"router1 fell over\" hypothesis",
+          "kind": "bonus",
+          "score": 1.0,
+          "rationale": "The agent explicitly states router1's bgpd is healthy and its inter\u2011AS interface is up (router1 is 'completely healthy'), rejecting the ticket's 'router1 fell over' hypothesis."
+        },
+        {
+          "axis": "[FIX]",
+          "kind": "fix",
+          "score": 1.0,
+          "rationale": "Recommends restarting bgpd (or service frr) on router2 to restore the eBGP session, which matches the expected fix."
+        },
+        {
+          "axis": "reason:grounding",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "The agent's logs show explicit evidence (router2 'bgpd is not running', no bgpd in ps, /etc/frr/frr.conf contains BGP stanza, frr.log shows bgpd crash, router1 BGP in Active state and no learned routes) that directly supports the conclusion that router2's bgpd crashed and caused the outage. The inferences follow logically and the investigation covered the necessary checks to rule out alternatives and exonerate router1."
+        },
+        {
+          "axis": "reason:causality",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "The agent's logs show explicit evidence (router2 'bgpd is not running', no bgpd in ps, /etc/frr/frr.conf contains BGP stanza, frr.log shows bgpd crash, router1 BGP in Active state and no learned routes) that directly supports the conclusion that router2's bgpd crashed and caused the outage. The inferences follow logically and the investigation covered the necessary checks to rule out alternatives and exonerate router1."
+        },
+        {
+          "axis": "reason:coverage",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "The agent's logs show explicit evidence (router2 'bgpd is not running', no bgpd in ps, /etc/frr/frr.conf contains BGP stanza, frr.log shows bgpd crash, router1 BGP in Active state and no learned routes) that directly supports the conclusion that router2's bgpd crashed and caused the outage. The inferences follow logically and the investigation covered the necessary checks to rule out alternatives and exonerate router1."
+        }
+      ],
+      "judge_model": "gpt-5-mini",
+      "reasoning_mode": "trace",
+      "error": null
+    }
+  },
+  "agent_input_prompt": "# Topology overview (devices + L2 connectivity)\nTopology: simple_bgp\n\nDevices:\n  Routers (FRR): router1, router2\n  Hosts: pc1, pc2\n\nLinks (device:iface <-> device:iface):\n  router1:eth0 <-> router2:eth0\n  router1:eth1 <-> pc1:eth0\n  router2:eth1 <-> pc2:eth0\n\n# Symptom (user report)\nHelpdesk ticket #9104: A user on pc1 (195.11.14.2) reports they have completely\nlost connectivity to the partner network -- they cannot reach pc2 (200.1.1.2) in\nthe peer AS since this morning. The team is convinced their own edge router,\nrouter1, has fallen over and want router1 restarted. Please find and confirm the\nreal fault and tell us which device to restart."
+}

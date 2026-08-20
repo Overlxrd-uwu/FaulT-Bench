@@ -1,0 +1,114 @@
+[AGENT] sade starts on lab=Kath5
+[TOOL] ToolSearch({'query': 'select:mcp__kathara_base_mcp_server__get_reachability'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_base_mcp_server__get_reachability'}]
+[TOOL] mcp__kathara_base_mcp_server__get_reachability({})
+[RESULT] {"result":"{\"hosts\":{\"pc0\":\"20.1.1.10\",\"pc12\":\"120.1.1.10\"},\"results\":[{\"src\":\"pc0\",\"dst\":\"pc12\",\"dst_ip\":\"120.1.1.10\",\"tx\":2,\"rx\":2,\"loss_percent\":0.0,\"time_ms\":1112.0,\"rtt_avg_ms\":0.906,\"rtt_min_ms\":0.88,\"rtt_max_ms\":0.932,\"rtt_mdev_ms\":0.026,\"status\":\"ok\"},{\"src\":\"pc12\",\"dst\":\"pc0\",\"dst_ip\":\"20.1.1.10\",\"tx\":2,\"rx\":2,\"loss_percent\":0.
+[TEXT] **Phase 1 complete.** Both hosts (pc0 ↔ pc12) show 0% loss. No real symptom surfaced in the reachability map. Proceeding to **Phase 4 — broad-search escalation**.
+[TOOL] Skill({'skill': 'diagnosis-methodology-skill'})
+[RESULT] Launching skill: diagnosis-methodology-skill
+[TEXT] **Phase A — L2 and infrastructure triage.** Running both triage helpers in parallel.
+[TOOL] ToolSearch({'query': 'select:mcp__helper_server__run_helper'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__helper_server__run_helper'}]
+[TOOL] mcp__helper_server__run_helper({'script_name': 'infra_sweep'})
+[TOOL] mcp__helper_server__run_helper({'script_name': 'l2_snapshot'})
+[RESULT] {"result":"=== INFRA SWEEP ===\nLab: Kath5\nScope: hosts, routers, switches, servers, bmv2_switches, ovs_switches, sdn_controllers, other_devices\nDevices scanned: 15\nFlagged devices: 0\n\nCategories inspected:\n  - ACL/firewall drop fingerprints: 0 device(s) with rules matched (0 means no protocol-specific drops seen)\n  - Static ARP entries (CM/PM/PERMANENT) on hosts: 0 found\n  - Fabricated-pa
+[RESULT] {"result":"=== L2 SNAPSHOT ===\nLab: Kath5\nScope: hosts, routers, switches, servers, bmv2_switches, ovs_switches, sdn_controllers, other_devices\nDevices scanned: 15\nDuplicate MAC groups: 0\nFlagged devices: 0\nDevices with bridge members: 0\nDevice errors: 0\nLink-discovery warnings: 12\n\nAll 15 devices' L2 identity is clean (no duplicate MACs, no down/missing interfaces).\nUse --show-clean to
+[TEXT] Phase A is clean — no ACL drops, no duplicate MACs, no addressing anomalies. Moving to **Phase B — Control plane routing**. The user explicitly mentioned a "virtual link" (OSPF construct), so running `ospf_snapshot`.
+[TOOL] mcp__helper_server__run_helper({'script_name': 'ospf_snapshot'})
+[RESULT] {"result":"=== OSPF SNAPSHOT ===\nLab: Kath5\nRouters scanned: 13\nFlags:\n  - r12: no OSPF network statements\n  - r12: non-Full neighbors present: {'is': 1}\n  - r13: FRR control sockets missing (ospfd_vty) — daemon likely down\n  - r13: no OSPF network statements\n  - r13: zero OSPF neighbors\n  - r4: OSPF interface VLINK0 (45.1.1.1/8) is running in area 0.0.0.0 but the matching network stateme
+[TEXT] Phase B surfaces critical OSPF flags. **Active lead:** r8 has an orphaned area 0.0.0.2 with 0 full adjacencies across 5 active interfaces, AND r13's ospfd daemon is reportedly DOWN. This maps squarely to `ospf-fault-skill`. Entering the skill before digging further.
+[TOOL] Skill({'skill': 'ospf-fault-skill'})
+[RESULT] Launching skill: ospf-fault-skill
+[TEXT] Now I'll drill into r8 (the orphaned area owner) and r13 (the daemon-down router) with direct evidence — pulling configs and process state in parallel.
+[TOOL] ToolSearch({'query': 'select:mcp__kathara_frr_mcp_server__frr_show_running_config,mcp__kathara_base_mcp_server__exec_shell'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_frr_mcp_server__frr_show_running_config'}, {'type': 'tool_reference', 'tool_name': 'mcp__kathara_base_mcp_server__exec_shell'}]
+[TOOL] mcp__kathara_frr_mcp_server__frr_show_running_config({'router_name': 'r8'})
+[RESULT] {"result":"Building configuration...\n\nCurrent configuration:\n!\nfrr version 9.1.3\nfrr defaults traditional\nhostname r8\ndomainname localdomain\nlog file /var/log/frr/frr.log\nno ipv6 forwarding\nno service integrated-vtysh-config\n!\npassword zebra\nenable password zebra\n!\nrouter ospf\n network 18.0.0.0/8 area 2\n network 58.0.0.0/8 area 1\n network 80.0.0.0/8 area 2\n area 1 virtual-link 1
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'r13', 'command': "ps aux | grep -E 'zebra|ospfd|watchfrr' | grep -v grep"})
+[RESULT] {"result":"root          71  0.0  0.0  41248  3304 ?        Ss   08:58   0:00 /usr/lib/frr/watchfrr -d -F traditional zebra mgmtd eigrpd staticd\nfrr           82  0.0  0.1 482200  9412 ?        Ssl  08:58   0:00 /usr/lib/frr/zebra -d -F traditional -A 127.0.0.1 -s 90000000"}
+[TEXT] **Key findings so far:**
+- r8 config: `area 1 virtual-link 14.1.4.1` — r8 points its virtual link at RID `14.1.4.1`
+- r4's loopback (from snapshot) is `14.1.1.1` — NOT `14.1.4.1`. Possible RID mismatch.
+- r13: `watchfrr` only manages `zebra mgmtd eigrpd staticd` — **ospfd is completely absent** from the FRR daemon stack.
+
+Need r4's config (to confirm its actual Router ID and virtual-link partner) and r8's live neighbor state. Running in parallel.
+[TOOL] mcp__kathara_frr_mcp_server__frr_show_running_config({'router_name': 'r4'})
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'r8', 'command': "vtysh -c 'show ip ospf neighbor'"})
+[RESULT] {"result":"Building configuration...\n\nCurrent configuration:\n!\nfrr version 9.1.3\nfrr defaults traditional\nhostname r4\ndomainname localdomain\nlog file /var/log/frr/frr.log\nno ipv6 forwarding\nno service integrated-vtysh-config\n!\npassword zebra\nenable password zebra\n!\nrouter ospf\n network 14.0.0.0/8 area 1\n network 34.0.0.0/8 area 0\n network 40.0.0.0/8 area 1\n network 45.0.0.0/8 ar
+[RESULT] {"result":"Neighbor ID     Pri State           Up Time         Dead Time Address         Interface                        RXmtL RqstL DBsmL\n15.1.4.1          1 Full/Backup     6m02s             33.883s 58.1.1.1        eth0:58.1.1.2                        0     0     0\n14.1.4.1          1 Full/DROther    5m42s             37.849s 45.1.1.1        VLINK0                               0     0     0"
+[TEXT] **Critical discovery:** r8's virtual link to r4 (RID `14.1.4.1`) is actually **FULL and working** (5m42s uptime on VLINK0). The virtual link itself is NOT the issue. But area 0.0.0.2 still has 0 adjacencies — r8 declares it with networks `18.0.0.0/8` and `80.0.0.0/8` but has no peers there.
+
+Let me examine what IP addresses r8 actually has and whether those area-2 networks match any real interface:
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'r8', 'command': 'ip addr show && ip route'})
+[RESULT] {"result":"1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN group default qlen 1000\n    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00\n    inet 127.0.0.1/8 scope host lo\n       valid_lft forever preferred_lft forever\n    inet 18.1.1.1/24 scope global lo\n       valid_lft forever preferred_lft forever\n    inet 18.1.2.1/24 scope global lo\n       valid_lft forever pref
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'r13', 'command': "ip addr show && vtysh -c 'show running-config'"})
+[RESULT] {"result":"1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN group default qlen 1000\n    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00\n    inet 127.0.0.1/8 scope host lo\n       valid_lft forever preferred_lft forever\n    inet 113.1.1.1/24 scope global lo\n       valid_lft forever preferred_lft forever\n2: lo1: <BROADCAST,NOARP,UP,LOWER_UP> mtu 1500 qdisc noqueue state
+[TEXT] **r8's loopbacks: 18.1.{1,2,3,4}.1** — Router ID = `18.1.4.1`, confirming r4's virtual-link config points correctly to r8. The virtual link r4↔r8 is confirmed healthy.
+
+**r13 runs EIGRP, not OSPF** — ospfd absent is expected; r13 is an EIGRP router. The ospf_snapshot flag was a red herring for r13.
+
+The anomaly narrows: r8's area 0.0.0.2 has 0 adjacencies but r8 declares it for 80.0.0.0/8 (eth1=BB) and 18.0.0.0/8 (loopbacks). Nothing else is on segment BB. Let me check r11 and r12 to understand the full design of the non-OSPF side.
+[TOOL] mcp__kathara_frr_mcp_server__frr_show_running_config({'router_name': 'r11'})
+[TOOL] mcp__kathara_frr_mcp_server__frr_show_running_config({'router_name': 'r12'})
+[RESULT] {"result":"Building configuration...\n\nCurrent configuration:\n!\nfrr version 9.1.3\nfrr defaults traditional\nhostname r11\ndomainname localdomain\nlog file /var/log/frr/frr.log\nno ipv6 forwarding\nno service integrated-vtysh-config\n!\npassword zebra\n!\nrouter eigrp 100\n network 112.0.0.0/8\n network 103.0.0.0/8\nexit\n!\nrouter ospf\n redistribute connected\n redistribute eigrp\n network 11
+[RESULT] {"result":"Building configuration...\n\nCurrent configuration:\n!\nfrr version 9.1.3\nfrr defaults traditional\nhostname r12\ndomainname localdomain\nlog file /var/log/frr/frr.log\nno ipv6 forwarding\nno service integrated-vtysh-config\n!\npassword zebra\nenable password zebra\n!\nrouter eigrp 100\n network 112.0.0.0/8\n network 120.0.0.0/8\n network 102.1.1.0/24\n network 102.1.2.0/24\n network 1
+[TEXT] **Major picture shift:** r11 runs BOTH OSPF (area 3) and EIGRP, and redistributes EIGRP into OSPF. r12 is EIGRP-only. The "bridge" between the two halves is r11's EIGRP↔OSPF redistribution. The virtual link r4↔r8 is confirmed Full — that's not the broken path.
+
+Now I need to check r11's EIGRP adjacency state (if r13 fell off after a restart, r13's 113.x.x.x routes would disappear from OSPF), and verify what backbone router r1 currently knows:
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'r11', 'command': "vtysh -c 'show ip eigrp neighbors'"})
+[RESULT] {"result":"EIGRP neighbors for AS(100)\n\nH   Address           Interface            Hold   Uptime   SRTT   RTO   Q     Seq  \n                                           (sec)           (ms)        Cnt    Num   \n0   112.1.1.2         eth0                 12     0        0      2    0      2\n0   103.1.1.2         eth2                 11     0        0      2    0      2"}
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'r1', 'command': "vtysh -c 'show ip route' | grep -E '113|103|112|120'"})
+[RESULT] {"result":"O>* 103.0.0.0/8 [110/20] via 111.1.1.2, eth1, weight 1, 00:09:39\nO>* 112.0.0.0/8 [110/20] via 111.1.1.2, eth1, weight 1, 00:09:39\nO>* 113.1.1.0/24 [110/20] via 111.1.1.2, eth1, weight 1, 00:09:39\nO>* 113.1.2.0/24 [110/20] via 111.1.1.2, eth1, weight 1, 00:09:39\nO>* 113.1.3.0/24 [110/20] via 111.1.1.2, eth1, weight 1, 00:09:39\nO>* 113.1.4.0/24 [110/20] via 111.1.1.2, eth1, weight 1,
+[TEXT] r11 has both EIGRP neighbours (r12 at 112.1.1.2, r13 at 103.1.1.2) and r1 has full OSPF redistributed routes for 103/112/113/120 subnets. The EIGRP↔OSPF redistribution side is healthy. But EIGRP uptime shows "0" for both neighbors — suspiciously fresh.
+
+Now let me check if r8's area-2 routes (18.x.x.x, 80.x.x.x) are visible on r1 (backbone), and whether r8 is actually advertising them as an ABR:
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'r1', 'command': "vtysh -c 'show ip route' | grep -E '^O.*18\\.|^O.*80\\.'"})
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'r8', 'command': "vtysh -c 'show ip ospf neighbor' && vtysh -c 'show ip ospf database summary'"})
+[RESULT] {"result":"O>* 18.1.1.1/32 [110/40] via 31.1.1.1, eth2, weight 1, 00:09:53\nO>* 18.1.2.1/32 [110/40] via 31.1.1.1, eth2, weight 1, 00:09:53\nO>* 18.1.3.1/32 [110/40] via 31.1.1.1, eth2, weight 1, 00:09:53\nO>* 18.1.4.1/32 [110/40] via 31.1.1.1, eth2, weight 1, 00:09:53\nO>* 80.0.0.0/8 [110/50] via 31.1.1.1, eth2, weight 1, 00:09:53"}
+[RESULT] {"result":"Neighbor ID     Pri State           Up Time         Dead Time Address         Interface                        RXmtL RqstL DBsmL\n15.1.4.1          1 Full/Backup     10m22s            33.113s 58.1.1.1        eth0:58.1.1.2                        0     0     0\n14.1.4.1          1 Full/DROther    10m02s            37.082s 45.1.1.1        VLINK0                               0     0     0\
+[TEXT] r8's area-2 routes ARE propagating to r1 (18.x.x.x, 80.x.x.x — 9m53s old), and r8's OSPF adjacencies are stable (10 minutes). The virtual link r4↔r8 is confirmed FULL and healthy.
+
+But r11's EIGRP neighbor uptime shows `0` and sequence numbers of only `2` for BOTH r12 and r13 — indicating the adjacencies JUST re-formed. Let me check r11's FRR process uptime and logs to find evidence of a recent restart, and simultaneously verify live end-to-end reachability to the "far" areas:
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'r11', 'command': "ps aux | grep -E 'eigrpd|ospfd|zebra|watchfrr' | grep -v grep && echo '---' && tail -30 /var/log/frr/frr.log 2>/dev/null || tail -30 /var/log/frr/eigrpd.log 2>/dev/null"})
+[RESULT] {"result":"root          40  0.0  0.0  41248  3480 ?        Ss   08:59   0:00 /usr/lib/frr/watchfrr -d -F traditional zebra mgmtd ospfd eigrpd staticd\nfrr           52  0.0  0.1 589016  9584 ?        Ssl  08:59   0:00 /usr/lib/frr/zebra -d -F traditional -A 127.0.0.1 -s 90000000\nfrr           59  0.0  0.0  45828  7128 ?        Ss   08:59   0:00 /usr/lib/frr/ospfd -d -F traditional -A 127.0.0.1\n
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'pc0', 'command': 'ping -c3 18.1.1.1 && ping -c3 113.1.1.1'})
+[RESULT] {"result":"PING 18.1.1.1 (18.1.1.1) 56(84) bytes of data.\n64 bytes from 18.1.1.1: icmp_seq=1 ttl=60 time=1.91 ms\n64 bytes from 18.1.1.1: icmp_seq=2 ttl=60 time=0.972 ms\n64 bytes from 18.1.1.1: icmp_seq=3 ttl=60 time=1.10 ms\n\n--- 18.1.1.1 ping statistics ---\n3 packets transmitted, 3 received, 0% packet loss, time 2223ms\nrtt min/avg/max/mdev = 0.972/1.329/1.912/0.415 ms\nPING 113.1.1.1 (113.1
+[TEXT] All "far area" routes are confirmed: pc0 reaches r8's area-2 loopback `18.1.1.1` and r13's redistributed loopback `113.1.1.1` with 0% loss. But r11's EIGRP log timestamps match lab startup — let me verify that nothing on r12/pc12 side breaks the return path, and check r12's actual routes to confirm EIGRP→OSPF direction works:
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'r12', 'command': "ip route && vtysh -c 'show ip eigrp neighbors'"})
+[RESULT] {"result":"default via 112.1.1.1 dev eth0 \n102.1.2.0/24 dev lo1 proto kernel scope link src 102.1.2.1 \n102.1.3.0/24 dev lo2 proto kernel scope link src 102.1.3.1 \n102.1.4.0/24 dev lo3 proto kernel scope link src 102.1.4.1 \n103.0.0.0/8 nhid 32 via 112.1.1.1 dev eth0 proto eigrp metric 20 \n112.0.0.0/8 dev eth0 proto kernel scope link src 112.1.1.2 \n113.1.1.0/24 nhid 32 via 112.1.1.1 dev eth0 p
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'pc12', 'command': 'ping -c3 18.1.1.1 && ping -c3 80.1.1.1'})
+[RESULT] {"result":"[TIMEOUT] Command 'ping -c3 18.1.1.1 && ping -c3 80.1.1.1' on 'pc12' exceeded 10s."}
+[TEXT] **Critical finding:** pc12 **TIMES OUT** pinging r8's loopback `18.1.1.1` and `80.1.1.1`. r12 has a default route to r11 but NO specific routes to the 18.x.x.x or 80.x.x.x ranges. The "far areas" ARE unreachable from the EIGRP side. Now I need to trace exactly where the drop occurs — does r11 have the route to 18.1.1.1, and does r8 have the return route to 120.0.0.0/8?
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'r11', 'command': "vtysh -c 'show ip route 18.1.1.1/32' && vtysh -c 'show ip route 80.0.0.0/8'"})
+[RESULT] {"result":"Routing entry for 18.1.1.1/32\n  Known via \"ospf\", distance 110, metric 50, best\n  Last update 00:15:08 ago\n  * 111.1.1.1, via eth1, weight 1\n\nRouting entry for 80.0.0.0/8\n  Known via \"ospf\", distance 110, metric 60, best\n  Last update 00:15:08 ago\n  * 111.1.1.1, via eth1, weight 1"}
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'r8', 'command': "vtysh -c 'show ip route 120.0.0.0/8' && vtysh -c 'show ip route 102.1.1.0/24'"})
+[RESULT] {"result":"% Network not in table\n% Network not in table"}
+[TEXT] **The fault is localized!**
+- r11 HAS routes to r8's area-2 addresses (18.1.1.1, 80.0.0.0) — forwarding toward r8 works ✓
+- r8 has **NO route** to `120.0.0.0/8` or `102.1.1.0/24` — the reply path from r8 back to pc12 drops silently ✗
+
+r8 is missing EIGRP-redistributed OSPF external routes. Let me verify whether this affects ALL such redistributed prefixes on r8, and confirm the Type-5 LSA is reaching r8:
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'r8', 'command': "vtysh -c 'show ip route' | grep -E '113|112|120|103|102'"})
+[RESULT] {"result":""}
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'r8', 'command': "vtysh -c 'show ip ospf database external' | grep -E '120|112|113|103|102' | head -30"})
+[RESULT] {"result":"Link State ID: 102.1.1.0 (External Network Number)\n  Advertising Router: 112.1.1.1\n  Link State ID: 102.1.2.0 (External Network Number)\n  Advertising Router: 112.1.1.1\n  Link State ID: 102.1.3.0 (External Network Number)\n  Advertising Router: 112.1.1.1\n  Link State ID: 102.1.4.0 (External Network Number)\n  Advertising Router: 112.1.1.1\n  Link State ID: 103.0.0.0 (External Networ
+[TEXT] **Confirmed fault path:** r8's OSPF database contains all the EIGRP-redistributed external LSAs (102/103/112/113/120 prefixes, advertised by router `112.1.1.1` = r11) but r8's **kernel routing table has NONE of them installed**. r8 can't reply to pc12 because it has no return route to `120.0.0.0/8`.
+
+Now I need to determine WHY r8 can't install these external routes — likely an ASBR reachability issue. Checking r8's OSPF computed routes and whether a Type-4 ASBR Summary LSA for r11 (112.1.1.1) exists in r8's database:
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'r8', 'command': "vtysh -c 'show ip ospf database asbr-summary' | head -40"})
+[RESULT] {"result":"OSPF Router with ID (18.1.4.1)\n\n\n                ASBR-Summary Link States (Area 0.0.0.0)\n\n\n                ASBR-Summary Link States (Area 0.0.0.1)\n\n  LS age: 1161\n  Options: 0x2  : *|-|-|-|-|-|E|-\n  LS Flags: 0x6  \n  LS Type: summary-LSA\n  Link State ID: 112.1.1.1 (AS Boundary Router address)\n  Advertising Router: 14.1.4.1\n  LS Seq Number: 80000001\n  Checksum: 0x0bab\n  L
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'r3', 'command': "vtysh -c 'show ip route' | grep -E '120|112|113|103'"})
+[RESULT] {"result":"O>* 103.0.0.0/8 [110/20] via 31.1.1.2, eth2, weight 1, 00:19:19\nO>* 112.0.0.0/8 [110/20] via 31.1.1.2, eth2, weight 1, 00:19:19\nO>* 113.1.1.0/24 [110/20] via 31.1.1.2, eth2, weight 1, 00:19:19\nO>* 113.1.2.0/24 [110/20] via 31.1.1.2, eth2, weight 1, 00:19:19\nO>* 113.1.3.0/24 [110/20] via 31.1.1.2, eth2, weight 1, 00:19:19\nO>* 113.1.4.0/24 [110/20] via 31.1.1.2, eth2, weight 1, 00:19
+[TEXT] **Critical evidence:** The Type-4 ASBR-Summary LSA for r11 (`112.1.1.1`) exists **only in r8's area 0.0.0.1 database** (advertised by r4=`14.1.4.1`) — **not in backbone area 0.0.0.0** on r8! r3 (direct backbone member) HAS all the redistributed routes. This means r8 can't resolve the ASBR via backbone and can't install any of r11's external routes.
+
+Need to confirm: does r4 itself have the Type-4 in its backbone LSDB (and therefore should be forwarding it to r8 via VLINK0)?
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'r4', 'command': "vtysh -c 'show ip ospf database asbr-summary' | head -40"})
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'r4', 'command': "vtysh -c 'show ip route' | grep -E '120|112|113|103'"})
+[RESULT] {"result":"OSPF Router with ID (14.1.4.1)\n\n\n                ASBR-Summary Link States (Area 0.0.0.0)\n\n  LS age: 1198\n  Options: 0x2  : *|-|-|-|-|-|E|-\n  LS Flags: 0x6  \n  LS Type: summary-LSA\n  Link State ID: 112.1.1.1 (AS Boundary Router address)\n  Advertising Router: 111.1.1.1\n  LS Seq Number: 80000001\n  Checksum: 0xea81\n  Length: 28\n\n  Network Mask: /0\n        TOS: 0  Metric: 10\
+[RESULT] {"result":"O>* 103.0.0.0/8 [110/20] via 34.1.1.1, eth0, weight 1, 00:19:55\nO>* 112.0.0.0/8 [110/20] via 34.1.1.1, eth0, weight 1, 00:19:55\nO>* 113.1.1.0/24 [110/20] via 34.1.1.1, eth0, weight 1, 00:19:55\nO>* 113.1.2.0/24 [110/20] via 34.1.1.1, eth0, weight 1, 00:19:55\nO>* 113.1.3.0/24 [110/20] via 34.1.1.1, eth0, weight 1, 00:19:55\nO>* 113.1.4.0/24 [110/20] via 34.1.1.1, eth0, weight 1, 00:19
+[FINAL] stop=tool_use tool_calls=33
+[ERROR] Exception: Claude Code returned an error result: Reached maximum number of turns (20)
+[SUBMITTED] parsed_ok=False is_anomaly=None faulty_devices=[]
+[FINAL-TEXT] **Critical evidence:** The Type-4 ASBR-Summary LSA for r11 (`112.1.1.1`) exists **only in r8's area 0.0.0.1 database** (advertised by r4=`14.1.4.1`) — **not in backbone area 0.0.0.0** on r8! r3 (direct backbone member) HAS all the redistributed routes. This means r8 can't resolve the ASBR via backbone and can't install any of r11's external routes.
+
+Need to confirm: does r4 itself have the Type-4 in its backbone LSDB (and therefore should be forwarding it to r8 via VLINK0)?

@@ -1,0 +1,159 @@
+[AGENT] sade starts on lab=Kath1
+[TOOL] ToolSearch({'query': 'select:mcp__kathara_base_mcp_server__get_reachability'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_base_mcp_server__get_reachability'}]
+[TEXT] ## Phase 1 — Blind Start
+[TOOL] mcp__kathara_base_mcp_server__get_reachability({})
+[RESULT] {"result":"{\"hosts\":{\"pc1\":\"10.1.0.100\",\"pc2\":\"10.1.0.101\",\"pc3\":\"10.3.0.100\"},\"results\":[{\"src\":\"pc1\",\"dst\":\"pc2\",\"dst_ip\":\"10.1.0.101\",\"tx\":2,\"rx\":2,\"loss_percent\":0.0,\"time_ms\":1036.0,\"rtt_avg_ms\":2.119,\"rtt_min_ms\":1.772,\"rtt_max_ms\":2.466,\"rtt_mdev_ms\":0.347,\"status\":\"ok\"},{\"src\":\"pc2\",\"dst\":\"pc1\",\"dst_ip\":\"10.1.0.100\",\"tx\":2,\"rx\
+[TEXT] ## Phase 2 — Branch
+
+All Phase 1 paths show `loss_percent=0.0` with `status=ok` — no active packet loss. The user's report describes a **past** event (brief outage → recovered) with a residual "longer path." No confirmed real symptom from Phase 1.
+
+→ Proceed to **Phase 4 — Broad-search escalation**.
+
+## Phase 4 — Broad-Search Escalation
+[TOOL] Skill({'skill': 'diagnosis-methodology-skill'})
+[RESULT] Launching skill: diagnosis-methodology-skill
+[TEXT] Running Phase A triage — both helpers in parallel.
+[TOOL] ToolSearch({'query': 'select:mcp__helper_server__run_helper'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__helper_server__run_helper'}]
+[TOOL] mcp__helper_server__run_helper({'script_name': 'infra_sweep'})
+[TOOL] mcp__helper_server__run_helper({'script_name': 'l2_snapshot'})
+[RESULT] {"result":"Unknown machine type: r1 with image kathara/dhcp\nUnknown machine type: ispb with image kathara/dhcp\nUnknown machine type: ispa with image kathara/dhcp\nUnknown machine type: r1 with image kathara/dhcp\nUnknown machine type: ispb with image kathara/dhcp\nUnknown machine type: ispa with image kathara/dhcp\n=== INFRA SWEEP ===\nLab: Kath1\nScope: hosts, routers, switches, servers, bmv2_s
+[RESULT] {"result":"Unknown machine type: r1 with image kathara/dhcp\nUnknown machine type: ispb with image kathara/dhcp\nUnknown machine type: ispa with image kathara/dhcp\n=== L2 SNAPSHOT ===\nLab: Kath1\nScope: hosts, routers, switches, servers, bmv2_switches, ovs_switches, sdn_controllers, other_devices\nDevices scanned: 20\nDuplicate MAC groups: 0\nFlagged devices: 4\nDevices with bridge members: 8\nD
+[TEXT] Key Phase A findings:
+1. **`arp_gateway_divergence` for 10.1.0.1** — pc1 sees MAC `6a:f0:fd:61:5d:b8`, pc2 sees MAC `42:c7:00:c4:7f:a6` for the same gateway IP. This is concrete divergence.
+2. ACL drop rules on dswa1/dswa2 (Office A → Office B traffic) — likely policy, not anomaly.
+3. l2_snapshot collection failures on dswa1/dswa2/dswb1/dswb2 (JSON truncation from large bridge tables).
+
+The ARP divergence on 10.1.0.1 is the active lead — two hosts on the same subnet see different physical MACs for their gateway, consistent with a VRRP failover or link-triggered topology change. Proceeding to Phase B to check OSPF/routing reconvergence evidence.
+[TOOL] mcp__helper_server__run_helper({'script_name': 'ospf_snapshot'})
+[RESULT] {"result":"Unknown machine type: r1 with image kathara/dhcp\nUnknown machine type: ispb with image kathara/dhcp\nUnknown machine type: ispa with image kathara/dhcp\n=== OSPF SNAPSHOT ===\nLab: Kath1\nRouters scanned: 12\nFlags:\n  - aswa1: FRR control sockets missing (ospfd_vty) — daemon likely down\n  - aswa1: no OSPF network statements\n  - aswa1: zero OSPF neighbors\n  - aswa2: FRR control sock
+[TEXT] Excellent — Phase B surfaces a critical anomaly. Focusing on the OSPF state:
+
+- **dswa1** — `eth5(10.0.0.46/30, state=DR, nbr=None, adj=None)`. This interface connects to **csw1.eth3** (CD_CORE_1_DSW1), yet shows *zero* OSPF neighbors/adjacencies.
+- **csw1** — `eth3(10.0.0.45/30, state=Backup, nbr=1, adj=1)` — the other end of the same link still counts one adjacency.
+- dswa1's total `adj=3` (from eth6→csw2, eth3/eth4→dswa2 peer) — the **csw1 uplink contributes nothing**, meaning dswa1 is routing exclusively via csw2 and dswa2 peers (longer path).
+
+This asymmetric OSPF state — dswa1.eth5 sees no neighbor, csw1.eth3 sees one — is the footprint of a **link fault** on CD_CORE_1_DSW1. Entering the matching fault-family skill.
+[TOOL] Skill({'skill': 'link-fault-skill'})
+[RESULT] Launching skill: link-fault-skill
+[TEXT] Active lead: **dswa1.eth5 ↔ csw1.eth3** (CD_CORE_1_DSW1) — OSPF adjacency missing on dswa1 side. Checking interface state and link history on both ends simultaneously.
+[TOOL] ToolSearch({'query': 'select:mcp__kathara_base_mcp_server__exec_shell'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_base_mcp_server__exec_shell'}]
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'dswa1', 'command': 'ip -s link show eth5 && echo "---" && dmesg | grep -i "eth5\\|link" | tail -20'})
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'csw1', 'command': 'ip -s link show eth3 && echo "---" && dmesg | grep -i "eth3\\|link" | tail -20'})
+[RESULT] {"result":"57644: eth5: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UP mode DEFAULT group default qlen 1000\n    link/ether 4e:74:c7:dd:b7:0b brd ff:ff:ff:ff:ff:ff\n    RX:  bytes packets errors dropped  missed   mcast           \n         10172      84      0       0       0       0 \n    TX:  bytes packets errors dropped carrier collsns           \n          8946      79     
+[RESULT] {"result":"57633: eth3: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UP mode DEFAULT group default qlen 1000\n    link/ether 5e:05:13:84:fd:6c brd ff:ff:ff:ff:ff:ff\n    RX:  bytes packets errors dropped  missed   mcast           \n          9078      79      0       0       0       0 \n    TX:  bytes packets errors dropped carrier collsns           \n         10040      84     
+[TEXT] Both interfaces are currently **UP/LOWER_UP** — the physical link has recovered. Now checking carrier-change history and startup logs to confirm a past flap.
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'dswa1', 'command': 'cat /sys/class/net/eth5/carrier_changes && echo "---" && tail -50 /var/log/startup.log 2>/dev/null || echo "no startup.log"'})
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'dswa1', 'command': 'vtysh -c "show ip ospf neighbor detail" 2>/dev/null | head -60'})
+[RESULT] {"result":"2\n\"---\"\nPlease, use \"ip ospf passive\" on an interface instead.\nThis command is deprecated, because it is not VRF-aware.\nPlease, use \"ip ospf passive\" on an interface instead.\nThis command is deprecated, because it is not VRF-aware.\nPlease, use \"ip ospf passive\" on an interface instead.\nThis command is deprecated, because it is not VRF-aware.\nPlease, use \"ip ospf passive
+[RESULT] {"result":"% Unknown command: \"show"}
+[TEXT] **`carrier_changes = 2`** on dswa1.eth5 — confirming at least one link transition beyond startup. Let me now check the same counter on csw1's side, the OSPF interface state directly, and link history.
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'csw1', 'command': 'cat /sys/class/net/eth3/carrier_changes'})
+[RESULT] {"result":"2"}
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'dswa1', 'command': 'vtysh -c "show ip ospf interface eth5" 2>&1'})
+[RESULT] {"result":"% Unknown command: \"show"}
+[TOOL] mcp__helper_server__run_helper({'script_name': 'dhcp_link_history', 'args': ['--device', 'dswa1']})
+[RESULT] {"result":"Unknown machine type: r1 with image kathara/dhcp\nUnknown machine type: ispb with image kathara/dhcp\nUnknown machine type: ispa with image kathara/dhcp\n=== DHCP/LINK HISTORY SNAPSHOT ===\nLab: Kath1\nDevices scanned: 1\nDevices with suspicious history/state: 0\n\nNo suspicious DHCP/link history found in the selected devices.\n"}
+[TEXT] Both ends of CD_CORE_1_DSW1 show **`carrier_changes = 2`** — symmetric on dswa1.eth5 and csw1.eth3. To confirm this is anomalous vs. normal startup behavior, checking a peer interface on dswa1 for comparison.
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'dswa1', 'command': 'for iface in eth0 eth1 eth2 eth3 eth4 eth5 eth6; do echo -n "$iface carrier_changes="; cat /sys/class/net/$iface/carrier_changes 2>/dev/null || echo "N/A"; done'})
+[RESULT] {"result":"\"eth0 carrier_changes=\"2\n\"eth1 carrier_changes=\"2\n\"eth2 carrier_changes=\"2\n\"eth3 carrier_changes=\"2\n\"eth4 carrier_changes=\"2\n\"eth5 carrier_changes=\"2\n\"eth6 carrier_changes=\"2"}
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'csw1', 'command': 'for iface in eth0 eth1 eth2 eth3 eth4 eth5 eth6; do echo -n "$iface carrier_changes="; cat /sys/class/net/$iface/carrier_changes 2>/dev/null || echo "N/A"; done'})
+[RESULT] {"result":"\"eth0 carrier_changes=\"2\n\"eth1 carrier_changes=\"2\n\"eth2 carrier_changes=\"2\n\"eth3 carrier_changes=\"2\n\"eth4 carrier_changes=\"2\n\"eth5 carrier_changes=\"2\n\"eth6 carrier_changes=\"2"}
+[TEXT] Every interface on both devices shows `carrier_changes=2` — this is **baseline startup noise** in this Kathara environment, not a flap signal. The link is physically stable.
+
+The real anomaly remains the asymmetric OSPF state: dswa1.eth5 shows `nbr=None, adj=None` while csw1.eth3 has `adj=1`. Let me query dswa1's OSPF state directly via FRR.
+[TOOL] ToolSearch({'query': 'select:mcp__kathara_frr_mcp_server__frr_exec'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_frr_mcp_server__frr_exec'}]
+[TOOL] mcp__kathara_frr_mcp_server__frr_exec({'router_name': 'dswa1', 'command': 'show ip ospf neighbor'})
+[TOOL] mcp__kathara_frr_mcp_server__frr_exec({'router_name': 'csw1', 'command': 'show ip ospf neighbor'})
+[RESULT] {"result":"Neighbor ID     Pri State           Up Time         Dead Time Address         Interface                        RXmtL RqstL DBsmL\n10.0.0.80         1 Full/DR         6m14s             30.956s 10.0.0.3        br0.99:10.0.0.2                      0     0     0\n10.0.0.77         1 Full/Backup     6m44s             30.864s 10.0.0.45       eth5:10.0.0.46                       0     0     0\
+[RESULT] {"result":"Neighbor ID     Pri State           Up Time         Dead Time Address         Interface                        RXmtL RqstL DBsmL\n10.0.0.76         1 Full/Backup     6m44s             33.416s 10.0.0.33       eth0:10.0.0.34                       0     0     0\n10.0.0.78         1 Full/DR         6m49s             30.373s 10.0.0.42       bond0:10.0.0.41                      0     0     0\
+[TEXT] The FRR direct query completely overturns the ospf_snapshot: **all adjacencies on dswa1 are Full** — `eth5:10.0.0.46 → 10.0.0.77 (csw1) Full/Backup, Up 6m44s`. The `nbr=None` from ospf_snapshot was a parsing artifact. OSPF fabric is healthy.
+
+The real remaining anomaly is the **ARP gateway divergence** on 10.1.0.1: pc1 and pc2 see different physical MACs for the same gateway IP. Let me check dswa1/dswa2 IP addresses and any VRRP/keepalived setup.
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'dswa1', 'command': 'ip addr show && echo "==PROCS==" && ps aux | grep -E "keepalive|vrrp|ucarp" | grep -v grep'})
+[RESULT] {"result":"1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN group default qlen 1000\n    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00\n    inet 127.0.0.1/8 scope host lo\n       valid_lft forever preferred_lft forever\n    inet 10.0.0.79/32 brd 10.0.0.79 scope global lo\n       valid_lft forever preferred_lft forever\n2: bond0: <BROADCAST,MULTICAST,MASTER,UP,LOWER_UP> m
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'dswa2', 'command': 'ip addr show && echo "==PROCS==" && ps aux | grep -E "keepalive|vrrp|ucarp" | grep -v grep'})
+[RESULT] {"result":"1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN group default qlen 1000\n    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00\n    inet 127.0.0.1/8 scope host lo\n       valid_lft forever preferred_lft forever\n    inet 10.0.0.80/32 brd 10.0.0.80 scope global lo\n       valid_lft forever preferred_lft forever\n2: bond0: <BROADCAST,MULTICAST,MASTER,UP,LOWER_UP> m
+[TEXT] Critical finding confirmed: **10.1.0.1/32 is configured as a secondary address on BOTH dswa1 (br0.10) and dswa2 (br0.10)** — without any VRRP process running on either device. Same duplicate for 10.0.0.1/32 on br0.99 of both.
+
+Key asymmetry: dswa2 also holds 10.6.0.1/32 and 10.2.0.1/32 that dswa1 **does not have**. This is a configuration inconsistency.
+
+This directly explains the ARP gateway divergence — two devices with the same IP answering ARP on the same VLAN broadcast domain. Now let me check whether a link event on the bond (DSW peer-link) is what triggered the ARP disruption, and look at current path differences.
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'dswa1', 'command': 'cat /sys/class/net/bond0/carrier_changes && echo "bond0_state=$(cat /sys/class/net/bond0/operstate)" && cat /proc/net/bonding/bond0 2>/dev/null | head -40'})
+[RESULT] {"result":"2\n\"bond0_state=up\"\nEthernet Channel Bonding Driver: v6.6.87.2-microsoft-standard-WSL2\n\nBonding Mode: IEEE 802.3ad Dynamic link aggregation\nTransmit Hash Policy: layer2 (0)\nMII Status: up\nMII Polling Interval (ms): 100\nUp Delay (ms): 0\nDown Delay (ms): 0\nPeer Notification Delay (ms): 0\n\n802.3ad info\nLACP active: on\nLACP rate: slow\nMin links: 0\nAggregator selection polic
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'dswa2', 'command': 'cat /sys/class/net/bond0/carrier_changes && echo "bond0_state=$(cat /sys/class/net/bond0/operstate)" && cat /proc/net/bonding/bond0 2>/dev/null | head -40'})
+[TOOL] mcp__kathara_frr_mcp_server__frr_exec({'router_name': 'dswa1', 'command': 'show ip route 10.6.0.0/24'})
+[RESULT] {"result":"2\n\"bond0_state=up\"\nEthernet Channel Bonding Driver: v6.6.87.2-microsoft-standard-WSL2\n\nBonding Mode: IEEE 802.3ad Dynamic link aggregation\nTransmit Hash Policy: layer2 (0)\nMII Status: up\nMII Polling Interval (ms): 100\nUp Delay (ms): 0\nDown Delay (ms): 0\nPeer Notification Delay (ms): 0\n\n802.3ad info\nLACP active: on\nLACP rate: slow\nMin links: 0\nAggregator selection polic
+[RESULT] {"result":"Routing entry for 10.6.0.0/24\n  Known via \"ospf\", distance 110, metric 5\n  Last update 00:09:54 ago\n    directly connected, br0.40, weight 1\n\nRouting entry for 10.6.0.0/24\n  Known via \"connected\", distance 0, metric 0, best\n  Last update 00:09:54 ago\n  * directly connected, br0.40"}
+[TEXT] Bond is healthy (Link Failure Count: 0, both bonds UP). Now checking if any dswa2 interface shows a higher-than-baseline carrier count, and verifying the OSPF routing path difference.
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'dswa2', 'command': 'for iface in eth0 eth1 eth2 eth3 eth4 eth5 eth6; do echo -n "$iface carrier_changes="; cat /sys/class/net/$iface/carrier_changes 2>/dev/null || echo "N/A"; done'})
+[TOOL] mcp__kathara_frr_mcp_server__frr_exec({'router_name': 'dswa2', 'command': 'show ip ospf neighbor'})
+[RESULT] {"result":"\"eth0 carrier_changes=\"2\n\"eth1 carrier_changes=\"2\n\"eth2 carrier_changes=\"2\n\"eth3 carrier_changes=\"2\n\"eth4 carrier_changes=\"2\n\"eth5 carrier_changes=\"2\n\"eth6 carrier_changes=\"2"}
+[RESULT] {"result":"Neighbor ID     Pri State           Up Time         Dead Time Address         Interface                        RXmtL RqstL DBsmL\n10.0.0.77         1 Full/Backup     10m57s            32.676s 10.0.0.49       eth5:10.0.0.50                       0     0     0\n10.0.0.78         1 Full/Backup     10m52s            32.684s 10.0.0.65       eth6:10.0.0.66                       0     0     0\
+[TEXT] The OSPF timing reveals a crucial discrepancy:
+- dswa2's adjacencies: ~10m57s old (stable since startup)
+- dswa1's ALL adjacencies: **~6m44s old** (formed ~4 minutes AFTER dswa2)
+
+This means dswa1's OSPF process reset ~4 minutes into lab operation, exactly matching the reported brief outage. Let me check what caused dswa1's ospfd to restart and confirm the FRR process timeline.
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'dswa1', 'command': 'ps -eo pid,etime,comm | grep -E "ospfd|zebra|frr|watchfrr" && echo "===" && cat /var/log/frr/ospfd.log 2>/dev/null | tail -30 || cat /var/log/frr/frr.log 2>/dev/null | tail -30 || echo "no frr log"'})
+[RESULT] {"result":"2026/08/02 09:45:11 MGMTD: [VTVCM-Y2NW3] Configuration Read in Took: 00:00:00\n2026/08/02 09:45:11 MGMTD: [G6NKK-8C6DV] end_config: VTY:0x58254bc99170, pending SET-CFG: 0\n2026/08/02 09:45:11 ZEBRA: [VTVCM-Y2NW3] Configuration Read in Took: 00:00:00\n2026/08/02 09:45:11 ZEBRA: [G6NKK-8C6DV] end_config: VTY:0x55db48a17a50, pending SET-CFG: 0\n2026/08/02 09:45:11 STATIC: [VTVCM-Y2NW3] Con
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'dswa2', 'command': 'ps -eo pid,etime,comm | grep -E "ospfd|zebra|frr|watchfrr"'})
+[RESULT] {"result":"/bin/bash: line 1: zebra: command not found\n/bin/bash: line 1: watchfrr\": command not found\n/bin/bash: line 1: frr: command not found"}
+[TEXT] The FRR log confirms dswa1's OSPF first read config at **09:45:11** and formed Full adjacencies at **09:45:58**. Meanwhile dswa2's OSPF adjacencies are 10m57s old (formed at ~09:41:45) — a **~4-minute gap**. This is a delayed FRR startup on dswa1, not a mid-session restart. Verifying dswa2's own FRR start time for comparison.
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'dswa2', 'command': 'cat /var/log/frr/frr.log 2>/dev/null | head -20 || cat /var/log/frr/ospfd.log 2>/dev/null | head -20 || echo "no frr log"'})
+[RESULT] {"result":"2026/08/02 09:45:11 MGMTD: [VTVCM-Y2NW3] Configuration Read in Took: 00:00:00\n2026/08/02 09:45:11 MGMTD: [G6NKK-8C6DV] end_config: VTY:0x55b61bd98170, pending SET-CFG: 0\n2026/08/02 09:45:11 ZEBRA: [VTVCM-Y2NW3] Configuration Read in Took: 00:00:00\n2026/08/02 09:45:11 ZEBRA: [G6NKK-8C6DV] end_config: VTY:0x5d38e1862a50, pending SET-CFG: 0\n2026/08/02 09:45:11 STATIC: [VTVCM-Y2NW3] Con
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'dswa1', 'command': 'cat /var/log/frr/frr.log 2>/dev/null | head -10'})
+[RESULT] {"result":"2026/08/02 09:45:11 MGMTD: [VTVCM-Y2NW3] Configuration Read in Took: 00:00:00\n2026/08/02 09:45:11 MGMTD: [G6NKK-8C6DV] end_config: VTY:0x58254bc99170, pending SET-CFG: 0\n2026/08/02 09:45:11 ZEBRA: [VTVCM-Y2NW3] Configuration Read in Took: 00:00:00\n2026/08/02 09:45:11 ZEBRA: [G6NKK-8C6DV] end_config: VTY:0x55db48a17a50, pending SET-CFG: 0\n2026/08/02 09:45:11 STATIC: [VTVCM-Y2NW3] Con
+[TEXT] Critical revelation in dswa2's FRR log:
+
+1. **Both dswa1 AND dswa2 started FRR at the same log timestamp (09:45:11)** — but dswa2's OSPF adjacencies are ~4 minutes older, confirming a **container-level clock skew** (~4 min): dswa2's processes ran ~4 min earlier in real time.
+
+2. **dswa2 FRR log shows OSPF NetworkMask mismatch errors from dswa1 at 09:45:56 and 09:46:06**:
+   ```
+   Packet 10.0.0.79 [Hello:RECV]: NetworkMask mismatch on br0.99:10.0.0.3
+   (configured prefix length is 28, but hello packet indicates 32)
+   ```
+   This is directly caused by dswa1 having **10.0.0.1/32** as a secondary IP on br0.99 alongside its primary /28 — the /32 secondary confused OSPF Hello processing, delaying the dswa1↔dswa2 management adjacency.
+
+## Phase 5 — Final Diagnosis
+
+All evidence now converges:
+
+[FINAL] stop=end_turn tool_calls=32
+[SUBMITTED] parsed_ok=True is_anomaly=True faulty_devices=['dswa1']
+[FINAL-TEXT] Critical revelation in dswa2's FRR log:
+
+1. **Both dswa1 AND dswa2 started FRR at the same log timestamp (09:45:11)** — but dswa2's OSPF adjacencies are ~4 minutes older, confirming a **container-level clock skew** (~4 min): dswa2's processes ran ~4 min earlier in real time.
+
+2. **dswa2 FRR log shows OSPF NetworkMask mismatch errors from dswa1 at 09:45:56 and 09:46:06**:
+   ```
+   Packet 10.0.0.79 [Hello:RECV]: NetworkMask mismatch on br0.99:10.0.0.3
+   (configured prefix length is 28, but hello packet indicates 32)
+   ```
+   This is directly caused by dswa1 having **10.0.0.1/32** as a secondary IP on br0.99 alongside its primary /28 — the /32 secondary confused OSPF Hello processing, delaying the dswa1↔dswa2 management adjacency.
+
+## Phase 5 — Final Diagnosis
+
+All evidence now converges:
+- dswa1 joined the OSPF domain ~4 minutes after dswa2 (real-time clock skew, confirmed by adjacency age differential and FRR log timestamps)
+- During that ~4-minute window, dswa1's bridge interfaces were UP with gateway IPs (10.1.0.1/32, 10.0.0.1/32) responding to ARP but unable to route (FRR not yet running)
+- When dswa1's FRR started, OSPF reconverged (~47 seconds from FRR start to Full adjacency), disrupting the Office A routing domain
+- dswa1 is also misconfigured with duplicate gateway IPs (no VRRP) missing 10.6.0.1/32 and 10.2.0.1/32 vs dswa2's complete set
+
+=== DIAGNOSIS ===
+is_anomaly: true
+faulty_devices: dswa1
+diagnosis_text:
+**Affected component**: dswa1's FRR/ospfd process and its VLAN subinterface gateway IP configuration (br0.10 and br0.99 secondary addresses).
+
+**Mechanism**: dswa1's container clock runs approximately 4 minutes behind dswa2's, meaning dswa1's FRR stack initialized ~4 minutes after dswa2 in real wall-clock time (both logs show 09:45:11 in their local clocks, but OSPF adjacency uptimes — 6m44s on dswa1 vs. 10m57s on dswa2 for the csw1 link — expose the divergence). During the ~4-minute gap, dswa1's bridge VLAN interfaces were UP and responding to ARP for 10.1.0.1/32 and 10.0.0.1/32, but without FRR running, dswa1 had no inter-VLAN or OSPF routing capability. Packets sent to dswa1 as a gateway were silently dropped. When dswa1's ospfd finally started, it flooded new LSAs into the OSPF area, triggering a full SPF recalculation (~47 seconds to reach Full adjacency) that briefly disrupted reachability to all Office A gateways — including 10.6.0.1 on dswa2, whose routes were transiently recalculated. dswa2's FRR log also records two OSPF Hello NetworkMask-mismatch errors from dswa1 at 09:45:56/09:46:06 on br0.99, caused by dswa1's secondary 10.0.0.1/32 address being picked up as the interface mask, further delaying the management-VLAN adjacency.
+
+**Localization**: dswa1 — br0.10 (10.1.0.1/32 duplicate), br0.99 (10.0.0.1/32 duplicate + /32 Hello mask mismatch); root FRR delayed startup.
+
+**Root cause**: dswa1's ospfd started approximately 4 minutes late (real time), and carries duplicate gateway secondary IPs (10.1.0.1/32, 10.0.0.1/32) that also exist on dswa2 with no VRRP to arbitrate — when dswa1 joined OSPF it triggered reconvergence, and the uncoordinated duplicate IPs left ARP caches diverged (pc1→10.1.0.1 via dswa2's MAC; pc2→10.1.0.1 via dswa1's MAC), producing the "slightly longer path" as different hosts now route through different physical distribution switches.
+
+**Fix**: Synchronise container clocks (or use FRR `ospf startup-notify`); remove the duplicate /32 secondary gateway addresses from dswa1's br0.10 and br0.99 (or add the missing 10.6.0.1/32 and 10.2.0.1/32 to dswa1) and configure VRRP on both dswa1 and dswa2 for all gateway IPs so a single virtual MAC is advertised regardless of which physical switch is active.
+=== END ===

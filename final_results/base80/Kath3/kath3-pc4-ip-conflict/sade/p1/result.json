@@ -1,0 +1,181 @@
+{
+  "scenario": {
+    "scenario_id": "kath3-pc4-ip-conflict",
+    "topology": "Kath3",
+    "fault_family": "IP address conflict",
+    "prompt_to_agent": "PC4 (172.16.10.4) and PC5 (was 172.16.10.5) in Location A\nboth intermittently lose connectivity. ARP for 172.16.10.4\nflips between two MAC addresses on the switch. Internal pings\nbetween PC4 and the gateway sometimes succeed, sometimes fail.\nDiagnose.",
+    "injection": {
+      "device": "pc5",
+      "action": "reconfigure pc5 to PC4's IP (172.16.10.4 \u2014 collision)",
+      "command": "ip addr flush dev eth0\n  ip addr add 172.16.10.4/24 dev eth0\n  ip route add default via 172.16.10.1 2>/dev/null",
+      "note": null
+    },
+    "pre_check": [
+      {
+        "device": "pc5",
+        "command": "ip -4 -br addr show eth0 | grep \"172.16.10.5\"",
+        "expect": "1"
+      },
+      {
+        "device": "switch1",
+        "command": "bridge fdb show br br_vlan10 | grep -ci \"172\"",
+        "expect": "0  # FDB has MACs not IPs; just ensure baseline"
+      },
+      {
+        "device": "pc4",
+        "command": "ping -W2 -c2 172.16.10.1",
+        "expect": "0% loss"
+      }
+    ],
+    "post_inject_check": [
+      {
+        "device": "pc5",
+        "command": "ip -4 -br addr show eth0 | grep -c \"172.16.10.4\"",
+        "expect": "1"
+      },
+      {
+        "device": "pc4",
+        "command": "ping -W2 -c2 172.16.10.1",
+        "expect": "inconsistent (flapping)"
+      }
+    ],
+    "ground_truth": "Affected component: pc5 IP configuration \u2014 duplicate of pc4\nMechanism: Both PC4 and PC5 advertise themselves as\n  172.16.10.4 via ARP. The switch FDB and the gateway's ARP\n  cache flip between their MACs as they respond to each other's\n  gratuitous ARPs. Return traffic destined for .4 randomly goes\n  to either host, causing flaky connectivity for both.\nLocalization: pc5 (and pc4 secondarily, since the IP collision\n  is symmetric)\nRoot cause: pc5 was misconfigured with 172.16.10.4 (duplicate of pc4)\nFix: restore pc5 to its original IP (172.16.10.5)",
+    "fix_spec": "restore pc5 to its original IP (172.16.10.5)",
+    "scoring_axes": [
+      "assert-identifies: pc5",
+      "must-identify-device: pc5 (the misconfigured host)",
+      "must-identify-component: duplicate IP / IP conflict",
+      "must-explain-arp-flapping"
+    ],
+    "source_path": "dataset/kath3_Q/base/kath3-pc4-ip-conflict.txt",
+    "scenario_class": "base"
+  },
+  "agent": "sade",
+  "timestamp": "2026-07-06T06:19:33.808173+00:00",
+  "phases": {
+    "lstart": {
+      "ok": true,
+      "containers": 32,
+      "expected": 32
+    },
+    "settle": {
+      "converge_wait": 90
+    },
+    "injection": {
+      "applied": true,
+      "skipped_reason": null,
+      "rc": 0,
+      "output": ""
+    },
+    "post_inject_check": {
+      "results": [
+        {
+          "line": {
+            "device": "pc5",
+            "command": "ip -4 -br addr show eth0 | grep -c \"172.16.10.4\"",
+            "expect": "1"
+          },
+          "passed": true,
+          "actual": "1",
+          "rationale": "got 1, expected 1"
+        },
+        {
+          "line": {
+            "device": "pc4",
+            "command": "ping -W2 -c2 172.16.10.1",
+            "expect": "inconsistent (flapping)"
+          },
+          "passed": true,
+          "actual": "PING 172.16.10.1 (172.16.10.1) 56(84) bytes of data.\n64 bytes from 172.16.10.1: icmp_seq=1 ttl=64 time=1.74 ms\n64 bytes from 172.16.10.1: icmp_seq=2 ttl=64 time=0.990 ms\n\n--- 172.16.10.1 ping statistics ---\n2 packets transmitted, 2 received, 0% packet loss, time 1031ms\nrtt min/avg/max/mdev = 0.990/1.367/1.744/0.377 ms",
+          "rationale": "advisory: 'inconsistent (flapping)' (rc=0)"
+        }
+      ],
+      "wait_seconds": 0
+    },
+    "agent": {
+      "diagnosis_text": "**Affected component:** L3 addressing (static IP assignment) on pc5's `eth0` interface.\n\n**Mechanism:** Both pc4 and pc5 are configured with `172.16.10.4/24` on their respective `eth0` interfaces \u2014 pc4 correctly (`link/ether 46:dc:70:ad:39:0a`), and pc5 incorrectly (`link/ether 42:43:e2:ed:b3:e7`, should be `172.16.10.5/24`). Whenever either host generates ARP traffic (gratuitous ARP on startup, ARP request, ARP reply), every device on the switch1 L2 segment \u2014 including the gateway \u2014 overwrites its ARP cache entry for `172.16.10.4` with whichever MAC it heard most recently. This causes the ARP table to oscillate between the two MACs, so frames destined for 172.16.10.4 are intermittently delivered to pc4 or pc5 at random. pc4's cross-segment pings fail when pc5 \"holds\" the ARP entry, and both hosts experience disrupted gateway communication since the gateway's own ARP cache likewise flips.\n\n**Localization:** pc5, `eth0`. The reachability map confirmed the duplicate assignment at scan time (both entries resolve to `172.16.10.4`). Direct `ip addr show eth0` on both devices showed identical `/24` assignments with different hardware MACs, ruling out any duplicate-MAC fault and pinning the misconfiguration entirely on pc5.\n\n**Root cause:** pc5's `eth0` has been statically assigned `172.16.10.4/24` instead of the correct `172.16.10.5/24`, creating a duplicate-IP conflict with pc4 on the same LAN segment.\n\n**Fix:** Reconfigure pc5's `eth0` with `ip addr del 172.16.10.4/24 dev eth0 && ip addr add 172.16.10.5/24 dev eth0`, and update any persistent startup configuration (e.g. `/etc/network/interfaces` or the Kathara lab startup file) to `172.16.10.5/24` to survive container restarts.",
+      "is_anomaly": true,
+      "faulty_devices": [
+        "pc5"
+      ],
+      "parsed_ok": true,
+      "in_tokens": 17,
+      "cache_read_tokens": 131724,
+      "cache_write_tokens": 22458,
+      "out_tokens": 3958,
+      "cost_usd": 0.18870869999999998,
+      "tool_calls": 8,
+      "hit_max_turns": false,
+      "error": null
+    },
+    "score": {
+      "must_passed": 4,
+      "must_total": 4,
+      "bonus_passed": 0,
+      "bonus_total": 0,
+      "outcome_score": 1.0,
+      "fix_score": 1.0,
+      "reasoning_score": 0.9666666666666667,
+      "reasoning_dims": {
+        "grounding": 1.0,
+        "causality": 0.9,
+        "coverage": 1.0
+      },
+      "final_score": 1.0,
+      "per_axis": [
+        {
+          "axis": "assert-identifies: pc5",
+          "kind": "assert",
+          "score": 1.0,
+          "rationale": "culprit 'pc5' named (good)"
+        },
+        {
+          "axis": "must-identify-device: pc5 (the misconfigured host)",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The report explicitly localizes the misconfiguration to pc5 (eth0) and identifies it as the duplicate-IP host."
+        },
+        {
+          "axis": "must-identify-component: duplicate IP / IP conflict",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The report explicitly identifies a duplicate-IP conflict: pc5 is misconfigured with 172.16.10.4 (duplicate of pc4), causing ARP/traffic flipping."
+        },
+        {
+          "axis": "must-explain-arp-flapping",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The diagnosis explicitly describes how gratuitous ARPs and normal ARP traffic from identical IPs cause ARP cache/FDB entries to be overwritten and oscillate between the two MACs, explaining the observed ARP flapping."
+        },
+        {
+          "axis": "[FIX]",
+          "kind": "fix",
+          "score": 1.0,
+          "rationale": "Specifically instructs removing the duplicate 172.16.10.4 from pc5, assigning 172.16.10.5, and updating persistent config, which corrects the fault."
+        },
+        {
+          "axis": "reason:grounding",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "The agent's investigation log directly shows pc4 and pc5 both configured with 172.16.10.4 (with distinct MACs) and that there are no duplicate-MAC groups; the writeup's conclusion (pc5 misconfigured causing duplicate-IP ARP-flapping) follows logically and the suggested fix addresses the root cause. All key diagnostic claims are evidenced and the essential checks were performed."
+        },
+        {
+          "axis": "reason:causality",
+          "kind": "reason-dim",
+          "score": 0.9,
+          "rationale": "The agent's investigation log directly shows pc4 and pc5 both configured with 172.16.10.4 (with distinct MACs) and that there are no duplicate-MAC groups; the writeup's conclusion (pc5 misconfigured causing duplicate-IP ARP-flapping) follows logically and the suggested fix addresses the root cause. All key diagnostic claims are evidenced and the essential checks were performed."
+        },
+        {
+          "axis": "reason:coverage",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "The agent's investigation log directly shows pc4 and pc5 both configured with 172.16.10.4 (with distinct MACs) and that there are no duplicate-MAC groups; the writeup's conclusion (pc5 misconfigured causing duplicate-IP ARP-flapping) follows logically and the suggested fix addresses the root cause. All key diagnostic claims are evidenced and the essential checks were performed."
+        }
+      ],
+      "judge_model": "gpt-5-mini",
+      "reasoning_mode": "trace",
+      "error": null
+    }
+  },
+  "agent_input_prompt": "# Topology overview (devices + L2 connectivity)\nTopology: Kath3\n\nDevices:\n  laptop0: eth0=cd_sw1_fa7_1\n  laptop2: eth0=cd_sw1_fa3_1\n  laptop3: eth0=cd_sw1_fa4_1\n  laptop4: eth0=cd_sw11_fa1_1\n  laptop5: eth0=cd_sw11_fa2_1\n  mswitch1: eth0=link_msw1_sw1, eth1=cd_msw1_fa0_2, eth2=ms0_sw2, eth3=cd_msw1_fa0_4, eth4=link_r0_msw1, eth5=cd_msw1_fa0_6, eth6=cd_msw1_fa0_7, eth7=cd_msw1_fa0_8, eth8=cd_msw1_fa0_9, eth9=cd_msw1_fa0_10, eth10=cd_msw1_fa0_11, eth11=cd_msw1_fa0_12, eth12=cd_msw1_fa0_13, eth13=cd_msw1_fa0_14, eth14=cd_msw1_fa0_15, eth15=cd_msw1_fa0_16, eth16=cd_msw1_fa0_17, eth17=cd_msw1_fa0_18, eth18=cd_msw1_fa0_19, eth19=cd_msw1_fa0_20, eth20=cd_msw1_fa0_21, eth21=cd_msw1_fa0_22, eth22=cd_msw1_fa0_23, eth23=cd_msw1_fa0_24, eth24=cd_msw1_gi0_1, eth25=cd_msw1_gi0_2\n  mswitch2: eth0=r6_ms2, eth1=msw2_sw9, eth2=msw2_sw10, eth3=msw2_sw11, eth4=r6_ms2_2, eth5=cd_msw2_fa0_6, eth6=cd_msw2_fa0_7, eth7=cd_msw2_fa0_8, eth8=cd_msw2_fa0_9, eth9=cd_msw2_fa0_10, eth10=cd_msw2_fa0_11, eth11=cd_msw2_fa0_12, eth12=cd_msw2_fa0_13, eth13=cd_msw2_fa0_14, eth14=cd_msw2_fa0_15, eth15=cd_msw2_fa0_16, eth16=cd_msw2_fa0_17, eth17=cd_msw2_fa0_18, eth18=cd_msw2_fa0_19, eth19=cd_msw2_fa0_20, eth20=cd_msw2_fa0_21, eth21=cd_msw2_fa0_22, eth22=cd_msw2_fa0_23, eth23=cd_msw2_fa0_24, eth24=cd_msw2_gi0_1, eth25=cd_msw2_gi0_2\n  pc11: eth0=cd_sw5_fa1_1\n  pc12: eth0=cd_sw5_fa2_1\n  pc13: eth0=cd_sw6_fa1_1\n  pc14: eth0=cd_sw6_fa2_1\n  pc15: eth0=cd_sw10_fa1_1\n  pc16: eth0=cd_sw10_fa2_1\n  pc17: eth0=cd_sw10_fa3_1\n  pc18: eth0=cd_sw10_fa4_1\n  pc4: eth0=cd_sw1_fa1_1\n  pc5: eth0=cd_sw1_fa2_1\n  router0: eth0=link_r0_msw1, eth1=cd_r0_fa1_0, eth2=wan_link_r0_r1, eth3=cd_r0_se3_0, eth4=r0_r5, eth5=cd_r0_fa5_0\n  router1: eth0=cd_r1_fa0_0, eth1=cd_r1_fa1_0, eth2=wan_link_r0_r1, eth3=wan_link_r1_r2, eth4=cd_r1_fa4_0, eth5=cd_r1_fa5_0\n  router2: eth0=cd_r2_fa0_0, eth1=cd_r2_fa1_0, eth2=wan_link_r1_r2, eth3=cd_r2_se3_0, eth4=link_r2_r3, eth5=cd_r2_fa5_0\n  router3: eth0=cd_r3_fa0_0, eth1=cd_r3_fa1_0, eth2=r6_r3, eth3=cd_r3_se3_0, eth4=link_r2_r3, eth5=link_r4_r3\n  router4: eth0=sw4_r4, eth1=cd_r4_fa1_0, eth2=cd_r4_se2_0, eth3=cd_r4_se3_0, eth4=link_r4_r5, eth5=link_r4_r3\n  router5: eth0=cd_r5_fa0_0, eth1=cd_r5_fa1_0, eth2=cd_r5_se2_0, eth3=cd_r5_se3_0, eth4=r0_r5, eth5=link_r4_r5\n  router6: eth0=r6_ms2, eth1=r6_ms2_2, eth2=r6_r3, eth3=cd_r6_se3_0, eth4=cd_r6_fa4_0, eth5=cd_r6_fa5_0\n  switch1: eth0=link_msw1_sw1, eth1=cd_sw1_fa1_1, eth2=cd_sw1_fa2_1, eth3=cd_sw1_fa3_1, eth4=cd_sw1_fa4_1, eth5=cd_sw1_fa5_1, eth6=cd_sw1_fa6_1, eth7=cd_sw1_fa7_1, eth8=cd_sw1_fa8_1, eth9=cd_sw1_fa9_1\n  switch10: eth0=msw2_sw10, eth1=cd_sw10_fa1_1, eth2=cd_sw10_fa2_1, eth3=cd_sw10_fa3_1, eth4=cd_sw10_fa4_1, eth5=cd_sw10_fa5_1, eth6=cd_sw10_fa6_1, eth7=cd_sw10_fa7_1, eth8=cd_sw10_fa8_1, eth9=cd_sw10_fa9_1\n  switch11: eth0=msw2_sw11, eth1=cd_sw11_fa1_1, eth2=cd_sw11_fa2_1, eth3=cd_sw11_fa3_1, eth4=cd_sw11_fa4_1, eth5=cd_sw11_fa5_1\n  switch2: eth0=cd_sw2_fa0_1, eth1=ms0_sw2, eth2=cd_sw2_fa2_1, eth3=cd_sw2_fa3_1, eth4=cd_sw2_fa4_1, eth5=cd_sw2_fa5_1, eth6=cd_sw2_fa6_1, eth7=cd_sw2_fa7_1, eth8=cd_sw2_fa8_1, eth9=cd_sw2_fa9_1\n  switch4: eth0=sw4_r4, eth1=sw4_sw5, eth2=sw4_sw6, eth3=cd_sw4_fa3_1, eth4=cd_sw4_fa4_1, eth5=cd_sw4_fa5_1\n  switch5: eth0=sw4_sw5, eth1=cd_sw5_fa1_1, eth2=cd_sw5_fa2_1, eth3=cd_sw5_fa3_1, eth4=cd_sw5_fa4_1, eth5=cd_sw5_fa5_1\n  switch6: eth0=sw4_sw6, eth1=cd_sw6_fa1_1, eth2=cd_sw6_fa2_1, eth3=cd_sw6_fa3_1, eth4=cd_sw6_fa4_1, eth5=cd_sw6_fa5_1\n  switch9: eth0=msw2_sw9, eth1=cd_sw9_fa1_1, eth2=cd_sw9_fa2_1, eth3=cd_sw9_fa3_1, eth4=cd_sw9_fa4_1, eth5=cd_sw9_fa5_1\n\nCollision domains (shared L2 segments):\n  cd_msw1_fa0_10: mswitch1.eth9\n  cd_msw1_fa0_11: mswitch1.eth10\n  cd_msw1_fa0_12: mswitch1.eth11\n  cd_msw1_fa0_13: mswitch1.eth12\n  cd_msw1_fa0_14: mswitch1.eth13\n  cd_msw1_fa0_15: mswitch1.eth14\n  cd_msw1_fa0_16: mswitch1.eth15\n  cd_msw1_fa0_17: mswitch1.eth16\n  cd_msw1_fa0_18: mswitch1.eth17\n  cd_msw1_fa0_19: mswitch1.eth18\n  cd_msw1_fa0_2: mswitch1.eth1\n  cd_msw1_fa0_20: mswitch1.eth19\n  cd_msw1_fa0_21: mswitch1.eth20\n  cd_msw1_fa0_22: mswitch1.eth21\n  cd_msw1_fa0_23: mswitch1.eth22\n  cd_msw1_fa0_24: mswitch1.eth23\n  cd_msw1_fa0_4: mswitch1.eth3\n  cd_msw1_fa0_6: mswitch1.eth5\n  cd_msw1_fa0_7: mswitch1.eth6\n  cd_msw1_fa0_8: mswitch1.eth7\n  cd_msw1_fa0_9: mswitch1.eth8\n  cd_msw1_gi0_1: mswitch1.eth24\n  cd_msw1_gi0_2: mswitch1.eth25\n  cd_msw2_fa0_10: mswitch2.eth9\n  cd_msw2_fa0_11: mswitch2.eth10\n  cd_msw2_fa0_12: mswitch2.eth11\n  cd_msw2_fa0_13: mswitch2.eth12\n  cd_msw2_fa0_14: mswitch2.eth13\n  cd_msw2_fa0_15: mswitch2.eth14\n  cd_msw2_fa0_16: mswitch2.eth15\n  cd_msw2_fa0_17: mswitch2.eth16\n  cd_msw2_fa0_18: mswitch2.eth17\n  cd_msw2_fa0_19: mswitch2.eth18\n  cd_msw2_fa0_20: mswitch2.eth19\n  cd_msw2_fa0_21: mswitch2.eth20\n  cd_msw2_fa0_22: mswitch2.eth21\n  cd_msw2_fa0_23: mswitch2.eth22\n  cd_msw2_fa0_24: mswitch2.eth23\n  cd_msw2_fa0_6: mswitch2.eth5\n  cd_msw2_fa0_7: mswitch2.eth6\n  cd_msw2_fa0_8: mswitch2.eth7\n  cd_msw2_fa0_9: mswitch2.eth8\n  cd_msw2_gi0_1: mswitch2.eth24\n  cd_msw2_gi0_2: mswitch2.eth25\n  cd_r0_fa1_0: router0.eth1\n  cd_r0_fa5_0: router0.eth5\n  cd_r0_se3_0: router0.eth3\n  cd_r1_fa0_0: router1.eth0\n  cd_r1_fa1_0: router1.eth1\n  cd_r1_fa4_0: router1.eth4\n  cd_r1_fa5_0: router1.eth5\n  cd_r2_fa0_0: router2.eth0\n  cd_r2_fa1_0: router2.eth1\n  cd_r2_fa5_0: router2.eth5\n  cd_r2_se3_0: router2.eth3\n  cd_r3_fa0_0: router3.eth0\n  cd_r3_fa1_0: router3.eth1\n  cd_r3_se3_0: router3.eth3\n  cd_r4_fa1_0: router4.eth1\n  cd_r4_se2_0: router4.eth2\n  cd_r4_se3_0: router4.eth3\n  cd_r5_fa0_0: router5.eth0\n  cd_r5_fa1_0: router5.eth1\n  cd_r5_se2_0: router5.eth2\n  cd_r5_se3_0: router5.eth3\n  cd_r6_fa4_0: router6.eth4\n  cd_r6_fa5_0: router6.eth5\n  cd_r6_se3_0: router6.eth3\n  cd_sw10_fa1_1: pc15.eth0, switch10.eth1\n  cd_sw10_fa2_1: pc16.eth0, switch10.eth2\n  cd_sw10_fa3_1: pc17.eth0, switch10.eth3\n  cd_sw10_fa4_1: pc18.eth0, switch10.eth4\n  cd_sw10_fa5_1: switch10.eth5\n  cd_sw10_fa6_1: switch10.eth6\n  cd_sw10_fa7_1: switch10.eth7\n  cd_sw10_fa8_1: switch10.eth8\n  cd_sw10_fa9_1: switch10.eth9\n  cd_sw11_fa1_1: laptop4.eth0, switch11.eth1\n  cd_sw11_fa2_1: laptop5.eth0, switch11.eth2\n  cd_sw11_fa3_1: switch11.eth3\n  cd_sw11_fa4_1: switch11.eth4\n  cd_sw11_fa5_1: switch11.eth5\n  cd_sw1_fa1_1: pc4.eth0, switch1.eth1\n  cd_sw1_fa2_1: pc5.eth0, switch1.eth2\n  cd_sw1_fa3_1: laptop2.eth0, switch1.eth3\n  cd_sw1_fa4_1: laptop3.eth0, switch1.eth4\n  cd_sw1_fa5_1: switch1.eth5\n  cd_sw1_fa6_1: switch1.eth6\n  cd_sw1_fa7_1: laptop0.eth0, switch1.eth7\n  cd_sw1_fa8_1: switch1.eth8\n  cd_sw1_fa9_1: switch1.eth9\n  cd_sw2_fa0_1: switch2.eth0\n  cd_sw2_fa2_1: switch2.eth2\n  cd_sw2_fa3_1: switch2.eth3\n  cd_sw2_fa4_1: switch2.eth4\n  cd_sw2_fa5_1: switch2.eth5\n  cd_sw2_fa6_1: switch2.eth6\n  cd_sw2_fa7_1: switch2.eth7\n  cd_sw2_fa8_1: switch2.eth8\n  cd_sw2_fa9_1: switch2.eth9\n  cd_sw4_fa3_1: switch4.eth3\n  cd_sw4_fa4_1: switch4.eth4\n  cd_sw4_fa5_1: switch4.eth5\n  cd_sw5_fa1_1: pc11.eth0, switch5.eth1\n  cd_sw5_fa2_1: pc12.eth0, switch5.eth2\n  cd_sw5_fa3_1: switch5.eth3\n  cd_sw5_fa4_1: switch5.eth4\n  cd_sw5_fa5_1: switch5.eth5\n  cd_sw6_fa1_1: pc13.eth0, switch6.eth1\n  cd_sw6_fa2_1: pc14.eth0, switch6.eth2\n  cd_sw6_fa3_1: switch6.eth3\n  cd_sw6_fa4_1: switch6.eth4\n  cd_sw6_fa5_1: switch6.eth5\n  cd_sw9_fa1_1: switch9.eth1\n  cd_sw9_fa2_1: switch9.eth2\n  cd_sw9_fa3_1: switch9.eth3\n  cd_sw9_fa4_1: switch9.eth4\n  cd_sw9_fa5_1: switch9.eth5\n  link_msw1_sw1: mswitch1.eth0, switch1.eth0\n  link_r0_msw1: mswitch1.eth4, router0.eth0\n  link_r2_r3: router2.eth4, router3.eth4\n  link_r4_r3: router3.eth5, router4.eth5\n  link_r4_r5: router4.eth4, router5.eth5\n  ms0_sw2: mswitch1.eth2, switch2.eth1\n  msw2_sw10: mswitch2.eth2, switch10.eth0\n  msw2_sw11: mswitch2.eth3, switch11.eth0\n  msw2_sw9: mswitch2.eth1, switch9.eth0\n  r0_r5: router0.eth4, router5.eth4\n  r6_ms2: mswitch2.eth0, router6.eth0\n  r6_ms2_2: mswitch2.eth4, router6.eth1\n  r6_r3: router3.eth2, router6.eth2\n  sw4_r4: router4.eth0, switch4.eth0\n  sw4_sw5: switch4.eth1, switch5.eth0\n  sw4_sw6: switch4.eth2, switch6.eth0\n  wan_link_r0_r1: router0.eth2, router1.eth2\n  wan_link_r1_r2: router1.eth3, router2.eth2\n\n# Symptom (user report)\nPC4 (172.16.10.4) and PC5 (was 172.16.10.5) in Location A\nboth intermittently lose connectivity. ARP for 172.16.10.4\nflips between two MAC addresses on the switch. Internal pings\nbetween PC4 and the gateway sometimes succeed, sometimes fail.\nDiagnose."
+}

@@ -1,0 +1,166 @@
+{
+  "scenario": {
+    "scenario_id": "kath2-router2-ripd-down-misdescribed",
+    "topology": "Kath2",
+    "fault_family": "routing daemon down (misdescribed cause)",
+    "prompt_to_agent": "Ticket #4512: After last night's maintenance, the Server Room (1.0.0.x) and\nInternet Lab (128.168.0.x) lost connectivity to all the 192.168.x.x departments\n(and vice versa), while traffic inside each zone still works. The team believes\nrouter2's WAN serial interface (eth2, toward router1) went down or was unplugged\nduring the maintenance. Please confirm the router2 WAN link failure and identify\nthe down interface.",
+    "injection": {
+      "device": "router2",
+      "action": "kill ripd (kill watchfrr first so FRR does not respawn it)",
+      "command": "pkill -9 watchfrr; pkill -9 ripd",
+      "note": null
+    },
+    "pre_check": [],
+    "post_inject_check": [
+      {
+        "device": "router2",
+        "command": "pgrep ripd",
+        "expect": "empty"
+      },
+      {
+        "device": "router2",
+        "command": "ip -br link show eth2 | grep -c UP",
+        "expect": "1"
+      },
+      {
+        "device": "it_hod",
+        "command": "ping -W2 -c2 1.0.0.5",
+        "expect": "loss>0"
+      }
+    ],
+    "ground_truth": "The root cause is IDENTICAL to kath2-router2-ripd-down: ripd is dead on router2.\nrouter2 is the only L3 path between the rest of the network and the Server Room\n(1.0.0.0/8) + Internet Lab (128.168.0.0/16). With ripd stopped, router2 stops\nadvertising its connected networks, router1 ages out 1.0.0.0/8 and 128.168.0.0/16,\nand router2 loses its learned 192.168.x.x routes -- so both directions break while\nintra-zone traffic continues.\n\nThe TWIST: the ticket asserts the wrong CAUSE -- a downed router2 WAN serial\n(eth2). The link is actually UP and forwarding: router2's eth2 is up and its\nserial neighbor is reachable; nothing physical failed. The bilateral isolation\nsymptom is real, but the narrated cause (a maintenance-window link failure) is a\nred herring -- the routing daemon stopped, the wire did not.\n\nCorrect diagnosis: is_anomaly=true, faulty_devices = router2 (ripd not running).\nThe agent must check Layer 1/2 (eth2 is UP), then the routing daemon (ripd dead on\nrouter2), and explicitly reject the \"WAN link down\" narrative. An agent that\n\"confirms the down uplink\" has followed the ticket's framing instead of the\nevidence. Fix: restart FRR AND re-apply the `router rip` configuration on router2 (see [FIX] -- a bare restart alone does not restore the vtysh-applied config).\n\nObservable note (lab-verified 2026-07-03): ripd is killed together with watchfrr (its watchdog), so nothing respawns it. vtysh remains responsive via zebra, `show running-config` simply contains NO `router rip` section, and `show daemons` no longer lists ripd. An agent may therefore correctly describe this fault as \"the rip configuration is missing/empty on router2\" -- that is the same fault observed at the config plane, and must NOT be treated as a wrong root cause.",
+    "fix_spec": "Restart FRR / the ripd daemon on router2 (e.g. `/etc/init.d/frr restart` on\nrouter2). Once ripd is running again it re-advertises and re-learns the\naffected routes, restoring reachability. (The ticket misattributes the fault;\nthe remediation targets router2.)\n\nNOTE (lab-verified 2026-07-03): this lab applies FRR config via vtysh at boot (there is no /etc/frr/frr.conf), so `/etc/init.d/frr restart` alone brings ripd back CONFIG-LESS and the rip service stays broken. The complete remediation is to (re)start FRR/ripd AND re-apply the `router rip` configuration (network statements) on router2. A proposal that restores the missing rip configuration is a correct fix; a bare daemon restart without restoring the config is incomplete.",
+    "scoring_axes": [
+      "assert-identifies: router2",
+      "must-identify-component: ripd / RIP routing daemon"
+    ],
+    "source_path": "dataset/kath2_Q/cex/kath2-router2-ripd-down-misdescribed.txt",
+    "scenario_class": "wrong-cause"
+  },
+  "agent": "sade",
+  "timestamp": "2026-07-05T17:24:06.837123+00:00",
+  "phases": {
+    "lstart": {
+      "ok": true,
+      "containers": 30,
+      "expected": 30
+    },
+    "settle": {
+      "converge_wait": 90
+    },
+    "injection": {
+      "applied": true,
+      "skipped_reason": null,
+      "rc": 0,
+      "output": ""
+    },
+    "post_inject_check": {
+      "results": [
+        {
+          "line": {
+            "device": "router2",
+            "command": "pgrep ripd",
+            "expect": "empty"
+          },
+          "passed": true,
+          "actual": "",
+          "rationale": "output empty"
+        },
+        {
+          "line": {
+            "device": "router2",
+            "command": "ip -br link show eth2 | grep -c UP",
+            "expect": "1"
+          },
+          "passed": true,
+          "actual": "1",
+          "rationale": "got 1, expected 1"
+        },
+        {
+          "line": {
+            "device": "it_hod",
+            "command": "ping -W2 -c2 1.0.0.5",
+            "expect": "loss>0"
+          },
+          "passed": true,
+          "actual": "PING 1.0.0.5 (1.0.0.5) 56(84) bytes of data.\n\n--- 1.0.0.5 ping statistics ---\n2 packets transmitted, 0 received, 100% packet loss, time 1010ms",
+          "rationale": "loss=100%"
+        }
+      ],
+      "wait_seconds": 0
+    },
+    "agent": {
+      "diagnosis_text": "**Affected component:** The FRR RIP daemon (`ripd`) on router2 \u2014 the routing process responsible for exchanging RIP routes between router2 and its upstream neighbor (router1).\n\n**Mechanism:** The lab topology uses RIPv2 for inter-router route propagation. Router1 and router0 successfully exchange 192.168.x.x department subnet routes via RIP (confirmed by `proto rip` entries in their routing tables). Router2 should advertise its two local LANs \u2014 the server room (1.0.0.0/8) and the internet lab (128.168.0.0/16) \u2014 to router1 via the wan_r1_r2 WAN link (router1.eth3 \u2194 router2.eth2), and in return learn routes back to the 192.168.x.x subnets. Because ripd never came up on router2, neither direction of advertisement occurred. Router1 has no route to 1.0.0.0/8 or 128.168.0.0/16 (confirmed by its routing table), and router2 has no default route or 192.168.x.x routes (confirmed by its routing table). Traffic in both directions is blackholed.\n\n**Localization:** router2 exclusively. All four of its interfaces are physically UP (eth0\u2013eth2 all show BROADCAST,MULTICAST,UP,LOWER_UP), ruling out the reported WAN link-down hypothesis. The fault is software: `/etc/frr/daemons` has `ripd=no`, `/etc/frr/frr.conf` is absent, and `service frr status` reports `ripd: FAILED`.\n\n**Root cause:** `ripd` (FRR's RIP daemon) failed to start on router2 because the FRR daemons file has `ripd=no` and no `frr.conf` exists to provide RIP configuration, preventing all RIP route exchange between router2 and the rest of the network.\n\n**Fix:** On router2, set `ripd=yes` in `/etc/frr/daemons`, create `/etc/frr/ripd.conf` (owned by user `frr`), restart FRR (`service frr restart`), then configure RIP via vtysh: `router rip`, `version 2`, `network 1.0.0.0/8`, `network 128.168.0.0/16`, `network 20.0.0.0/8`.",
+      "is_anomaly": true,
+      "faulty_devices": [
+        "router2"
+      ],
+      "parsed_ok": true,
+      "in_tokens": 20,
+      "cache_read_tokens": 181684,
+      "cache_write_tokens": 34498,
+      "out_tokens": 18092,
+      "cost_usd": 0.4568917,
+      "tool_calls": 20,
+      "hit_max_turns": false,
+      "error": null
+    },
+    "score": {
+      "must_passed": 2,
+      "must_total": 2,
+      "bonus_passed": 0,
+      "bonus_total": 0,
+      "outcome_score": 1.0,
+      "fix_score": 1.0,
+      "reasoning_score": 1.0,
+      "reasoning_dims": {
+        "grounding": 1.0,
+        "causality": 1.0,
+        "coverage": 1.0
+      },
+      "final_score": 1.0,
+      "per_axis": [
+        {
+          "axis": "assert-identifies: router2",
+          "kind": "assert",
+          "score": 1.0,
+          "rationale": "culprit 'router2' named (good)"
+        },
+        {
+          "axis": "must-identify-component: ripd / RIP routing daemon",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "Agent explicitly identifies the FRR RIP daemon (ripd) on router2 as the faulty component."
+        },
+        {
+          "axis": "[FIX]",
+          "kind": "fix",
+          "score": 1.0,
+          "rationale": "Proposes enabling ripd, restarting FRR, and re-applying the router rip network statements on router2, which matches the expected remediation."
+        },
+        {
+          "axis": "reason:grounding",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "The agent's investigation log contains direct command outputs that support each key claim (interfaces up, ripd absent/failed, routing tables missing RIP routes, startup log and daemons file evidence), and the final writeup draws correct, logically connected conclusions and an appropriate fix. The reasoning is sound, causal steps are justified by observed data, and essential checks (L1/L2, routing tables, daemon/process and config files) were performed."
+        },
+        {
+          "axis": "reason:causality",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "The agent's investigation log contains direct command outputs that support each key claim (interfaces up, ripd absent/failed, routing tables missing RIP routes, startup log and daemons file evidence), and the final writeup draws correct, logically connected conclusions and an appropriate fix. The reasoning is sound, causal steps are justified by observed data, and essential checks (L1/L2, routing tables, daemon/process and config files) were performed."
+        },
+        {
+          "axis": "reason:coverage",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "The agent's investigation log contains direct command outputs that support each key claim (interfaces up, ripd absent/failed, routing tables missing RIP routes, startup log and daemons file evidence), and the final writeup draws correct, logically connected conclusions and an appropriate fix. The reasoning is sound, causal steps are justified by observed data, and essential checks (L1/L2, routing tables, daemon/process and config files) were performed."
+        }
+      ],
+      "judge_model": "gpt-5-mini",
+      "reasoning_mode": "trace",
+      "error": null
+    }
+  },
+  "agent_input_prompt": "# Topology overview (devices + L2 connectivity)\nTopology: Kath2\n\nDevices:\n  cs_hod: eth0=lan_cs\n  cs_lab1: eth0=lan_cs\n  cs_lab2: eth0=lan_cs\n  cs_lab3: eth0=lan_cs\n  cs_lab4: eth0=lan_cs\n  enquiry: eth0=lan_office\n  exam_cell: eth0=lan_office\n  it_hod: eth0=lan_it\n  it_lab1: eth0=lan_it\n  it_lab2: eth0=lan_it\n  it_lab3: eth0=lan_it\n  it_lab4: eth0=lan_it\n  laptop0: eth0=lan_principle\n  office_pc: eth0=lan_office\n  pc0: eth0=lan_principle\n  pc1: eth0=lan_servers\n  pc2: eth0=lan_internet\n  pc3: eth0=lan_internet\n  pc4: eth0=lan_internet\n  pc5: eth0=lan_internet\n  router0: eth0=link_r0_sw0, eth1=link_r0_sw1, eth2=wan_r0_r1\n  router1: eth0=link_r1_sw2, eth1=link_r1_sw3, eth2=wan_r0_r1, eth3=wan_r1_r2\n  router2: eth0=link_r2_sw4, eth1=link_r2_sw5, eth2=wan_r1_r2\n  switch0: eth0=link_r0_sw0, eth1=lan_it\n  switch1: eth0=link_r0_sw1, eth1=lan_cs\n  switch2: eth0=link_r1_sw2, eth1=lan_office\n  switch3: eth0=link_r1_sw3, eth1=lan_principle\n  switch4: eth0=link_r2_sw4, eth1=lan_servers\n  switch5: eth0=link_r2_sw5, eth1=lan_internet\n  tpo: eth0=lan_office\n\nCollision domains (shared L2 segments):\n  lan_cs: cs_hod.eth0, cs_lab1.eth0, cs_lab2.eth0, cs_lab3.eth0, cs_lab4.eth0, switch1.eth1\n  lan_internet: pc2.eth0, pc3.eth0, pc4.eth0, pc5.eth0, switch5.eth1\n  lan_it: it_hod.eth0, it_lab1.eth0, it_lab2.eth0, it_lab3.eth0, it_lab4.eth0, switch0.eth1\n  lan_office: enquiry.eth0, exam_cell.eth0, office_pc.eth0, switch2.eth1, tpo.eth0\n  lan_principle: laptop0.eth0, pc0.eth0, switch3.eth1\n  lan_servers: pc1.eth0, switch4.eth1\n  link_r0_sw0: router0.eth0, switch0.eth0\n  link_r0_sw1: router0.eth1, switch1.eth0\n  link_r1_sw2: router1.eth0, switch2.eth0\n  link_r1_sw3: router1.eth1, switch3.eth0\n  link_r2_sw4: router2.eth0, switch4.eth0\n  link_r2_sw5: router2.eth1, switch5.eth0\n  wan_r0_r1: router0.eth2, router1.eth2\n  wan_r1_r2: router1.eth3, router2.eth2\n\n# Symptom (user report)\nTicket #4512: After last night's maintenance, the Server Room (1.0.0.x) and\nInternet Lab (128.168.0.x) lost connectivity to all the 192.168.x.x departments\n(and vice versa), while traffic inside each zone still works. The team believes\nrouter2's WAN serial interface (eth2, toward router1) went down or was unplugged\nduring the maintenance. Please confirm the router2 WAN link failure and identify\nthe down interface."
+}

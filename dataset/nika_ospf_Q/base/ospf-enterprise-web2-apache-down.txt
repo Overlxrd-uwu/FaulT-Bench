@@ -1,0 +1,63 @@
+==================================================
+Scenario: ospf-enterprise-web2-apache-down
+Topology: ospf_enterprise_static
+Fault family: service down
+==================================================
+
+[PROMPT-TO-AGENT]
+Helpdesk ticket #8878: Users in both pods report the "web2.local" portal
+returns nothing -- connections fail immediately instead of loading. The other
+portals (web0/web1/web3) load fine. DNS resolves web2.local to 10.200.0.5,
+and ping to 10.200.0.5 works from user machines. Diagnose.
+
+[INJECTION]
+device: web_server_2
+action: stop the Apache web service on web_server_2
+cmd: service apache2 stop
+
+[POST-INJECT-CHECK]
+web_server_2   pgrep apache2                                              => expect empty
+host_1_1_1_1   curl -s -o /dev/null -w '%{http_code}' http://web2.local   => expect 000
+host_1_1_1_1   nslookup web2.local 10.200.0.2 | grep -c 10.200.0.5        => expect >=1
+
+[GROUND-TRUTH]
+Affected component: web_server_2 Apache (apache2) HTTP service
+Mechanism: the apache2 service on web_server_2 (10.200.0.5) is stopped, so
+  nothing listens on TCP/80 and connection attempts are refused immediately.
+  Everything below the service layer is healthy: DNS still resolves
+  web2.local -> 10.200.0.5, the OSPF path delivers packets (ping succeeds),
+  and the other three web servers keep serving. The symptom is purely the
+  dead HTTP daemon on one server.
+Localization: web_server_2
+Root cause: apache2 not running on web_server_2 (TCP/80 closed)
+Fix: `service apache2 start` on web_server_2
+
+[FIX]
+Restart the Apache web service on web_server_2 (e.g. `service apache2 start`
+/ `systemctl start apache2`). Once Apache listens on port 80 again,
+http://web2.local serves normally. Nothing else needs changing.
+
+[DIAGNOSTIC-PROCESS]
+1. Reproduce on the real path: from host_1_1_1_1, curl http://web2.local
+   fails immediately, while nslookup web2.local returns 10.200.0.5 and ping
+   10.200.0.5 succeeds -- name resolution and the network path are healthy.
+2. Separate the layers: an instant connection failure with working ICMP
+   means the host is up but TCP/80 is closed -- a service-layer fault, not
+   routing or DNS.
+3. Test the service directly: on web_server_2, `pgrep apache2` is empty --
+   the web daemon is not running.
+4. Localize to web_server_2 (Apache): the dead HTTP service fully explains
+   the symptom; exonerate dns_server, the OSPF core, and the other web
+   servers (all still serving).
+
+[SCORING-AXES]
+assert-identifies: web_server_2
+must-identify-device: web_server_2
+must-identify-component: Apache/HTTP service stopped (TCP 80 closed)
+bonus-exonerates-dns-and-network: notes DNS resolves web2.local correctly and 10.200.0.5 is reachable at the IP layer, ruling out name resolution and the network path
+# These axes score the outcome metric only; fix and reasoning are judged separately.
+
+[NIKA-LABEL]
+nika_label: service_down
+nika_category: NETWORK_NODE_ERROR
+in_taxonomy: true

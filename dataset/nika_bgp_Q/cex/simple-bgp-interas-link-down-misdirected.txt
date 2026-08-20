@@ -1,0 +1,67 @@
+==================================================
+Scenario: simple-bgp-interas-link-down-misdirected
+Topology: simple_bgp
+Fault family: link down (misdirected ticket)
+==================================================
+
+[PROMPT-TO-AGENT]
+Helpdesk ticket #9105: A user on pc1 (195.11.14.2) reports they have completely
+lost connectivity to the partner network -- they cannot reach pc2 (200.1.1.2) in
+the peer AS since this morning. The team is convinced the peer's router, router2,
+dropped the peering and want router2 restarted. Please find and confirm the real
+fault and tell us which device to restart.
+
+[INJECTION]
+device: router1
+action: administratively down the inter-AS interface (eth0) on router1
+cmd: ip link set eth0 down
+
+[POST-INJECT-CHECK]
+router1   ip -br link show eth0 | grep -c UP => expect 0
+pc1       ping -W2 -c2 200.1.1.2             => expect loss>0
+
+[GROUND-TRUTH]
+The real fault is the inter-AS link on router1: router1's eth0 (the interface to
+router2) is DOWN, so the physical/L2 path between the two ASes is broken. As a
+CONSEQUENCE the eBGP session between router1 and router2 drops and the inter-AS
+prefixes are withdrawn, so pc1 (195.11.14.2) cannot reach pc2 (200.1.1.2). The
+ticket MISDIRECTS to router2 ("router2 dropped the peering"), but the fault is on
+the LOCAL side: it is router1's own inter-AS interface that is down. router2 is
+healthy -- its bgpd is still running and its inter-AS interface is up; the session
+is down only because router1's link went away.
+
+The correct diagnosis identifies router1 (inter-AS link / eth0 down) as the root
+cause and explicitly EXONERATES router2: router2's BGP daemon and interface are
+fine, so the user's "router2 dropped the peering" hypothesis is wrong. An agent
+that restarts / blames router2 has followed the ticket's misdirection instead of
+the evidence.
+
+[FIX]
+Bring the inter-AS link back up: on router1 run `ip link set eth0 up`. Once eth0
+is up again, the eBGP session to router2 re-establishes, the inter-AS prefixes are
+re-exchanged, and pc1 reaches pc2 normally. router2 needs no change -- it was
+healthy the whole time.
+
+[DIAGNOSTIC-PROCESS]
+1. Reproduce on the real path: from pc1, ping pc2 (200.1.1.2) -- it fails (no
+   route to the peer AS).
+2. Check the data/physical layer on both ends: on router1 the inter-AS interface
+   eth0 is DOWN (no carrier) -> the link itself is broken; router2's inter-AS
+   interface is still UP.
+3. Localize to the LOCAL link: the eBGP session is down BECAUSE router1's link is
+   down; router2's bgpd is up and reports the peer (router1) as unreachable, not
+   a fault of its own.
+4. Localize to the inter-AS link (router1 eth0 down), not router2: exonerate
+   router2, whose daemon and interface are healthy.
+
+[SCORING-AXES]
+assert-identifies: router1
+assert-not-identifies: router2
+must-identify-link-down: identifies the inter-AS link (router1 eth0) is down as the root cause, with BGP loss as a consequence
+bonus-notes-router2-healthy: rejects the ticket's "router2 dropped the peering" hypothesis by any valid evidence -- e.g. router2's config/daemon verified fine, its failed pings explained by the far end being down, or an explicit 'do not restart router2'
+
+[NIKA-LABEL]
+nika_label: link_down
+nika_category: LINK_FAILURE
+in_taxonomy: true
+note: NIKA-substrate misdirected counter-example (clean simple_bgp topology; real inter-AS link-down fault on router1 eth0; ticket blames router2)

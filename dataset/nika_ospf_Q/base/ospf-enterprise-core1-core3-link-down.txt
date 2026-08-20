@@ -1,0 +1,73 @@
+==================================================
+Scenario: ospf-enterprise-core1-core3-link-down
+Topology: ospf_enterprise_static
+Fault family: link cut (backbone redundancy loss, traffic rerouted)
+==================================================
+
+[PROMPT-TO-AGENT]
+Helpdesk ticket #8880: NOC monitoring reports that the OSPF adjacency between
+router_core_1 and router_core_3 dropped a few minutes ago and has not come
+back. There are no user complaints: both pods still reach the server farm
+normally, and all portals load. We are concerned the backbone is now running
+without redundancy on pod 1's path to the data center. Confirm what failed
+and exactly where, so the right link can be repaired.
+
+[INJECTION]
+device: router_core_1
+action: bring down the backbone link to router_core_3
+cmd: ip link set eth1 down
+
+[POST-INJECT-CHECK]
+router_core_1  ip -br link show eth1 | grep -c UP                     => expect 0
+router_core_1  vtysh -c "show ip ospf neighbor" | grep -c 172.16.0.3  => expect 0
+host_1_1_1_1   ping -W2 -c2 10.200.0.2                                => expect 0% loss   (still OK -- rerouted via router_core_2)
+
+[GROUND-TRUTH]
+Affected component: router_core_1's eth1 interface -- the
+  router_core_1<->router_core_3 backbone link (172.16.0.2/31, area 0)
+Mechanism: the core is a triangle (core1-core2, core1-core3, core2-core3).
+  router_core_1's eth1 (172.16.0.2/31, the direct link to router_core_3) is
+  administratively DOWN, so the adjacency to neighbor 172.16.0.3 dropped
+  immediately. OSPF reconverges around the failure: pod-1 traffic to the
+  server farm now flows router_core_1 -> router_core_2 -> router_core_3, so
+  end-to-end connectivity is preserved and users see nothing. The observable
+  fault is the lost adjacency and the down interface -- the backbone has
+  lost its redundancy, not its reachability. Note the asymmetry evidence:
+  router_core_3's own eth0 still shows UP (only router_core_1's side of the
+  link was taken down), which localizes the failure to router_core_1's end.
+Localization: router_core_1 eth1 (the 172.16.0.2/31 link to router_core_3)
+Root cause: backbone link router_core_1<->router_core_3 down
+  (router_core_1's eth1 administratively down)
+Fix: `ip link set eth1 up` on router_core_1
+
+[FIX]
+`ip link set eth1 up` on router_core_1
+
+[DIAGNOSTIC-PROCESS]
+1. Scope the symptom: users are unaffected but the NOC alarm is real --
+   verify end-to-end paths first (host_1_1_1_1 -> 10.200.0.x works), then
+   focus on the control plane.
+2. Check neighbor state on the cores: router_core_1 no longer lists neighbor
+   172.16.0.3; router_core_2 still has Full adjacencies to both other cores
+   -- only the core1<->core3 adjacency is gone.
+3. Layer 1/2 next: `ip -br link` on router_core_1 shows eth1 DOWN, while
+   router_core_3's eth0 (the far side of the same 172.16.0.2/31 link) shows
+   UP -- the failure is on router_core_1's side of the link.
+4. Confirm the reroute: traceroute/routing tables show pod-1 -> farm traffic
+   now transits router_core_2, matching the "no user impact" report --
+   redundancy, not reachability, was lost.
+5. Localize to router_core_1 eth1 (the 172.16.0.2/31 backbone link): rule
+   out an ospfd crash (daemon running, other adjacencies Full) and any
+   config change (running config unchanged).
+
+[SCORING-AXES]
+assert-identifies: router_core_1
+must-identify-affected-link: router_core_1<->router_core_3 backbone link (172.16.0.2/31)
+must-identify-component: interface eth1 down on router_core_1 (link-layer failure, not a daemon or config fault)
+bonus-notes-reroute: explains that OSPF rerouted pod-1 traffic via router_core_2, so only redundancy was lost and users see no outage
+# These axes score the outcome metric only; fix and reasoning are judged separately.
+
+[NIKA-LABEL]
+nika_label: link_down
+nika_category: LINK_FAILURE
+in_taxonomy: true

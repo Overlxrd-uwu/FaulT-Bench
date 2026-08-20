@@ -1,0 +1,72 @@
+==================================================
+Scenario: simple-bgp-router2-iptables-icmp-drop
+Topology: simple_bgp
+Fault family: ACL drops transit ICMP
+==================================================
+
+[PROMPT-TO-AGENT]
+After an overnight maintenance window, pc1 (195.11.14.2) reports
+pings to pc2 (200.1.1.2) are 100% lost, and pc2 reports the same
+toward pc1. Yet monitoring shows the router1<->router2 eBGP
+session Established with prefixes exchanged, and pc1 can still
+ping BOTH of router2's addresses (193.10.11.2 and 200.1.1.1).
+Identify what is dropping the traffic.
+
+[INJECTION]
+device: router2
+action: add an iptables FORWARD rule dropping all transit ICMP
+cmd: iptables -A FORWARD -p icmp -j DROP
+
+[POST-INJECT-CHECK]
+router2   iptables -S FORWARD | grep -c icmp  => expect 1
+pc1       ping -W2 -c2 200.1.1.2             => expect loss>0
+pc1       ping -W2 -c2 193.10.11.2           => expect 0% loss
+
+[GROUND-TRUTH]
+Affected component: router2 iptables FORWARD chain
+Mechanism: a DROP rule for protocol icmp sits in router2's FORWARD
+  chain, so any ICMP packet router2 must FORWARD (pc1<->pc2 transit
+  in either direction) is discarded at the firewall layer. Traffic
+  addressed TO router2 itself traverses INPUT, not FORWARD, which
+  is why pc1 can still ping 193.10.11.2 and 200.1.1.1. The BGP
+  session is TCP, not ICMP, so it stays Established and all
+  prefixes remain exchanged -- routing is completely healthy; the
+  drop is purely at the packet-filter layer.
+Localization: router2
+Root cause: extraneous iptables FORWARD DROP rule for ICMP on
+  router2
+Fix: `iptables -D FORWARD -p icmp -j DROP` on router2
+
+[FIX]
+Remove the DROP rule on router2 -- `iptables -D FORWARD -p icmp -j DROP`.
+Transit pings between pc1 and pc2 succeed again immediately; no routing or
+BGP change is needed.
+
+[DIAGNOSTIC-PROCESS]
+1. Scope the selective failure: pc1<->pc2 pings fail in both directions, yet
+   pc1 reaches both of router2's own addresses and the eBGP session is
+   Established with prefixes exchanged. Destination-dependent loss with a
+   healthy control plane points to a filter, not routing.
+2. Verify routing: router1 has 200.1.1.0/24 via BGP and router2 has
+   195.11.14.0/24 -- the paths exist.
+3. Inspect the firewall on the transit device: `iptables -S FORWARD` (or
+   `iptables -nL FORWARD` / `nft list ruleset` -- same rule under the
+   iptables-nft backend) on router2 shows a DROP rule for protocol icmp in the
+   FORWARD chain.
+4. Confirm the mechanism: forwarded ICMP is dropped, while locally-terminated
+   traffic (INPUT) and the TCP-based BGP session are untouched.
+5. Localize to router2's FORWARD rule: rule out link failures, daemon crashes
+   and config changes -- all are healthy.
+
+[SCORING-AXES]
+assert-identifies: router2
+must-identify-device: router2
+must-identify-component: iptables FORWARD rule dropping ICMP / firewall filter
+must-recognize-filter-pattern: recognizes that routing and BGP are healthy (session Established, router2's own addresses reachable) and only transit ICMP is dropped
+bonus-cites-rule: shows the DROP rule via iptables -S/-nL FORWARD (or nft list ruleset)
+
+[NIKA-LABEL]
+nika_label: icmp_acl_block
+nika_category: MISCONFIGURATION
+in_taxonomy: true
+note: implemented as an iptables FORWARD drop on the transit router (NIKA's variant installs the same icmp drop via nftables)

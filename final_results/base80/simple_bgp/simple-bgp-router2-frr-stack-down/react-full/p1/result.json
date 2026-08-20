@@ -1,0 +1,188 @@
+{
+  "scenario": {
+    "scenario_id": "simple-bgp-router2-frr-stack-down",
+    "topology": "simple_bgp",
+    "fault_family": "routing stack crash (zebra + bgpd)",
+    "prompt_to_agent": "pc2 (200.1.1.2) lost all connectivity to the partner network, and\nthe partner reports pc1 (195.11.14.2) cannot reach pc2 either.\nOur NOC tried to inspect router2 but vtysh commands on it error\nout entirely -- they cannot even display the routing table. pc2\ncan still ping router2's address 200.1.1.1. Find what broke.",
+    "injection": {
+      "device": "router2",
+      "action": "kill the entire FRR stack (watchdog, zebra and bgpd) on router2",
+      "command": "pkill -9 watchfrr; pkill -9 zebra; pkill -9 bgpd",
+      "note": null
+    },
+    "pre_check": [],
+    "post_inject_check": [
+      {
+        "device": "router2",
+        "command": "pgrep zebra",
+        "expect": "empty"
+      },
+      {
+        "device": "router2",
+        "command": "pgrep bgpd",
+        "expect": "empty"
+      },
+      {
+        "device": "pc1",
+        "command": "ping -W2 -c2 200.1.1.2",
+        "expect": "loss>0"
+      }
+    ],
+    "ground_truth": "Affected component: router2 FRR routing stack (zebra + bgpd,\n  watchfrr included)\nMechanism: the whole FRR service on router2 is dead -- not just\n  one daemon. With bgpd gone the eBGP session's TCP connection\n  closes, so router1 immediately drops the session and withdraws\n  200.1.1.0/24; pc1's traffic toward pc2 then dies at router1 with\n  no route, and pc2's replies/pings toward 195.11.14.0/24 have no\n  usable end-to-end path either. With zebra ALSO dead, vtysh has\n  no daemon left to attach to, so it fails outright -- unlike a\n  bgpd-only crash, where vtysh stays responsive via zebra. (A\n  stale kernel route to 195.11.14.0/24 may linger on router2,\n  since zebra died without cleaning up; end-to-end traffic still\n  fails because router1 has withdrawn 200.1.1.0/24.) router2's\n  kernel itself is alive: it still answers on its connected\n  addresses, e.g. pc2 -> 200.1.1.1.\nLocalization: router2\nRoot cause: FRR routing stack (zebra and bgpd) not running on\n  router2\nFix: restart FRR on router2 (`service frr restart`)",
+    "fix_spec": "Restart the FRR service on router2 (`service frr restart`). This brings back\nwatchfrr, zebra and bgpd from /etc/frr/frr.conf; the eBGP session to router1\nre-establishes, the inter-AS prefixes are re-exchanged, and pc1 reaches pc2\nnormally. router1 needs no change.",
+    "scoring_axes": [
+      "assert-identifies: router2",
+      "must-identify-device: router2",
+      "must-identify-component: FRR routing stack (zebra and bgpd) not running on router2",
+      "must-distinguish-scope: recognizes the whole FRR service is down (vtysh unreachable), not just a single daemon, a link failure, or a config change",
+      "bonus-notes-kernel-alive: notes router2 still answers on its connected addresses (kernel/data plane alive); only the routing control plane died"
+    ],
+    "source_path": "dataset/nika_bgp_Q/base/simple-bgp-router2-frr-stack-down.txt",
+    "scenario_class": "base",
+    "ticket_style": "standard"
+  },
+  "agent": "react-full",
+  "timestamp": "2026-08-03T01:44:33.223396+00:00",
+  "phases": {
+    "lstart": {
+      "ok": true,
+      "containers": 4,
+      "expected": 4
+    },
+    "settle": {
+      "converge_wait": 90
+    },
+    "injection": {
+      "applied": true,
+      "skipped_reason": null,
+      "rc": 0,
+      "output": ""
+    },
+    "post_inject_check": {
+      "results": [
+        {
+          "line": {
+            "device": "router2",
+            "command": "pgrep zebra",
+            "expect": "empty"
+          },
+          "passed": true,
+          "actual": "",
+          "rationale": "output empty"
+        },
+        {
+          "line": {
+            "device": "router2",
+            "command": "pgrep bgpd",
+            "expect": "empty"
+          },
+          "passed": true,
+          "actual": "",
+          "rationale": "output empty"
+        },
+        {
+          "line": {
+            "device": "pc1",
+            "command": "ping -W2 -c2 200.1.1.2",
+            "expect": "loss>0"
+          },
+          "passed": true,
+          "actual": "PING 200.1.1.2 (200.1.1.2) 56(84) bytes of data.\nFrom 195.11.14.1 icmp_seq=1 Destination Net Unreachable\n\n--- 200.1.1.2 ping statistics ---\n2 packets transmitted, 0 received, +1 errors, 100% packet loss, time 1067ms",
+          "rationale": "loss=100%"
+        }
+      ],
+      "wait_seconds": 0
+    },
+    "agent": {
+      "diagnosis_text": "Affected component: FRRouting (FRR) routing stack on router2, specifically zebra and bgpd. The management CLI (vtysh) depends on these daemons and fails when they are down.\n\nMechanism: With bgpd on router2 down, the eBGP session on router1 has no peer and sits in Active state, so router1 withdraws 200.1.1.0/24. As a result, packets from pc1 (195.11.14.0/24) toward pc2 (200.1.1.0/24) are immediately unroutable at router1, producing \u201cDestination Net Unreachable\u201d from 195.11.14.1. pc2 can still ping its default gateway (router2: 200.1.1.1), confirming local L2/L3 are fine.\n\nLocalization and evidence:\n- router2: systemctl shows frr inactive (dead); vtysh fails (exit 1); frr_show_ip_route says \u201czebra is not running\u201d; frr_get_bgp_conf says \u201cbgpd is not running.\u201d Process list lacks zebra/bgpd (only mgmtd/staticd present).\n- router1: BGP summary shows neighbor 193.10.11.2 in Active, PfxRcd 0; routing table has no 200.1.1.0/24.\n- pc1\u2192pc2 ping returns \u201cFrom 195.11.14.1 Destination Net Unreachable,\u201d proving router1 lacks a route to 200.1.1.0/24.\n\nRoot cause: FRR daemons (zebra and bgpd) stopped/crashed on router2, bringing down the BGP peering.\n\nCorrective fix: Restart FRR on router2 and ensure watchfrr manages zebra and bgpd. Verify /etc/frr/daemons has zebra=yes and bgpd=yes and /etc/frr/frr.conf contains the BGP config. After starting, confirm BGP establishes on router1 (Established state) and routes 200.1.1.0/24 and 195.11.14.0/24 are exchanged, restoring pc1\u2194pc2 connectivity.",
+      "is_anomaly": true,
+      "faulty_devices": [
+        "router2"
+      ],
+      "parsed_ok": true,
+      "in_tokens": 13469,
+      "cache_read_tokens": 13056,
+      "cache_write_tokens": 0,
+      "out_tokens": 8473,
+      "cost_usd": 0.10319825,
+      "tool_calls": 25,
+      "hit_max_turns": false,
+      "error": null
+    },
+    "score": {
+      "must_passed": 4,
+      "must_total": 4,
+      "bonus_passed": 1,
+      "bonus_total": 1,
+      "outcome_score": 1.0,
+      "fix_score": 1.0,
+      "reasoning_score": 0.9666666666666667,
+      "reasoning_dims": {
+        "grounding": 1.0,
+        "causality": 1.0,
+        "coverage": 0.9
+      },
+      "final_score": 1.0,
+      "per_axis": [
+        {
+          "axis": "assert-identifies: router2",
+          "kind": "assert",
+          "score": 1.0,
+          "rationale": "culprit 'router2' named (good)"
+        },
+        {
+          "axis": "must-identify-device: router2",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The agent explicitly identifies router2 as the affected device (FRR/zebra/bgpd on router2)."
+        },
+        {
+          "axis": "must-identify-component: FRR routing stack (zebra and bgpd) not running on router2",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "Agent explicitly identifies the FRR routing stack on router2 (zebra and bgpd) as stopped/crashed, matching the required component identification."
+        },
+        {
+          "axis": "must-distinguish-scope: recognizes the whole FRR service is down (vtysh unreachable), not just a single daemon, a link failure, or a config change",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "Agent explicitly identifies the entire FRR service as inactive on router2 (systemctl shows frr dead, vtysh fails, zebra and bgpd absent), distinguishing it from a single-daemon, link, or config issue."
+        },
+        {
+          "axis": "bonus-notes-kernel-alive: notes router2 still answers on its connected addresses (kernel/data plane alive); only the routing control plane died",
+          "kind": "bonus",
+          "score": 1.0,
+          "rationale": "Agent explicitly notes pc2 can still reach router2's interface (200.1.1.1), confirming the kernel/data plane is alive while the FRR control plane is down."
+        },
+        {
+          "axis": "[FIX]",
+          "kind": "fix",
+          "score": 1.0,
+          "rationale": "Proposes restarting FRR on router2 and ensuring zebra/bgpd are enabled under watchfrr, which matches the expected fix and will restore the BGP session and routes."
+        },
+        {
+          "axis": "reason:grounding",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "Investigation log repeatedly shows FRR daemons (zebra, bgpd) absent on router2, vtysh failing, router1 BGP neighbor in Active and pc1\u2192pc2 ICMP unreachable from router1; the writeup's diagnosis follows logically and ties to the observed outputs. Minor unexplained artifact (router1 systemctl showing inactive) doesn't undermine the core evidence."
+        },
+        {
+          "axis": "reason:causality",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "Investigation log repeatedly shows FRR daemons (zebra, bgpd) absent on router2, vtysh failing, router1 BGP neighbor in Active and pc1\u2192pc2 ICMP unreachable from router1; the writeup's diagnosis follows logically and ties to the observed outputs. Minor unexplained artifact (router1 systemctl showing inactive) doesn't undermine the core evidence."
+        },
+        {
+          "axis": "reason:coverage",
+          "kind": "reason-dim",
+          "score": 0.9,
+          "rationale": "Investigation log repeatedly shows FRR daemons (zebra, bgpd) absent on router2, vtysh failing, router1 BGP neighbor in Active and pc1\u2192pc2 ICMP unreachable from router1; the writeup's diagnosis follows logically and ties to the observed outputs. Minor unexplained artifact (router1 systemctl showing inactive) doesn't undermine the core evidence."
+        }
+      ],
+      "judge_model": "gpt-5-mini",
+      "reasoning_mode": "trace",
+      "error": null
+    }
+  },
+  "agent_input_prompt": "# Topology overview (devices + L2 connectivity)\nTopology: simple_bgp\n\nDevices:\n  Routers (FRR): router1, router2\n  Hosts: pc1, pc2\n\nLinks (device:iface <-> device:iface):\n  router1:eth0 <-> router2:eth0\n  router1:eth1 <-> pc1:eth0\n  router2:eth1 <-> pc2:eth0\n\n# Symptom (user report)\npc2 (200.1.1.2) lost all connectivity to the partner network, and\nthe partner reports pc1 (195.11.14.2) cannot reach pc2 either.\nOur NOC tried to inspect router2 but vtysh commands on it error\nout entirely -- they cannot even display the routing table. pc2\ncan still ping router2's address 200.1.1.1. Find what broke."
+}

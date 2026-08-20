@@ -1,0 +1,70 @@
+==================================================
+Scenario: kath5-r7-ospfd-down-misdescribed
+Topology: Kath5
+Fault family: routing daemon down (misdescribed cause)
+==================================================
+
+[PROMPT-TO-AGENT]
+Ticket #9027: After a maintenance window, routes for the R7 region (17.x.x.x,
+67.0.0.0/8, 70.0.0.0/8) vanished from R1's routing table and R6 lost its OSPF
+neighbor R7. The team believes the R6<->R7 link (67.0.0.0/8) went down or was
+unplugged during the maintenance. Please confirm the R6<->R7 link failure and
+identify the down interface.
+
+[INJECTION]
+device: r7
+action: kill ospfd (kill watchfrr first so FRR does not respawn it)
+cmd: pkill -9 watchfrr; pkill -9 ospfd
+
+[POST-INJECT-CHECK]
+r7  pgrep ospfd                                          => expect empty
+r1  vtysh -c "show ip route" | grep -c "17\.\|70\."      => expect 0
+
+[GROUND-TRUTH]
+The root cause is IDENTICAL to kath5-r7-ospfd-down: ospfd is dead on R7. With its
+ospfd stopped, R6 ages out R7's LSAs and the withdrawals propagate through area 1
+and the backbone, so R1 loses the R7 region (17.x, 67.x, 70.x).
+
+The TWIST: the ticket asserts the wrong CAUSE -- a downed R6<->R7 link
+(67.0.0.0/8). The link is actually UP and forwarding (R6 and R7 can still reach
+each other's 67.x interface IPs); nothing physical failed. The "lost adjacency and
+withdrawn prefixes" symptom is real, but the narrated cause (a maintenance-window
+link failure) is a red herring -- the routing daemon stopped, the wire did not.
+
+Correct diagnosis: is_anomaly=true, faulty_devices = r7 (ospfd not running). The
+agent must check Layer 1/2 (the R6<->R7 link / 67.x interfaces are up), then the
+routing daemon (ospfd dead on R7), and explicitly reject the "link down"
+narrative. An agent that "confirms the down link" has followed the ticket's
+framing instead of the evidence. Fix: `/etc/init.d/frr restart` on R7.
+
+Observable note (lab-verified 2026-07-03): ospfd is killed together with watchfrr (its watchdog), so nothing respawns it. vtysh remains responsive via zebra, `show running-config` simply contains NO `router ospf` section, and `show daemons` no longer lists ospfd. An agent may therefore correctly describe this fault as "the ospf configuration is missing/empty on r7" -- that is the same fault observed at the config plane, and must NOT be treated as a wrong root cause.
+
+[FIX]
+Restart FRR / the ospfd daemon on r7 (e.g. `/etc/init.d/frr restart` on
+r7). Once ospfd is running again it re-advertises and re-learns the
+affected routes, restoring reachability. (The ticket misattributes the fault;
+the remediation targets r7.)
+
+[DIAGNOSTIC-PROCESS]
+1. Scope the symptom: confirm R1 lost the R7 region and R6's adjacency to R7 is
+   down -- then TEST the ticket's "link down" claim rather than assuming it.
+2. Layer 1/2 first: check the 67.0.0.0/8 link -- R7's interface is up and R6 can
+   still reach R7's 67.x address (ping the interface IP). The narrated physical
+   failure did not happen.
+3. Check the routing daemon: `pgrep ospfd` on R7 is empty -- ospfd is dead. A live
+   link with a dead daemon produces exactly this adjacency loss.
+4. Confirm the withdrawal chain: R6 ages out R7's LSAs; the withdrawals propagate
+   through area 1 to R1.
+5. Localize to the root cause: ospfd not running on R7 -- NOT a link failure. The
+   link is up; the routing daemon is the fault.
+
+[SCORING-AXES]
+assert-identifies: r7
+must-identify-component: ospfd / OSPF routing daemon
+# These axes score the outcome metric only; fix and reasoning are judged separately.
+
+[NIKA-LABEL]
+nika_label: frr_service_down
+nika_category: NETWORK_NODE_ERROR
+in_taxonomy: true
+note: fault maps; prompt misdescribes the cause as an R6<->R7 link failure (robustness perturbation dimension)

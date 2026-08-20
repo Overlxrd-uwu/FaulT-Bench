@@ -1,0 +1,73 @@
+==================================================
+Scenario: kath3-router0-ripd-down-misdescribed
+Topology: Kath3
+Fault family: routing daemon down (misdescribed cause)
+==================================================
+
+[PROMPT-TO-AGENT]
+Ticket #7026: After last night's maintenance window, Location A (PC4/PC5,
+Laptop0) lost reachability to Location C and the rest of the network, while
+internal Location A traffic still works. The team believes the Serial uplink from
+router0 to router1 (the 10.16.1.0/24 link) went down or was unplugged during the
+maintenance. Please confirm the router0->router1 link failure and identify the
+down interface.
+
+[INJECTION]
+device: router0
+action: kill ripd (kill watchfrr first so FRR does not respawn it)
+cmd: pkill -9 watchfrr; pkill -9 ripd
+
+[POST-INJECT-CHECK]
+router0  pgrep ripd                                       => expect empty
+router0  ip -br link show eth2 | grep -c UP               => expect 1
+pc4      ping -W2 -c2 192.168.100.1                        => expect loss>0
+
+[GROUND-TRUTH]
+The root cause is IDENTICAL to kath3-router0-ripd-down: ripd is dead on router0.
+With the RIP daemon stopped, router0 no longer advertises Location A's prefixes or
+learns the rest of the RIB, so Location A is a routing island while intra-VLAN
+traffic still works.
+
+The TWIST: the ticket asserts the wrong CAUSE -- a downed router0->router1 serial
+link. The link is actually UP: router0's eth2 (Serial2/0, 10.16.1.1/24) is up and
+forwarding; nothing physical failed. The "lost upstream reachability" symptom is
+real, but the narrated cause (a maintenance-window link failure) is a red herring
+-- the routing protocol silently stopped, the wire did not.
+
+Correct diagnosis: is_anomaly=true, faulty_devices = router0 (ripd not running).
+The agent must check Layer 1/2 (the uplink is UP), then the routing daemon (ripd
+dead), and explicitly reject the "link down" narrative. An agent that "confirms
+the down uplink" has followed the ticket's framing instead of the evidence. Fix: restart FRR AND re-apply the `router rip` configuration on router0 (see [FIX] -- a bare restart alone does not restore the vtysh-applied config).
+
+Observable note (lab-verified 2026-07-03): ripd is killed together with watchfrr (its watchdog), so nothing respawns it. vtysh remains responsive via zebra, `show running-config` simply contains NO `router rip` section, and `show daemons` no longer lists ripd. An agent may therefore correctly describe this fault as "the rip configuration is missing/empty on router0" -- that is the same fault observed at the config plane, and must NOT be treated as a wrong root cause.
+
+[FIX]
+Restart FRR / the ripd daemon on router0 (e.g. `/etc/init.d/frr restart` on
+router0). Once ripd is running again it re-advertises and re-learns the
+affected routes, restoring reachability. (The ticket misattributes the fault;
+the remediation targets router0.)
+
+NOTE (lab-verified 2026-07-03): this lab applies FRR config via vtysh at boot (there is no /etc/frr/frr.conf), so `/etc/init.d/frr restart` alone brings ripd back CONFIG-LESS and the rip service stays broken. The complete remediation is to (re)start FRR/ripd AND re-apply the `router rip` configuration (network statements) on router0. A proposal that restores the missing rip configuration is a correct fix; a bare daemon restart without restoring the config is incomplete.
+
+[DIAGNOSTIC-PROCESS]
+1. Scope the symptom: confirm Location A lost everything upstream while intra-VLAN
+   works -- then TEST the ticket's "link down" claim rather than assuming it.
+2. Layer 1/2 first: check router0's uplink -- eth2 (10.16.1.1/24, the serial to
+   router1) is UP and forwarding. The narrated physical failure did not happen.
+3. Check the routing protocol: `pgrep ripd` on router0 is empty -- ripd is dead.
+   A live link with a dead routing daemon produces exactly this symptom.
+4. Confirm propagation: from router1, Location A's prefixes (172.16.x) have aged
+   out of RIP because router0 stopped advertising.
+5. Localize to the root cause: ripd not running on router0 -- NOT a link failure.
+   The uplink is up; the routing daemon is the fault.
+
+[SCORING-AXES]
+assert-identifies: router0
+must-identify-component: ripd / RIP routing daemon (equivalently: FRR service failure with the RIP config section missing/empty -- the config-plane description in [GROUND-TRUTH] is the same fault)
+# These axes score the outcome metric only; fix and reasoning are judged separately.
+
+[NIKA-LABEL]
+nika_label: frr_service_down
+nika_category: NETWORK_NODE_ERROR
+in_taxonomy: true
+note: fault maps; prompt misdescribes the cause as a router0->router1 link failure (robustness perturbation dimension)

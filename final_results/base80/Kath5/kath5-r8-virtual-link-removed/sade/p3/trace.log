@@ -1,0 +1,67 @@
+[AGENT] sade starts on lab=Kath5
+[TOOL] ToolSearch({'query': 'select:mcp__kathara_base_mcp_server__get_reachability'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_base_mcp_server__get_reachability'}]
+[TOOL] mcp__kathara_base_mcp_server__get_reachability({})
+[RESULT] {"result":"{\"hosts\":{\"pc0\":\"20.1.1.10\",\"pc12\":\"120.1.1.10\"},\"results\":[{\"src\":\"pc0\",\"dst\":\"pc12\",\"dst_ip\":\"120.1.1.10\",\"tx\":2,\"rx\":2,\"loss_percent\":0.0,\"time_ms\":1071.0,\"rtt_avg_ms\":0.692,\"rtt_min_ms\":0.641,\"rtt_max_ms\":0.744,\"rtt_mdev_ms\":0.051,\"status\":\"ok\"},{\"src\":\"pc12\",\"dst\":\"pc0\",\"dst_ip\":\"20.1.1.10\",\"tx\":2,\"rx\":2,\"loss_percent\":0
+[TEXT] Phase 1 shows pc0↔pc12 reachability is intact (0% loss). However, the user's report is about control-plane OSPF routes disappearing from r1's RIB — this is a real routing anomaly. The symptom maps clearly to the `ospf-fault-skill` family. Let me enter it.
+[TOOL] Skill({'skill': 'ospf-fault-skill'})
+[RESULT] Launching skill: ospf-fault-skill
+[TEXT] The skill calls for `ospf_snapshot.py` as the one-pass triage. Let me run it now.
+[TOOL] ToolSearch({'query': 'select:mcp__helper_server__run_helper'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__helper_server__run_helper'}]
+[TOOL] mcp__helper_server__run_helper({'script_name': 'ospf_snapshot'})
+[RESULT] {"result":"=== OSPF SNAPSHOT ===\nLab: Kath5\nRouters scanned: 13\nFlags:\n  - r12: no OSPF network statements\n  - r12: non-Full neighbors present: {'is': 1}\n  - r13: FRR control sockets missing (ospfd_vty) — daemon likely down\n  - r13: no OSPF network statements\n  - r13: zero OSPF neighbors\n  - r4: OSPF interface VLINK0 (45.1.1.1/8) is running in area 0.0.0.0 but the matching network stateme
+[TEXT] The snapshot output was cut off right at r8's detail section. I have strong leads from the flags already. Let me pull r8's running config directly to confirm.
+[TOOL] ToolSearch({'query': 'select:mcp__kathara_frr_mcp_server__frr_show_running_config,mcp__kathara_base_mcp_server__exec_shell'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_frr_mcp_server__frr_show_running_config'}, {'type': 'tool_reference', 'tool_name': 'mcp__kathara_base_mcp_server__exec_shell'}]
+[TEXT] Now let me pull r8's and r4's running configs in parallel — I want to compare their virtual-link declarations side-by-side.
+[TOOL] mcp__kathara_frr_mcp_server__frr_show_running_config({'router_name': 'r8'})
+[TOOL] mcp__kathara_frr_mcp_server__frr_show_running_config({'router_name': 'r4'})
+[RESULT] {"result":"Building configuration...\n\nCurrent configuration:\n!\nfrr version 9.1.3\nfrr defaults traditional\nhostname r8\ndomainname localdomain\nlog file /var/log/frr/frr.log\nno ipv6 forwarding\nno service integrated-vtysh-config\n!\npassword zebra\nenable password zebra\n!\nrouter ospf\n network 18.0.0.0/8 area 2\n network 58.0.0.0/8 area 1\n network 80.0.0.0/8 area 2\nexit\n!\nend"}
+[RESULT] {"result":"Building configuration...\n\nCurrent configuration:\n!\nfrr version 9.1.3\nfrr defaults traditional\nhostname r4\ndomainname localdomain\nlog file /var/log/frr/frr.log\nno ipv6 forwarding\nno service integrated-vtysh-config\n!\npassword zebra\nenable password zebra\n!\nrouter ospf\n network 14.0.0.0/8 area 1\n network 34.0.0.0/8 area 0\n network 40.0.0.0/8 area 1\n network 45.0.0.0/8 ar
+[TEXT] The smoking gun is visible. Let me confirm r4's OSPF router-id (which r8 must reference in the matching virtual-link statement) before writing the final diagnosis.
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'r4', 'command': "vtysh -c 'show ip ospf' | grep -E 'Router ID|router-id'"})
+[RESULT] {"result":"OSPF Routing Process, Router ID: 14.1.4.1"}
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'r8', 'command': "vtysh -c 'show ip ospf' | grep -E 'Router ID|router-id'"})
+[RESULT] {"result":"OSPF Routing Process, Router ID: 18.1.4.1"}
+[TEXT] All the evidence I need is now in hand. The picture is unambiguous:
+
+| Device | Virtual-link config | Router-id |
+|---|---|---|
+| r4 | `area 1 virtual-link 18.1.4.1` ✅ | 14.1.4.1 |
+| r8 | *(missing)* ❌ | 18.1.4.1 |
+
+r4 correctly names r8 (18.1.4.1) as the remote endpoint. r8 has **no matching `area 1 virtual-link 14.1.4.1` statement** — it was stripped during the maintenance window. The virtual link therefore cannot form an adjacency on either side (confirmed by r4's `VLINK0: nbr=0, adj=0` and r8's `area 0.0.0.0: adj=0, iface=0`).
+
+=== DIAGNOSIS ===
+is_anomaly: true
+faulty_devices: r8
+diagnosis_text:
+**Affected component:** OSPF virtual-link configuration inside r8's `router ospf` stanza.
+
+**Mechanism:** Area 2 (18.0.0.0/8, 80.0.0.0/8) has no direct physical connection to the OSPF backbone
+[FINAL] stop=end_turn tool_calls=10
+[SUBMITTED] parsed_ok=True is_anomaly=True faulty_devices=['r8']
+[FINAL-TEXT] All the evidence I need is now in hand. The picture is unambiguous:
+
+| Device | Virtual-link config | Router-id |
+|---|---|---|
+| r4 | `area 1 virtual-link 18.1.4.1` ✅ | 14.1.4.1 |
+| r8 | *(missing)* ❌ | 18.1.4.1 |
+
+r4 correctly names r8 (18.1.4.1) as the remote endpoint. r8 has **no matching `area 1 virtual-link 14.1.4.1` statement** — it was stripped during the maintenance window. The virtual link therefore cannot form an adjacency on either side (confirmed by r4's `VLINK0: nbr=0, adj=0` and r8's `area 0.0.0.0: adj=0, iface=0`).
+
+=== DIAGNOSIS ===
+is_anomaly: true
+faulty_devices: r8
+diagnosis_text:
+**Affected component:** OSPF virtual-link configuration inside r8's `router ospf` stanza.
+
+**Mechanism:** Area 2 (18.0.0.0/8, 80.0.0.0/8) has no direct physical connection to the OSPF backbone (Area 0). The topology design bridges this gap with a virtual link that runs through transit Area 1, pairing r4 (an Area 0/Area 1 ABR, router-id 14.1.4.1) with r8 (the Area 1/Area 2 ABR, router-id 18.1.4.1). Without a functioning virtual link, r8 is not an Area 0 ABR and cannot inject Area 2 inter-area LSAs into the backbone. r1, which participates only in Area 0 (and Area 3 via another segment), never receives those type-3 LSAs and therefore has no routes for the Area 2 prefixes.
+
+**Localization:** r8 exclusively. r4's side of the virtual link (`area 1 virtual-link 18.1.4.1`) is intact and correct. r8's `router ospf` block contains only three `network` statements and is completely missing the reciprocal `area 1 virtual-link 14.1.4.1` line — confirmed missing from the live running config. The ospf_snapshot independently flags this: r8 shows `area 0.0.0.0 (adj=0, iface=0)`, Area 2 as an orphaned active area with 0 full adjacencies, and an area-set divergence where Area 2 is visible on no peer.
+
+**Root cause:** r8's `area 1 virtual-link 14.1.4.1` statement was removed during the recent maintenance, breaking the virtual-link adjacency and severing Area 2 from the OSPF backbone.
+
+**Fix:** Under `router ospf` on r8, restore the line `area 1 virtual-link 14.1.4.1`. Once the adjacency forms, r8 becomes a backbone ABR again and Area 2 routes will propagate to r1 via normal inter-area LSA flooding.
+=== END ===

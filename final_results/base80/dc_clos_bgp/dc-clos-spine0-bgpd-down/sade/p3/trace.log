@@ -1,0 +1,59 @@
+[AGENT] sade starts on lab=dc_clos_bgp
+[TOOL] ToolSearch({'query': 'select:mcp__kathara_base_mcp_server__get_reachability'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_base_mcp_server__get_reachability'}]
+[TOOL] mcp__kathara_base_mcp_server__get_reachability({})
+[RESULT] {"result":"{\"hosts\":{\"pc_0_0\":\"10.0.0.2\",\"pc_0_1\":\"10.0.1.2\"},\"results\":[{\"src\":\"pc_0_0\",\"dst\":\"pc_0_1\",\"dst_ip\":\"10.0.1.2\",\"tx\":2,\"rx\":2,\"loss_percent\":0.0,\"time_ms\":1088.0,\"rtt_avg_ms\":0.672,\"rtt_min_ms\":0.534,\"rtt_max_ms\":0.811,\"rtt_mdev_ms\":0.138,\"status\":\"ok\"},{\"src\":\"pc_0_1\",\"dst\":\"pc_0_0\",\"dst_ip\":\"10.0.0.2\",\"tx\":2,\"rx\":2,\"loss_pe
+[TEXT] **Phase 1 complete.** Data-plane reachability between pc_0_0 and pc_0_1 shows 0% loss — traffic is surviving via the spine_router_0_1 path. However, the user reports **BGP sessions toward spine_router_0_0 dropped simultaneously** on three peers (super_spine_router_0, leaf_router_0_0, leaf_router_0_1). That is a real BGP control-plane symptom.
+
+**Phase 2 → Phase 3.** Active lead: BGP sessions to spine_router_0_0 are down on all three of its peers simultaneously. This maps to the BGP fault family.
+[TOOL] Skill({'skill': 'bgp-fault-skill'})
+[RESULT] Launching skill: bgp-fault-skill
+[TEXT] Good. Now let me run the BGP snapshot helper across the fabric.
+[TOOL] ToolSearch({'query': 'select:mcp__helper_server__run_helper'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__helper_server__run_helper'}]
+[TOOL] mcp__helper_server__run_helper({'script_name': 'bgp_snapshot'})
+[RESULT] {"result":"=== BGP SNAPSHOT ===\nLab: dc_clos_bgp\nRouters scanned: 5\nFlags:\n  - leaf_router_0_0: non-established BGP neighbors present: {'Active': 1, 'Established': 1}\n  - leaf_router_0_1: non-established BGP neighbors present: {'Active': 1, 'Established': 1}\n  - spine_router_0_0: missing FRR process(es): watchfrr, bgpd\n  - spine_router_0_0: zero BGP neighbors in summary\n  - super_spine_rou
+[TEXT] The snapshot is conclusive. Let me do one targeted confirmation on spine_router_0_0 to lock in the root cause.
+[TOOL] ToolSearch({'query': 'select:mcp__kathara_base_mcp_server__exec_shell'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_base_mcp_server__exec_shell'}]
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'spine_router_0_0', 'command': 'ps aux | grep -E \'bgpd|watchfrr|zebra\' | grep -v grep; echo "---"; pgrep -a bgpd || echo "bgpd NOT RUNNING"; pgrep -a watchfrr || echo "watchfrr NOT RUNNING"'})
+[RESULT] {"result":"frr         51  0.0  0.1 597124  9288 ?        Ssl  19:00   0:00 /usr/lib/frr/zebra -d -F traditional -s 90000000 --daemon -A 127.0.0.1\n\"---\"\n\"bgpd NOT RUNNING\"\n\"watchfrr NOT RUNNING\""}
+[TEXT] The evidence is definitive. On `spine_router_0_0`:
+- **`bgpd` — NOT RUNNING** (process absent)
+- **`watchfrr` — NOT RUNNING** (watchdog that would restart it is also dead)
+- Only `zebra` is alive (kernel-route forwarding plane, no BGP control plane)
+
+This single fact explains every reported alarm: the moment `bgpd` stopped, all three TCP-based BGP sessions it was holding (toward super_spine_router_0, leaf_router_0_0, leaf_router_0_1) were torn down simultaneously. Data-plane traffic survived because the alternate path through `spine_router_0_1` (whose `bgpd` is fully healthy, all 3 sessions Established) carried the traffic via pre-installed routes.
+
+---
+
+=== DIAGNOSIS ===
+is_anomaly: true
+faulty_devices: spine_router_0_0
+diagnosis_text:
+**Affected component:** The `bgpd` daemon (and its su
+[FINAL] stop=end_turn tool_calls=7
+[SUBMITTED] parsed_ok=True is_anomaly=True faulty_devices=['spine_router_0_0']
+[FINAL-TEXT] The evidence is definitive. On `spine_router_0_0`:
+- **`bgpd` — NOT RUNNING** (process absent)
+- **`watchfrr` — NOT RUNNING** (watchdog that would restart it is also dead)
+- Only `zebra` is alive (kernel-route forwarding plane, no BGP control plane)
+
+This single fact explains every reported alarm: the moment `bgpd` stopped, all three TCP-based BGP sessions it was holding (toward super_spine_router_0, leaf_router_0_0, leaf_router_0_1) were torn down simultaneously. Data-plane traffic survived because the alternate path through `spine_router_0_1` (whose `bgpd` is fully healthy, all 3 sessions Established) carried the traffic via pre-installed routes.
+
+---
+
+=== DIAGNOSIS ===
+is_anomaly: true
+faulty_devices: spine_router_0_0
+diagnosis_text:
+**Affected component:** The `bgpd` daemon (and its supervisor `watchfrr`) on `spine_router_0_0` has stopped. Only `zebra` remains running; the BGP control plane is completely absent on this device.
+
+**Mechanism:** BGP sessions are maintained as long-lived TCP connections kept alive by the BGP daemon. When `bgpd` exits, the OS tears down those TCP connections immediately, sending a TCP FIN/RST to each peer. All three peers — `super_spine_router_0`, `leaf_router_0_0`, and `leaf_router_0_1` — received the session teardown at the same moment (within seconds of each other), which is exactly what the fabric alarm described. The simultaneous multi-peer drop is the hallmark of a daemon crash rather than a link, ASN, or policy fault.
+
+**Localization:** `spine_router_0_0` — confirmed by `ps aux` showing no `bgpd` or `watchfrr` process. The peer routers correctly report their session state as `Active` (attempting to reconnect) while their sessions toward `spine_router_0_1` remain `Established`. Data-plane connectivity between `pc_0_0` and `pc_0_1` survived because `spine_router_0_1` provides a full alternate path and its BGP sessions are intact.
+
+**Root cause:** `bgpd` (and the `watchfrr` supervisor) crashed or was killed on `spine_router_0_0`, removing the device's entire BGP control plane and dropping all three of its BGP peering sessions simultaneously.
+
+**Fix:** Restart FRR on `spine_router_0_0` — `systemctl restart frr` — to bring `watchfrr`, `bgpd`, and the full daemon stack back up. Sessions will re-establish automatically once `bgpd` is running and peers reconnect.
+=== END ===

@@ -1,0 +1,173 @@
+{
+  "scenario": {
+    "scenario_id": "simple-bgp-router2-wrong-remote-as",
+    "topology": "simple_bgp",
+    "fault_family": "BGP wrong remote-as (ASN mismatch)",
+    "prompt_to_agent": "After a configuration change window on router2, pc1 (195.11.14.2)\ncannot reach pc2 (200.1.1.2) and pc2 cannot reach pc1. Both\nrouters are up, and the two ends of the inter-AS link still ping\neach other directly (193.10.11.1 <-> 193.10.11.2), but the eBGP\nsession between router1 and router2 will not come up. Investigate.",
+    "injection": {
+      "device": "router2",
+      "action": "set a wrong remote-as (65001 instead of 1) on router2's neighbor statement for router1",
+      "command": "vtysh -c \"configure terminal\" \\\n        -c \"router bgp 2\" \\\n        -c \"no neighbor 193.10.11.1\" \\\n        -c \"neighbor 193.10.11.1 remote-as 65001\" \\\n        -c \"exit\" -c \"exit\"",
+      "note": null
+    },
+    "pre_check": [],
+    "post_inject_check": [
+      {
+        "device": "router2",
+        "command": "vtysh -c \"show running-config\" | grep -c \"remote-as 65001\"",
+        "expect": "1"
+      },
+      {
+        "device": "pc1",
+        "command": "ping -W2 -c2 200.1.1.2",
+        "expect": "loss>0"
+      }
+    ],
+    "ground_truth": "Affected component: router2 BGP configuration (neighbor remote-as)\nMechanism: router2's config now says `neighbor 193.10.11.1\n  remote-as 65001`, but router1 really is AS 1. During session\n  setup router1's OPEN message carries AS 1; router2 compares it\n  against the configured 65001, rejects the OPEN (bad peer AS\n  notification), and the session never reaches Established. With\n  no session, no prefixes are exchanged: router1 never learns\n  200.1.1.0/24 and router2 never learns 195.11.14.0/24, so pc1 and\n  pc2 cannot reach each other. The underlying link is healthy\n  (direct pings across 193.10.11.0/24 work) and both daemons run.\nLocalization: router2\nRoot cause: wrong remote-as (65001 instead of 1) on router2's\n  neighbor statement for 193.10.11.1\nFix: restore remote-as 1 on router2 (see [FIX])",
+    "fix_spec": "Restore the correct peer AS on router2:\n`vtysh -c \"configure terminal\" -c \"router bgp 2\" -c \"no neighbor 193.10.11.1\" -c \"neighbor 193.10.11.1 remote-as 1\"`\nThe eBGP session establishes and the inter-AS prefixes are exchanged.\n(A `service frr restart` on router2 also restores it, since /etc/frr/frr.conf\non disk was never modified.)",
+    "scoring_axes": [
+      "assert-identifies: router2",
+      "must-identify-device: router2",
+      "must-identify-component: wrong remote-as (65001 instead of 1) on router2's neighbor statement for 193.10.11.1",
+      "must-identify-mechanism: eBGP AS mismatch -- router1 is AS 1 but router2 expects 65001, so the session never establishes",
+      "bonus-rules-out-lower-layers: notes the inter-AS link and direct 193.10.11.1<->193.10.11.2 reachability are fine, isolating the fault to the BGP session configuration"
+    ],
+    "source_path": "dataset/nika_bgp_Q/base/simple-bgp-router2-wrong-remote-as.txt",
+    "scenario_class": "base",
+    "ticket_style": "standard"
+  },
+  "agent": "cc-baseline",
+  "timestamp": "2026-08-04T14:51:24.329214+00:00",
+  "phases": {
+    "lstart": {
+      "ok": true,
+      "containers": 4,
+      "expected": 4
+    },
+    "settle": {
+      "converge_wait": 90
+    },
+    "injection": {
+      "applied": true,
+      "skipped_reason": null,
+      "rc": 0,
+      "output": ""
+    },
+    "post_inject_check": {
+      "results": [
+        {
+          "line": {
+            "device": "router2",
+            "command": "vtysh -c \"show running-config\" | grep -c \"remote-as 65001\"",
+            "expect": "1"
+          },
+          "passed": true,
+          "actual": "1",
+          "rationale": "got 1, expected 1"
+        },
+        {
+          "line": {
+            "device": "pc1",
+            "command": "ping -W2 -c2 200.1.1.2",
+            "expect": "loss>0"
+          },
+          "passed": true,
+          "actual": "PING 200.1.1.2 (200.1.1.2) 56(84) bytes of data.\nFrom 195.11.14.1 icmp_seq=1 Destination Net Unreachable\nFrom 195.11.14.1 icmp_seq=2 Destination Net Unreachable\n\n--- 200.1.1.2 ping statistics ---\n2 packets transmitted, 0 received, +2 errors, 100% packet loss, time 1070ms",
+          "rationale": "loss=100%"
+        }
+      ],
+      "wait_seconds": 0
+    },
+    "agent": {
+      "diagnosis_text": "The eBGP session is permanently stuck in Idle because router2 has a wrong\nremote-AS configured for its neighbor 193.10.11.1 (router1). Router2's\nrunning configuration shows:\n\n    neighbor 193.10.11.1 remote-as 65001\n\nBut router1 is actually operating in AS 1. Every time router2 receives\nrouter1's BGP OPEN message (which correctly advertises AS 1), router2\nimmediately rejects it and fires back a NOTIFICATION with error code\n\"OPEN Message Error / Bad Peer AS\". This is confirmed by the neighbor\ndetail output on both sides: router2 shows \"Notification sent (OPEN\nMessage Error/Bad Peer AS)\" and has sent 4 NOTIFICATIONs while receiving\nnone; router1 shows \"Notification received (OPEN Message Error/Bad Peer\nAS)\" with 8 NOTIFICATIONs received and connections established 1/dropped 1\n(the only successful TCP handshake was immediately torn down). Because the\nsession never reaches ESTABLISHED, no prefixes are exchanged in either\ndirection \u2014 router1 cannot install 200.1.1.0/24 and router2 cannot install\n195.11.14.0/24, making pc1 \u2194 pc2 traffic blackholed at both routers. The\ninter-AS link itself is healthy (L3 up, direct pings work), isolating the\nfault entirely to the BGP control plane on router2.\n\nRoot cause: during the change window, the `remote-as` value for router1's\nneighbor on router2 was incorrectly set to 65001 instead of 1.\n\nCorrective fix: on router2, execute:\n    configure terminal\n    router bgp 2\n    neighbor 193.10.11.1 remote-as 1\n    end\n    write memory\nThe session will come up on the next connect-retry (within ~4 seconds based\non current timer state).",
+      "is_anomaly": true,
+      "faulty_devices": [
+        "router2"
+      ],
+      "parsed_ok": true,
+      "in_tokens": 9,
+      "cache_read_tokens": 49987,
+      "cache_write_tokens": 12353,
+      "out_tokens": 2190,
+      "cost_usd": 0.09495785,
+      "tool_calls": 9,
+      "hit_max_turns": false,
+      "error": null
+    },
+    "score": {
+      "must_passed": 4,
+      "must_total": 4,
+      "bonus_passed": 1,
+      "bonus_total": 1,
+      "outcome_score": 1.0,
+      "fix_score": 1.0,
+      "reasoning_score": 0.8333333333333334,
+      "reasoning_dims": {
+        "grounding": 0.8,
+        "causality": 0.9,
+        "coverage": 0.8
+      },
+      "final_score": 1.0,
+      "per_axis": [
+        {
+          "axis": "assert-identifies: router2",
+          "kind": "assert",
+          "score": 1.0,
+          "rationale": "culprit 'router2' named (good)"
+        },
+        {
+          "axis": "must-identify-device: router2",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The report explicitly names router2 as the device with the incorrect remote-as configuration and localizes the fault to router2."
+        },
+        {
+          "axis": "must-identify-component: wrong remote-as (65001 instead of 1) on router2's neighbor statement for 193.10.11.1",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The submission explicitly identifies that router2's neighbor 193.10.11.1 is configured with remote-as 65001 instead of the correct AS 1."
+        },
+        {
+          "axis": "must-identify-mechanism: eBGP AS mismatch -- router1 is AS 1 but router2 expects 65001, so the session never establishes",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The report clearly identifies an eBGP AS mismatch: router2 is configured with remote-as 65001 while router1 is AS 1, causing OPEN rejection (Bad Peer AS) and preventing session establishment."
+        },
+        {
+          "axis": "bonus-rules-out-lower-layers: notes the inter-AS link and direct 193.10.11.1<->193.10.11.2 reachability are fine, isolating the fault to the BGP session configuration",
+          "kind": "bonus",
+          "score": 1.0,
+          "rationale": "Agent explicitly states the inter\u2011AS link is healthy and direct pings between 193.10.11.1 and 193.10.11.2 succeed, isolating the fault to the BGP control plane on router2."
+        },
+        {
+          "axis": "[FIX]",
+          "kind": "fix",
+          "score": 1.0,
+          "rationale": "The agent instructs changing router2's neighbor 193.10.11.1 to remote-as 1 (and saving), which directly fixes the incorrect peer AS and restores the eBGP session."
+        },
+        {
+          "axis": "reason:grounding",
+          "kind": "reason-dim",
+          "score": 0.8,
+          "rationale": "The investigation log contains direct outputs showing router2's neighbor configured with remote-as 65001, router1's local AS is 1, both neighbors are in Idle and no eBGP prefixes are learned \u2014 these observations support the diagnosis. The writeup adds some specific notification/ping details that are not fully present in the log, but the core causal chain (wrong remote-as \u2192 OPEN rejected \u2192 session Idle \u2192 no prefixes \u2192 reachability loss) is well supported."
+        },
+        {
+          "axis": "reason:causality",
+          "kind": "reason-dim",
+          "score": 0.9,
+          "rationale": "The investigation log contains direct outputs showing router2's neighbor configured with remote-as 65001, router1's local AS is 1, both neighbors are in Idle and no eBGP prefixes are learned \u2014 these observations support the diagnosis. The writeup adds some specific notification/ping details that are not fully present in the log, but the core causal chain (wrong remote-as \u2192 OPEN rejected \u2192 session Idle \u2192 no prefixes \u2192 reachability loss) is well supported."
+        },
+        {
+          "axis": "reason:coverage",
+          "kind": "reason-dim",
+          "score": 0.8,
+          "rationale": "The investigation log contains direct outputs showing router2's neighbor configured with remote-as 65001, router1's local AS is 1, both neighbors are in Idle and no eBGP prefixes are learned \u2014 these observations support the diagnosis. The writeup adds some specific notification/ping details that are not fully present in the log, but the core causal chain (wrong remote-as \u2192 OPEN rejected \u2192 session Idle \u2192 no prefixes \u2192 reachability loss) is well supported."
+        }
+      ],
+      "judge_model": "gpt-5-mini",
+      "reasoning_mode": "trace",
+      "error": null
+    }
+  },
+  "agent_input_prompt": "# Topology overview (devices + L2 connectivity)\nTopology: simple_bgp\n\nDevices:\n  Routers (FRR): router1, router2\n  Hosts: pc1, pc2\n\nLinks (device:iface <-> device:iface):\n  router1:eth0 <-> router2:eth0\n  router1:eth1 <-> pc1:eth0\n  router2:eth1 <-> pc2:eth0\n\n# Symptom (user report)\nAfter a configuration change window on router2, pc1 (195.11.14.2)\ncannot reach pc2 (200.1.1.2) and pc2 cannot reach pc1. Both\nrouters are up, and the two ends of the inter-AS link still ping\neach other directly (193.10.11.1 <-> 193.10.11.2), but the eBGP\nsession between router1 and router2 will not come up. Investigate."
+}

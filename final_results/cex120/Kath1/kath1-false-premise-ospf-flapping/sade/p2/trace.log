@@ -1,0 +1,93 @@
+[AGENT] sade starts on lab=Kath1
+[TOOL] ToolSearch({'query': 'select:mcp__kathara_base_mcp_server__get_reachability'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_base_mcp_server__get_reachability'}]
+[TOOL] mcp__kathara_base_mcp_server__get_reachability({})
+[RESULT] {"result":"{\"hosts\":{\"pc1\":\"10.1.0.100\",\"pc2\":\"10.1.0.101\",\"pc3\":\"10.3.0.100\"},\"results\":[{\"src\":\"pc1\",\"dst\":\"pc2\",\"dst_ip\":\"10.1.0.101\",\"tx\":2,\"rx\":2,\"loss_percent\":0.0,\"time_ms\":1112.0,\"rtt_avg_ms\":1.068,\"rtt_min_ms\":0.848,\"rtt_max_ms\":1.289,\"rtt_mdev_ms\":0.22,\"status\":\"ok\"},{\"src\":\"pc2\",\"dst\":\"pc1\",\"dst_ip\":\"10.1.0.100\",\"tx\":2,\"rx\"
+[TEXT] Phase 1 complete. All four tested paths show 0% loss — no reachability failure at the data-plane level. Per Phase 2 rules, this means no confirmed symptom from the blind start. The user report describes OSPF instability (control-plane), which may not show in endpoint ping results.
+
+Proceeding to **Phase 4 — Broad-search escalation**. First required action: enter the diagnosis-methodology skill.
+[TOOL] Skill({'skill': 'diagnosis-methodology-skill'})
+[RESULT] Launching skill: diagnosis-methodology-skill
+[TEXT] Phase A starts here — running both triage helpers in parallel.
+[TOOL] ToolSearch({'query': 'select:mcp__helper_server__run_helper'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__helper_server__run_helper'}]
+[TOOL] mcp__helper_server__run_helper({'script_name': 'infra_sweep'})
+[TOOL] mcp__helper_server__run_helper({'script_name': 'l2_snapshot'})
+[RESULT] {"result":"Unknown machine type: r1 with image kathara/dhcp\nUnknown machine type: ispa with image kathara/dhcp\nUnknown machine type: ispb with image kathara/dhcp\nUnknown machine type: r1 with image kathara/dhcp\nUnknown machine type: ispa with image kathara/dhcp\nUnknown machine type: ispb with image kathara/dhcp\n=== INFRA SWEEP ===\nLab: Kath1\nScope: hosts, routers, switches, servers, bmv2_s
+[RESULT] {"result":"Unknown machine type: r1 with image kathara/dhcp\nUnknown machine type: ispa with image kathara/dhcp\nUnknown machine type: ispb with image kathara/dhcp\n=== L2 SNAPSHOT ===\nLab: Kath1\nScope: hosts, routers, switches, servers, bmv2_switches, ovs_switches, sdn_controllers, other_devices\nDevices scanned: 20\nDuplicate MAC groups: 0\nFlagged devices: 4\nDevices with bridge members: 8\nD
+[TEXT] Phase A results analyzed:
+- **ACL flags**: dswa1/dswa2 have drop rules for 10.1.0.0/24→10.3.0.0/24 but with 0 packets/bytes — not firing. ISP RFC1918 blocks and SSH drop on r1 are normal.
+- **L2**: 0 duplicate MACs. The 4 collection failures on the distribution switches (dswa1/2, dswb1/2) are JSON-truncation artifacts, not MAC conflicts.
+
+No L2/addressing symptoms. Moving to **Phase B — Control-plane triage** with `ospf_snapshot` (OSPF/FRR topology).
+[TOOL] mcp__helper_server__run_helper({'script_name': 'ospf_snapshot'})
+[RESULT] {"result":"Unknown machine type: r1 with image kathara/dhcp\nUnknown machine type: ispa with image kathara/dhcp\nUnknown machine type: ispb with image kathara/dhcp\n=== OSPF SNAPSHOT ===\nLab: Kath1\nRouters scanned: 12\nFlags:\n  - aswa1: FRR control sockets missing (ospfd_vty) — daemon likely down\n  - aswa1: no OSPF network statements\n  - aswa1: zero OSPF neighbors\n  - aswa2: FRR control sock
+[TEXT] Phase B triage complete. Key finding from `ospf_snapshot`:
+
+**Critical anomaly**: Both `csw1.eth6` and `csw2.eth6` report `nbr=None, adj=None` — the adjacency to **dswb2** is missing on both core switches simultaneously. The flag `adj=6 < iface=7` on both csw1 and csw2 confirms exactly one adjacency is absent on each, and both missing adjacencies point to the same device: dswb2.
+
+This is an `ospf_neighbor_missing` symptom. Exiting broad search and entering the OSPF fault-family skill with dswb2 as the active lead.
+[TOOL] Skill({'skill': 'ospf-fault-skill'})
+[RESULT] Launching skill: ospf-fault-skill
+[TEXT] Active lead: missing OSPF adjacencies on csw1.eth6 and csw2.eth6, both pointing to dswb2. Running targeted checks on dswb2 — process state, neighbor table, and running config — in parallel.
+[TOOL] ToolSearch({'query': 'select:mcp__kathara_base_mcp_server__exec_shell,mcp__kathara_frr_mcp_server__frr_show_running_config'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_base_mcp_server__exec_shell'}, {'type': 'tool_reference', 'tool_name': 'mcp__kathara_frr_mcp_server__frr_show_running_config'}]
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'dswb2', 'command': "ps aux | grep -E 'zebra|ospfd|watchfrr' | grep -v grep"})
+[RESULT] {"result":"root       100  0.0  0.0  41248  3480 ?        Ss   20:27   0:00 /usr/lib/frr/watchfrr -d -F traditional zebra mgmtd ospfd staticd\nfrr        111  0.0  0.1 482016  9112 ?        Ssl  20:27   0:00 /usr/lib/frr/zebra -d -F traditional -A 127.0.0.1 -s 90000000\nfrr        118  0.1  0.0  45956  6768 ?        Ss   20:27   0:00 /usr/lib/frr/ospfd -d -F traditional -A 127.0.0.1"}
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'dswb2', 'command': "vtysh -c 'show ip ospf neighbor'"})
+[TOOL] mcp__kathara_frr_mcp_server__frr_show_running_config({'router_name': 'dswb2'})
+[RESULT] {"result":"Neighbor ID     Pri State           Up Time         Dead Time Address         Interface                        RXmtL RqstL DBsmL\n10.0.0.81         1 Full/Backup     3m29s             36.675s 10.0.0.18       br0.99:10.0.0.19                     0     0     0\n10.0.0.77         1 Full/Backup     3m58s             36.713s 10.0.0.57       eth5:10.0.0.58                       0     0     0\
+[RESULT] {"result":"Building configuration...\n\nCurrent configuration:\n!\nfrr version 9.1.3\nfrr defaults traditional\nhostname dswb2\ndomainname localdomain\nlog file /var/log/frr/frr.log\nno ipv6 forwarding\nno service integrated-vtysh-config\n!\npassword zebra\nenable password zebra\n!\ninterface lo\n ip address 10.0.0.82/32\n ip ospf passive\nexit\n!\ninterface br0.10\n ip ospf area 0\n ip ospf passi
+[TEXT] The dswb2 daemons are healthy and its neighbor table shows Full adjacencies to both csw1 (10.0.0.77) and csw2 (10.0.0.78). The `adj=None` in the snapshot was a parsing artifact. But the Up Times are only 3-4 minutes — very recent. Let me check csw1's neighbor table and look for flap evidence.
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'csw1', 'command': "vtysh -c 'show ip ospf neighbor'"})
+[RESULT] {"result":"Neighbor ID     Pri State           Up Time         Dead Time Address         Interface                        RXmtL RqstL DBsmL\n10.0.0.76         1 Full/Backup     4m23s             34.887s 10.0.0.33       eth0:10.0.0.34                       0     0     0\n10.0.0.78         1 Full/DR         4m28s             31.703s 10.0.0.42       bond0:10.0.0.41                      0     0     0\
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'dswb2', 'command': "cat /var/log/frr/frr.log | grep -E 'adjacency|neighbor|OSPF|flap|down|up' | tail -40"})
+[RESULT] {"result":"2026/07/29 20:26:51 ZEBRA: [WPPMZ-G9797] if_zebra_speed_update: bond0 old speed: 10000 new speed: 20000\n2026/07/29 20:26:51 ZEBRA: [WPPMZ-G9797] if_zebra_speed_update: br0 old speed: 10000 new speed: 20000\n2026/07/29 20:26:51 ZEBRA: [WPPMZ-G9797] if_zebra_speed_update: br0.10 old speed: 10000 new speed: 20000\n2026/07/29 20:26:51 ZEBRA: [WPPMZ-G9797] if_zebra_speed_update: br0.20 old 
+[TEXT] The dswb2 log reveals critical evidence: a **continuous stream of OSPF Hello NetworkMask mismatch errors** from neighbor 10.0.0.81 (dswb1) on `br0.99`:
+
+> `NetworkMask mismatch on br0.99:10.0.0.19 (configured prefix length is 28, but hello packet indicates 32)`
+
+This fires every ~10 seconds (every hello interval). This is the fault mechanism. Now I need to confirm dswb1's br0.99 mask configuration.
+[TOOL] mcp__kathara_frr_mcp_server__frr_show_running_config({'router_name': 'dswb1'})
+[RESULT] {"result":"Building configuration...\n\nCurrent configuration:\n!\nfrr version 9.1.3\nfrr defaults traditional\nhostname dswb1\ndomainname localdomain\nlog file /var/log/frr/frr.log\nno ipv6 forwarding\nno service integrated-vtysh-config\n!\npassword zebra\nenable password zebra\n!\ninterface lo\n ip address 10.0.0.81/32\n ip ospf passive\nexit\n!\ninterface br0.10\n ip ospf area 0\n ip ospf passi
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'dswb1', 'command': 'ip addr show br0.99'})
+[RESULT] {"result":"7: br0.99@br0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue state UP group default qlen 1000\n    link/ether 46:13:6d:19:66:83 brd ff:ff:ff:ff:ff:ff\n    inet 10.0.0.18/28 scope global br0.99\n       valid_lft forever preferred_lft forever\n    inet 10.0.0.17/32 scope global br0.99\n       valid_lft forever preferred_lft forever"}
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'dswb2', 'command': 'ip addr show br0.99'})
+[RESULT] {"result":"7: br0.99@br0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue state UP group default qlen 1000\n    link/ether 72:6f:37:1b:6a:fe brd ff:ff:ff:ff:ff:ff\n    inet 10.0.0.19/28 scope global br0.99\n       valid_lft forever preferred_lft forever"}
+[TEXT] Direct evidence confirmed. Here's what was found:
+
+- **dswb1 `br0.99`** has **two IP addresses**: `10.0.0.18/28` (correct) AND `10.0.0.17/32` (spurious secondary)
+- **dswb2 `br0.99`** has only `10.0.0.19/28` (correct, single address)
+- FRR's ospfd on dswb1 creates **two OSPF interface instances** on br0.99 — one per address. The /32 instance sends Hellos advertising `NetworkMask=255.255.255.255`
+- dswb2 rejects those Hellos every 10 seconds (every Hello interval), logging: *"configured prefix length is 28, but hello packet indicates 32"*
+- The main adjacency is via `10.0.0.18/28` and is currently Full (up 3m29s, dead timer healthy) — but the constant rejected-Hello stream creates the appearance of OSPF instability
+
+This is sufficient confirming evidence. Proceeding to Phase 5.
+
+=== DIAGNOS
+[FINAL] stop=end_turn tool_calls=17
+[SUBMITTED] parsed_ok=True is_anomaly=True faulty_devices=['dswb1']
+[FINAL-TEXT] Direct evidence confirmed. Here's what was found:
+
+- **dswb1 `br0.99`** has **two IP addresses**: `10.0.0.18/28` (correct) AND `10.0.0.17/32` (spurious secondary)
+- **dswb2 `br0.99`** has only `10.0.0.19/28` (correct, single address)
+- FRR's ospfd on dswb1 creates **two OSPF interface instances** on br0.99 — one per address. The /32 instance sends Hellos advertising `NetworkMask=255.255.255.255`
+- dswb2 rejects those Hellos every 10 seconds (every Hello interval), logging: *"configured prefix length is 28, but hello packet indicates 32"*
+- The main adjacency is via `10.0.0.18/28` and is currently Full (up 3m29s, dead timer healthy) — but the constant rejected-Hello stream creates the appearance of OSPF instability
+
+This is sufficient confirming evidence. Proceeding to Phase 5.
+
+=== DIAGNOSIS ===
+is_anomaly: true
+faulty_devices: dswb1
+diagnosis_text:
+**Affected component**: FRR ospfd on dswb1, specifically the OSPF interface configuration on `br0.99` (the inter-DSW peer link in the B-side distribution layer, connecting dswb1 and dswb2).
+
+**Mechanism**: dswb1's `br0.99` interface has two IP addresses configured: the correct `10.0.0.18/28` and a spurious secondary `10.0.0.17/32`. FRR's ospfd creates one OSPF interface instance per IP address on an interface when `ip ospf area` is applied. The `/32` instance fires its own OSPF Hello packets every 10 seconds with `NetworkMask=255.255.255.255`. dswb2, whose `br0.99` is `10.0.0.19/28`, rejects every one of these Hellos with the error *"NetworkMask mismatch on br0.99:10.0.0.19 (configured prefix length is 28, but hello packet indicates 32)"* — exactly every Hello interval, continuously. The main adjacency formed correctly via the `/28` address and is currently Full, but the unbroken stream of rejected Hellos produces log entries that monitoring systems interpret as the adjacency "bouncing."
+
+**Localization**: dswb1, interface `br0.99`, secondary address `10.0.0.17/32`.
+
+**Root cause**: A spurious `/32` host address (`10.0.0.17/32`) was injected onto dswb1's `br0.99` management VLAN interface, causing FRR to spawn an OSPF interface instance that permanently conflicts with dswb2's `/28` mask, flooding OSPF logs with mask-mismatch errors and risking true adjacency drops if the Hello timing drifts.
+
+**Fix**: Remove the spurious secondary address from dswb1: `ip addr del 10.0.0.17/32 dev br0.99`. This eliminates the rogue OSPF interface instance and stops the mismatch Hello stream immediately.
+=== END ===

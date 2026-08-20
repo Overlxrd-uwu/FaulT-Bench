@@ -1,0 +1,188 @@
+{
+  "scenario": {
+    "scenario_id": "ospf-enterprise-core3-acl-blocks-serverfarm",
+    "topology": "ospf_enterprise_static",
+    "fault_family": "ACL drops legitimate transit",
+    "prompt_to_agent": "Helpdesk ticket #8877: Since a firewall change window this morning, BOTH pods\nhave lost access to every 10.200.0.x server: DNS queries to 10.200.0.2 time\nout and no portal loads by name or by IP. Pod-to-pod traffic between\nhost_1_1_1_1 and host_2_1_1_1 still works. Monitoring shows all OSPF\nadjacencies Full and the 10.200.0.0/24 route present on every router.\nIdentify what is blocking the server farm.",
+    "injection": {
+      "device": "router_core_3",
+      "action": "add a FORWARD DROP rule for all traffic destined to the server farm",
+      "command": "iptables -A FORWARD -d 10.200.0.0/24 -j DROP",
+      "note": null
+    },
+    "pre_check": [],
+    "post_inject_check": [
+      {
+        "device": "router_core_3",
+        "command": "iptables -S FORWARD | grep -c 10.200.0.0/24",
+        "expect": "1"
+      },
+      {
+        "device": "host_1_1_1_1",
+        "command": "ping -W2 -c2 10.200.0.2",
+        "expect": "loss>0"
+      },
+      {
+        "device": "host_2_1_1_1",
+        "command": "ping -W2 -c2 10.200.0.3",
+        "expect": "loss>0"
+      }
+    ],
+    "ground_truth": "Affected component: router_core_3 iptables FORWARD chain\nMechanism: router_core_3 is the mandatory transit for the server farm --\n  switch_server_access attaches only to router_core_3 (172.16.0.10/31). The\n  new rule `-A FORWARD -d 10.200.0.0/24 -j DROP` silently discards every\n  FORWARDED packet destined to the farm, from both pods. Routing is\n  genuinely healthy: OSPF hellos are INPUT/OUTPUT traffic on router_core_3\n  (not FORWARD), so all adjacencies stay Full and 10.200.0.0/24 remains in\n  every table -- the drop happens at the firewall layer after the routing\n  decision. Pod-to-pod traffic transits router_core_1<->router_core_2 and\n  matches no rule. Note: router_core_3's OWN pings to the farm still succeed\n  (locally generated traffic traverses OUTPUT, not FORWARD) -- a useful\n  discriminator.\nLocalization: router_core_3\nRoot cause: extraneous iptables FORWARD DROP rule for destination\n  10.200.0.0/24 on router_core_3\nFix: `iptables -D FORWARD -d 10.200.0.0/24 -j DROP` on router_core_3",
+    "fix_spec": "remove the DROP rule on router_core_3 --\n`iptables -D FORWARD -d 10.200.0.0/24 -j DROP`",
+    "scoring_axes": [
+      "assert-identifies: router_core_3",
+      "must-identify-device: router_core_3",
+      "must-identify-component: iptables FORWARD DROP rule / firewall filter, not a routing fault",
+      "must-recognize-filter-pattern: recognizes that healthy OSPF plus present routes with silent forwarding loss indicates packet filtering on the transit path",
+      "bonus-notes-transit-choke: notes all farm traffic must transit router_core_3 (sole attachment of switch_server_access), which is why both pods are affected"
+    ],
+    "source_path": "dataset/nika_ospf_Q/base/ospf-enterprise-core3-acl-blocks-serverfarm.txt",
+    "scenario_class": "base",
+    "ticket_style": "standard"
+  },
+  "agent": "cc-baseline",
+  "timestamp": "2026-08-03T09:40:39.217356+00:00",
+  "phases": {
+    "lstart": {
+      "ok": true,
+      "containers": 15,
+      "expected": 15
+    },
+    "settle": {
+      "converge_wait": 90
+    },
+    "injection": {
+      "applied": true,
+      "skipped_reason": null,
+      "rc": 0,
+      "output": ""
+    },
+    "post_inject_check": {
+      "results": [
+        {
+          "line": {
+            "device": "router_core_3",
+            "command": "iptables -S FORWARD | grep -c 10.200.0.0/24",
+            "expect": "1"
+          },
+          "passed": true,
+          "actual": "1",
+          "rationale": "got 1, expected 1"
+        },
+        {
+          "line": {
+            "device": "host_1_1_1_1",
+            "command": "ping -W2 -c2 10.200.0.2",
+            "expect": "loss>0"
+          },
+          "passed": true,
+          "actual": "PING 10.200.0.2 (10.200.0.2) 56(84) bytes of data.\n\n--- 10.200.0.2 ping statistics ---\n2 packets transmitted, 0 received, 100% packet loss, time 1108ms",
+          "rationale": "loss=100%"
+        },
+        {
+          "line": {
+            "device": "host_2_1_1_1",
+            "command": "ping -W2 -c2 10.200.0.3",
+            "expect": "loss>0"
+          },
+          "passed": true,
+          "actual": "PING 10.200.0.3 (10.200.0.3) 56(84) bytes of data.\n\n--- 10.200.0.3 ping statistics ---\n2 packets transmitted, 0 received, 100% packet loss, time 1085ms",
+          "rationale": "loss=100%"
+        }
+      ],
+      "wait_seconds": 0
+    },
+    "agent": {
+      "diagnosis_text": "During this morning's firewall change window, an erroneous iptables rule was\ninserted into the FORWARD chain on router_core_3:\n\n  FORWARD rule 1: DROP  protocol all  source 0.0.0.0/0  destination 10.200.0.0/24\n\nrouter_core_3 is the sole L3 gateway between the two user pods and the server\nfarm: pod traffic flows host \u2192 switch_dist \u2192 router_core_1/2 \u2192 router_core_3\n\u2192 switch_server_access \u2192 servers. Any forwarded packet whose destination falls\nwithin 10.200.0.0/24 is silently dropped at the kernel netfilter FORWARD hook\non router_core_3 before it can be handed off to eth2. The rule is protocol-\nand source-agnostic, so ICMP, UDP (DNS), and TCP (HTTP/HTTPS) are all affected\nequally \u2014 hence DNS timeouts and portal failures for both pods simultaneously.\n\nPod-to-pod traffic is unaffected because those packets are destined for\n10.1.1.0/24 or 10.2.1.0/24, not 10.200.0.0/24. OSPF adjacencies and routing\ntables are fully healthy on all routers; switch_server_access has correct\nback-routes to both pod subnets and carries no firewall rules of its own.\nIntra-server-farm traffic never transits router_core_3's FORWARD chain so it\nworks normally. The rule counter (12 packets / 1008 bytes) confirms it is\nactively dropping live traffic.\n\nRoot cause: a blanket iptables FORWARD DROP for 10.200.0.0/24 was mistakenly\napplied to router_core_3 during the firewall change window.\n\nCorrective fix: on router_core_3, run:\n  iptables -D FORWARD -d 10.200.0.0/24 -j DROP\nThis removes rule 1 from the FORWARD chain and immediately restores pod-to-\nserver connectivity without any routing or OSPF changes needed.",
+      "is_anomaly": true,
+      "faulty_devices": [
+        "router_core_3"
+      ],
+      "parsed_ok": true,
+      "in_tokens": 9,
+      "cache_read_tokens": 59029,
+      "cache_write_tokens": 16663,
+      "out_tokens": 4175,
+      "cost_usd": 0.14403595,
+      "tool_calls": 10,
+      "hit_max_turns": false,
+      "error": null
+    },
+    "score": {
+      "must_passed": 4,
+      "must_total": 4,
+      "bonus_passed": 1,
+      "bonus_total": 1,
+      "outcome_score": 1.0,
+      "fix_score": 1.0,
+      "reasoning_score": 0.9333333333333332,
+      "reasoning_dims": {
+        "grounding": 0.9,
+        "causality": 1.0,
+        "coverage": 0.9
+      },
+      "final_score": 1.0,
+      "per_axis": [
+        {
+          "axis": "assert-identifies: router_core_3",
+          "kind": "assert",
+          "score": 1.0,
+          "rationale": "culprit 'router_core_3' named (good)"
+        },
+        {
+          "axis": "must-identify-device: router_core_3",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The agent explicitly identifies router_core_3 as the affected device and bases the diagnosis and corrective action on that router."
+        },
+        {
+          "axis": "must-identify-component: iptables FORWARD DROP rule / firewall filter, not a routing fault",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The report explicitly pins the failure on an iptables FORWARD DROP for 10.200.0.0/24 on router_core_3 and distinguishes it from a routing/OSPF issue."
+        },
+        {
+          "axis": "must-recognize-filter-pattern: recognizes that healthy OSPF plus present routes with silent forwarding loss indicates packet filtering on the transit path",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The writeup explicitly states OSPF adjacencies and routing are healthy while forwarded packets are silently dropped at router_core_3's FORWARD/netfilter hook, indicating a transit-path packet filter."
+        },
+        {
+          "axis": "bonus-notes-transit-choke: notes all farm traffic must transit router_core_3 (sole attachment of switch_server_access), which is why both pods are affected",
+          "kind": "bonus",
+          "score": 1.0,
+          "rationale": "Agent explicitly states router_core_3 is the sole L3 gateway and describes traffic flow (router_core_1/2 \u2192 router_core_3 \u2192 switch_server_access), explaining why both pods are affected."
+        },
+        {
+          "axis": "[FIX]",
+          "kind": "fix",
+          "score": 1.0,
+          "rationale": "Proposes the exact iptables -D command to remove the DROP rule on router_core_3, which directly fixes the stated fault."
+        },
+        {
+          "axis": "reason:grounding",
+          "kind": "reason-dim",
+          "score": 0.9,
+          "rationale": "The log shows a FORWARD-chain DROP on router_core_3 (with packet counters), failed pings from both pods to the server subnet, and routing/firewall checks on related devices \u2014 together these observations support the agent's conclusion. The reasoning correctly links the observed iptables drop to the loss of forwarded traffic; only minor topology-verification steps are implicit but not necessary given the packet counters."
+        },
+        {
+          "axis": "reason:causality",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "The log shows a FORWARD-chain DROP on router_core_3 (with packet counters), failed pings from both pods to the server subnet, and routing/firewall checks on related devices \u2014 together these observations support the agent's conclusion. The reasoning correctly links the observed iptables drop to the loss of forwarded traffic; only minor topology-verification steps are implicit but not necessary given the packet counters."
+        },
+        {
+          "axis": "reason:coverage",
+          "kind": "reason-dim",
+          "score": 0.9,
+          "rationale": "The log shows a FORWARD-chain DROP on router_core_3 (with packet counters), failed pings from both pods to the server subnet, and routing/firewall checks on related devices \u2014 together these observations support the agent's conclusion. The reasoning correctly links the observed iptables drop to the loss of forwarded traffic; only minor topology-verification steps are implicit but not necessary given the packet counters."
+        }
+      ],
+      "judge_model": "gpt-5-mini",
+      "reasoning_mode": "trace",
+      "error": null
+    }
+  },
+  "agent_input_prompt": "# Topology overview (devices + L2 connectivity)\nTopology: ospf_enterprise_static\n\nDevices:\n  Routers (FRR): router_core_1, router_core_2, router_core_3, switch_dist_1_1, switch_dist_2_1, switch_server_access\n  Switches: switch_access_1_1_1, switch_access_2_1_1\n  Hosts: host_1_1_1_1, host_2_1_1_1\n  Dns servers: dns_server\n  Web servers: web_server_0, web_server_1, web_server_2, web_server_3\n\nLinks (device:iface <-> device:iface):\n  router_core_1:eth0 <-> router_core_2:eth0\n  router_core_1:eth1 <-> router_core_3:eth0\n  router_core_1:eth2 <-> switch_dist_1_1:eth0\n  router_core_2:eth1 <-> router_core_3:eth1\n  router_core_2:eth2 <-> switch_dist_2_1:eth0\n  router_core_3:eth2 <-> switch_server_access:eth5\n  switch_access_1_1_1:eth1 <-> host_1_1_1_1:eth0\n  switch_access_2_1_1:eth1 <-> host_2_1_1_1:eth0\n  switch_dist_1_1:eth1 <-> switch_access_1_1_1:eth0\n  switch_dist_2_1:eth1 <-> switch_access_2_1_1:eth0\n  dns_server:eth0 <-> switch_server_access:eth0\n  web_server_0:eth0 <-> switch_server_access:eth1\n  web_server_1:eth0 <-> switch_server_access:eth2\n  web_server_2:eth0 <-> switch_server_access:eth3\n  web_server_3:eth0 <-> switch_server_access:eth4\n\n# Symptom (user report)\nHelpdesk ticket #8877: Since a firewall change window this morning, BOTH pods\nhave lost access to every 10.200.0.x server: DNS queries to 10.200.0.2 time\nout and no portal loads by name or by IP. Pod-to-pod traffic between\nhost_1_1_1_1 and host_2_1_1_1 still works. Monitoring shows all OSPF\nadjacencies Full and the 10.200.0.0/24 route present on every router.\nIdentify what is blocking the server farm."
+}

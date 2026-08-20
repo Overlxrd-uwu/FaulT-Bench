@@ -1,0 +1,66 @@
+==================================================
+Scenario: kath3-router0-ripd-down
+Topology: Kath3
+Fault family: routing daemon down
+==================================================
+
+[PROMPT-TO-AGENT]
+PC4, PC5 (VLAN 10) and Laptop0 (VLAN 20) in Location A report
+they cannot reach anything outside Location A. Internal hosts
+in Location A can still reach each other and their gateways.
+Location B and Location C are unaffected internally. Diagnose.
+
+[INJECTION]
+device: router0
+action: kill ripd
+cmd: pkill -9 watchfrr; pkill -9 ripd
+
+[POST-INJECT-CHECK]
+router0  pgrep ripd                                       => expect empty
+pc4      ping -W2 -c2 192.168.100.1                       => expect loss>0
+
+[GROUND-TRUTH]
+Affected component: router0 ripd
+Mechanism: router0 is Location A's only L3 egress. It connects
+  VLAN 10 (172.16.10.0/24) and VLAN 20 (172.16.20.0/24) via
+  eth0 subinterfaces and uplinks to router1 over the 10.16.1.0/24
+  serial. With ripd dead, router1 ages out Location A's prefixes
+  and router0 itself stops learning the rest of the network's
+  RIB. Location A becomes a routing island.
+Localization: router0
+Root cause: ripd not running on router0
+Fix: restart FRR AND re-apply the `router rip` configuration on router0 (see [FIX] -- a bare restart alone does not restore the vtysh-applied config).
+
+Observable note (lab-verified 2026-07-03): ripd is killed together with watchfrr (its watchdog), so nothing respawns it. vtysh remains responsive via zebra, `show running-config` simply contains NO `router rip` section, and `show daemons` no longer lists ripd. An agent may therefore correctly describe this fault as "the rip configuration is missing/empty on router0" -- that is the same fault observed at the config plane, and must NOT be treated as a wrong root cause.
+
+[FIX]
+`/etc/init.d/frr restart` on router0
+
+NOTE (lab-verified 2026-07-03): this lab applies FRR config via vtysh at boot (there is no /etc/frr/frr.conf), so `/etc/init.d/frr restart` alone brings ripd back CONFIG-LESS and the rip service stays broken. The complete remediation is to (re)start FRR/ripd AND re-apply the `router rip` configuration (network statements) on router0. A proposal that restores the missing rip configuration is a correct fix; a bare daemon restart without restoring the config is incomplete.
+
+[DIAGNOSTIC-PROCESS]
+1. Scope which prefixes/hosts are unreachable: confirm Location A hosts (PC4/PC5 on
+   VLAN 10, Laptop0 on VLAN 20) cannot reach outside Location A, while internal
+   Location A reachability and other locations are unaffected.
+2. Inspect the routing table on the affected device: check router0's RIB -- confirm
+   that routes to the rest of the network (Location B, Location C, 192.168.100.0/24)
+   are absent, indicating router0 is no longer learning RIP routes.
+3. Check RIP neighbor/adjacency state: verify from router1 that Location A's prefixes
+   (172.16.10.0/24, 172.16.20.0/24) have aged out of its RIP table -- router0 has
+   stopped advertising.
+4. Check the routing daemon process on router0: run `pgrep ripd` on router0 -- the
+   process is not running.
+5. Localize to the daemon: the fault is ripd being dead on router0, not a link failure
+   or configuration change; rule out eth0 subinterface or uplink issues by confirming
+   the serial link to router1 (10.16.1.0/24) is physically up.
+
+[SCORING-AXES]
+assert-identifies: router0
+must-identify-device: router0
+must-identify-component: ripd / RIP
+# These axes score the outcome metric only; fix and reasoning are judged separately.
+
+[NIKA-LABEL]
+nika_label: frr_service_down
+nika_category: NETWORK_NODE_ERROR
+in_taxonomy: true

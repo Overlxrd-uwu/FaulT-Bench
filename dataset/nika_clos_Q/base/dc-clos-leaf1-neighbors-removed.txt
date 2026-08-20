@@ -1,0 +1,84 @@
+==================================================
+Scenario: dc-clos-leaf1-neighbors-removed
+Topology: dc_clos_bgp
+Fault family: BGP config error (neighbor statements removed)
+==================================================
+
+[PROMPT-TO-AGENT]
+After a config-cleanup window, a user on pc_0_1 (10.0.1.2) reports they
+lost all reach across the fabric -- pc_0_0 (10.0.0.2) is unreachable,
+though pc_0_1 can still ping its own gateway 10.0.1.1. Both spine
+routers report their BGP session toward leaf_router_0_1 down at the
+same time, yet leaf_router_0_1's uplink interfaces show UP and its FRR
+daemons are all running. Investigate.
+
+[INJECTION]
+device: leaf_router_0_1
+action: delete both spine neighbor statements from the running BGP config
+cmd: |
+  vtysh -c "configure terminal" \
+        -c "router bgp 65201" \
+        -c "no neighbor 172.16.0.6" \
+        -c "no neighbor 172.16.0.10" \
+        -c "exit" -c "exit"
+
+[POST-INJECT-CHECK]
+leaf_router_0_1   vtysh -c "show running-config" | grep -c "neighbor 172.16.0."  => expect 0
+pc_0_0            ping -W2 -c2 10.0.1.2                                          => expect loss>0
+
+[GROUND-TRUTH]
+Affected component: leaf_router_0_1 BGP neighbor configuration
+Mechanism: leaf_router_0_1 (AS 65201) normally peers with
+  spine_router_0_0 (neighbor 172.16.0.6 remote-as 65100) and
+  spine_router_0_1 (neighbor 172.16.0.10 remote-as 65101). Both
+  neighbor statements were deleted from the running config, so bgpd
+  sends a Cease notification and drops both sessions. With zero peers
+  the leaf stops advertising 10.0.1.0/24 (the spines withdraw it
+  immediately) and stops learning 10.0.0.0/24, so pc_0_1 is isolated
+  even though bgpd is running and every link is UP.
+Localization: leaf_router_0_1
+Root cause: both BGP neighbor statements removed under
+  `router bgp 65201` on leaf_router_0_1
+Fix: re-add the two neighbor statements on leaf_router_0_1 (see [FIX]).
+
+[FIX]
+Re-add the spine neighbors on leaf_router_0_1:
+`vtysh -c "configure terminal" -c "router bgp 65201"
+ -c "neighbor 172.16.0.6 remote-as 65100"
+ -c "neighbor 172.16.0.10 remote-as 65101"`
+Note: the injection changed only the running config; the intended
+config is still intact in /etc/frr/frr.conf, so `service frr restart`
+on leaf_router_0_1 is an equally correct fix (it reloads the file and
+re-creates both neighbors).
+
+[DIAGNOSTIC-PROCESS]
+1. Reproduce the symptom: from pc_0_1, ping 10.0.0.2 -- fails; ping the
+   gateway 10.0.1.1 -- succeeds. The break is beyond the leaf's host port.
+2. Check the fabric from the healthy side: both spines show only their
+   session toward leaf_router_0_1 down; sessions to leaf_router_0_0 and
+   the super-spine are Established -- localized to leaf_router_0_1.
+3. Rule out link and daemon faults: leaf_router_0_1's eth0/eth1 are UP,
+   and `pgrep bgpd` shows the daemon running -- this is not the
+   daemon-down or link-down pattern.
+4. Inspect the config plane: `show running-config` on leaf_router_0_1
+   still has `router bgp 65201` and `network 10.0.1.0/24` but contains
+   NO neighbor statements -- the leaf has no configured peers, and
+   `show bgp summary` lists no neighbors.
+5. Localize to the removed neighbor configuration on leaf_router_0_1:
+   the missing `neighbor 172.16.0.6` / `neighbor 172.16.0.10` lines
+   fully explain both sessions dropping while links and daemons stay
+   healthy.
+
+[SCORING-AXES]
+assert-identifies: leaf_router_0_1
+must-identify-device: leaf_router_0_1
+must-identify-component: BGP neighbor configuration removed / no configured peers
+must-distinguish-symptom-pattern: uplink interfaces UP and bgpd running while both spine sessions are down -- a config fault, not a link or daemon fault
+bonus-cites-missing-neighbors: names the missing neighbor statements (172.16.0.6 / spine_router_0_0 and 172.16.0.10 / spine_router_0_1) or shows `show bgp summary` with zero peers
+# These axes score the outcome metric only; fix and reasoning are judged separately.
+
+[NIKA-LABEL]
+nika_label: none
+nika_category: NOVEL
+in_taxonomy: false
+note: BGP neighbor statements removed; closest NIKA label is ospf_neighbor_missing, which is OSPF-only -- no BGP-neighbor-removal label in the taxonomy

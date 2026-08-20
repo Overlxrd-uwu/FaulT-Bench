@@ -1,0 +1,181 @@
+{
+  "scenario": {
+    "scenario_id": "kath1-keepalived-master-down",
+    "topology": "Kath1",
+    "fault_family": "VRRP daemon down (master)",
+    "prompt_to_agent": "Office A users report a brief connectivity outage to their\ndefault gateway (10.1.0.1, 10.6.0.1, 10.0.0.1), then service\nrestored. After the event, traffic appears to take a slightly\nlonger path. The gateways still respond. Find what caused the\nevent.",
+    "injection": {
+      "device": "dswa1",
+      "action": "stop keepalived (kills all VRRP instances on the MASTER)",
+      "command": "pkill -9 keepalived",
+      "note": null
+    },
+    "pre_check": [],
+    "post_inject_check": [
+      {
+        "device": "dswa1",
+        "command": "pgrep keepalived",
+        "expect": "empty"
+      },
+      {
+        "device": "pc1",
+        "command": "ping -W2 -c2 10.1.0.1",
+        "expect": "0% loss (BACKUP took over)"
+      },
+      {
+        "device": "dswa2",
+        "command": "ip -br addr show br0.10 | grep 10.1.0.1",
+        "expect": "non-empty"
+      }
+    ],
+    "ground_truth": "Affected component: dswa1 keepalived process (VRRP daemon)\nMechanism: dswa1 was VRRP MASTER for VIs 10, 20, 40, 99 on\n  Office A side (priorities 105 / 1 / 1 / 105). Killing\n  keepalived stops VRRP advertisements; after the dead\n  interval (~3s) dswa2 takes over MASTER for all of them.\n  Briefly during failover, packets to VIPs are dropped.\n  Steady state restores once dswa2 owns the VIPs.\nLocalization: dswa1\nRoot cause: keepalived not running on dswa1\nFix: `/etc/init.d/keepalived start` on dswa1",
+    "fix_spec": "`/etc/init.d/keepalived start` on dswa1",
+    "scoring_axes": [
+      "assert-identifies: dswa1",
+      "must-identify-device: dswa1",
+      "must-identify-component: keepalived / VRRP",
+      "must-explain-failover-pattern"
+    ],
+    "source_path": "dataset/kath1_Q/base/kath1-keepalived-master-down.txt",
+    "scenario_class": "base",
+    "ticket_style": "standard"
+  },
+  "agent": "sade",
+  "timestamp": "2026-08-02T09:44:47.624495+00:00",
+  "phases": {
+    "lstart": {
+      "ok": true,
+      "containers": 20,
+      "expected": 20
+    },
+    "settle": {
+      "converge_wait": 90
+    },
+    "injection": {
+      "applied": true,
+      "skipped_reason": null,
+      "rc": 0,
+      "output": ""
+    },
+    "post_inject_check": {
+      "results": [
+        {
+          "line": {
+            "device": "dswa1",
+            "command": "pgrep keepalived",
+            "expect": "empty"
+          },
+          "passed": true,
+          "actual": "",
+          "rationale": "output empty"
+        },
+        {
+          "line": {
+            "device": "pc1",
+            "command": "ping -W2 -c2 10.1.0.1",
+            "expect": "0% loss (BACKUP took over)"
+          },
+          "passed": true,
+          "actual": "PING 10.1.0.1 (10.1.0.1) 56(84) bytes of data.\n64 bytes from 10.1.0.1: icmp_seq=1 ttl=64 time=2.59 ms\n64 bytes from 10.1.0.1: icmp_seq=2 ttl=64 time=1.41 ms\n\n--- 10.1.0.1 ping statistics ---\n2 packets transmitted, 2 received, 0% packet loss, time 1036ms\nrtt min/avg/max/mdev = 1.410/2.001/2.593/0.591 ms",
+          "rationale": "loss=0%"
+        },
+        {
+          "line": {
+            "device": "dswa2",
+            "command": "ip -br addr show br0.10 | grep 10.1.0.1",
+            "expect": "non-empty"
+          },
+          "passed": true,
+          "actual": "br0.10@br0       UP             10.1.0.3/24 10.1.0.1/32",
+          "rationale": "output present"
+        }
+      ],
+      "wait_seconds": 20
+    },
+    "agent": {
+      "diagnosis_text": "**Affected component**: dswa1's FRR/ospfd process and its VLAN subinterface gateway IP configuration (br0.10 and br0.99 secondary addresses).\n\n**Mechanism**: dswa1's container clock runs approximately 4 minutes behind dswa2's, meaning dswa1's FRR stack initialized ~4 minutes after dswa2 in real wall-clock time (both logs show 09:45:11 in their local clocks, but OSPF adjacency uptimes \u2014 6m44s on dswa1 vs. 10m57s on dswa2 for the csw1 link \u2014 expose the divergence). During the ~4-minute gap, dswa1's bridge VLAN interfaces were UP and responding to ARP for 10.1.0.1/32 and 10.0.0.1/32, but without FRR running, dswa1 had no inter-VLAN or OSPF routing capability. Packets sent to dswa1 as a gateway were silently dropped. When dswa1's ospfd finally started, it flooded new LSAs into the OSPF area, triggering a full SPF recalculation (~47 seconds to reach Full adjacency) that briefly disrupted reachability to all Office A gateways \u2014 including 10.6.0.1 on dswa2, whose routes were transiently recalculated. dswa2's FRR log also records two OSPF Hello NetworkMask-mismatch errors from dswa1 at 09:45:56/09:46:06 on br0.99, caused by dswa1's secondary 10.0.0.1/32 address being picked up as the interface mask, further delaying the management-VLAN adjacency.\n\n**Localization**: dswa1 \u2014 br0.10 (10.1.0.1/32 duplicate), br0.99 (10.0.0.1/32 duplicate + /32 Hello mask mismatch); root FRR delayed startup.\n\n**Root cause**: dswa1's ospfd started approximately 4 minutes late (real time), and carries duplicate gateway secondary IPs (10.1.0.1/32, 10.0.0.1/32) that also exist on dswa2 with no VRRP to arbitrate \u2014 when dswa1 joined OSPF it triggered reconvergence, and the uncoordinated duplicate IPs left ARP caches diverged (pc1\u219210.1.0.1 via dswa2's MAC; pc2\u219210.1.0.1 via dswa1's MAC), producing the \"slightly longer path\" as different hosts now route through different physical distribution switches.\n\n**Fix**: Synchronise container clocks (or use FRR `ospf startup-notify`); remove the duplicate /32 secondary gateway addresses from dswa1's br0.10 and br0.99 (or add the missing 10.6.0.1/32 and 10.2.0.1/32 to dswa1) and configure VRRP on both dswa1 and dswa2 for all gateway IPs so a single virtual MAC is advertised regardless of which physical switch is active.",
+      "is_anomaly": true,
+      "faulty_devices": [
+        "dswa1"
+      ],
+      "parsed_ok": true,
+      "in_tokens": 32,
+      "cache_read_tokens": 669660,
+      "cache_write_tokens": 78098,
+      "out_tokens": 58913,
+      "cost_usd": 1.3802035000000001,
+      "tool_calls": 32,
+      "hit_max_turns": false,
+      "error": null
+    },
+    "score": {
+      "must_passed": 2,
+      "must_total": 4,
+      "bonus_passed": 0,
+      "bonus_total": 0,
+      "outcome_score": 0.5,
+      "fix_score": 1.0,
+      "reasoning_score": 0.6,
+      "reasoning_dims": {
+        "grounding": 0.6,
+        "causality": 0.6,
+        "coverage": 0.6
+      },
+      "final_score": 0.5,
+      "per_axis": [
+        {
+          "axis": "assert-identifies: dswa1",
+          "kind": "assert",
+          "score": 1.0,
+          "rationale": "culprit 'dswa1' named (good)"
+        },
+        {
+          "axis": "must-identify-device: dswa1",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The agent explicitly localizes the fault to dswa1 in multiple places of the diagnosis."
+        },
+        {
+          "axis": "must-identify-component: keepalived / VRRP",
+          "kind": "must",
+          "score": 0.0,
+          "rationale": "The submission does not identify keepalived/VRRP as the affected component \u2014 it blames FRR/ospfd and duplicate IPs and only mentions VRRP later as a mitigation."
+        },
+        {
+          "axis": "must-explain-failover-pattern",
+          "kind": "must",
+          "score": 0.0,
+          "rationale": "The writeup does not explain the observed VRRP failover pattern (rapid ~3s MASTER switch when keepalived stopped) and instead blames OSPF/duplicate-IP reconvergence, so it fails to account for the quick VIP takeover and brief packet drop behavior."
+        },
+        {
+          "axis": "[FIX]",
+          "kind": "fix",
+          "score": 1.0,
+          "rationale": "Agent recommends configuring VRRP on dswa1/dswa2 (i.e., run keepalived) which matches the expected fix to start keepalived on dswa1."
+        },
+        {
+          "axis": "reason:grounding",
+          "kind": "reason-dim",
+          "score": 0.6,
+          "rationale": "The agent gathered relevant data (ARP divergence, OSPF neighbor ages, ip addr outputs, FRR logs) and built a plausible narrative, but some specific claims (container clock skew, absence of VRRP/keepalived on both boxes vs. just dswa1) are weaker or not fully evidenced in the log. Overall the chain of inference is reasonable but contains a few unsupported leaps and incomplete grounding for critical assertions."
+        },
+        {
+          "axis": "reason:causality",
+          "kind": "reason-dim",
+          "score": 0.6,
+          "rationale": "The agent gathered relevant data (ARP divergence, OSPF neighbor ages, ip addr outputs, FRR logs) and built a plausible narrative, but some specific claims (container clock skew, absence of VRRP/keepalived on both boxes vs. just dswa1) are weaker or not fully evidenced in the log. Overall the chain of inference is reasonable but contains a few unsupported leaps and incomplete grounding for critical assertions."
+        },
+        {
+          "axis": "reason:coverage",
+          "kind": "reason-dim",
+          "score": 0.6,
+          "rationale": "The agent gathered relevant data (ARP divergence, OSPF neighbor ages, ip addr outputs, FRR logs) and built a plausible narrative, but some specific claims (container clock skew, absence of VRRP/keepalived on both boxes vs. just dswa1) are weaker or not fully evidenced in the log. Overall the chain of inference is reasonable but contains a few unsupported leaps and incomplete grounding for critical assertions."
+        }
+      ],
+      "judge_model": "gpt-5-mini",
+      "reasoning_mode": "trace",
+      "error": null
+    }
+  },
+  "agent_input_prompt": "# Topology overview (devices + L2 connectivity)\nTopology: Kath1\n\nDevices:\n  aswa1: eth0=CD_CLIENT_A1, eth1=CD_LINK_A2, eth2=CD_DSW_1_A1, eth3=CD_DSW_2_A1\n  aswa2: eth0=link_a2_pc, eth1=CD_DSW_1_A2, eth2=CD_DSW_2_A2\n  aswa3: eth0=CD_CLIENT_A3, eth1=CD_DSW_1_A3, eth2=CD_DSW_2_A3\n  aswb1: eth0=CD_CLIENT_B1, eth1=CD_DSW_1_B1, eth2=CD_DSW_2_B1\n  aswb2: eth0=CD_CLIENT_B2, eth1=CD_DSW_1_B2, eth2=CD_DSW_2_B2\n  aswb3: eth0=CD_CLIENT_B3, eth1=CD_DSW_1_B3, eth2=CD_DSW_2_B3\n  csw1: eth0=CD_WAN_LINK_1, eth1=CD_CORE_PEER_1, eth2=CD_CORE_PEER_2, eth3=CD_CORE_1_DSW1, eth4=CD_CORE_1_DSW2, eth5=CD_CORE_1_DSWB1, eth6=CD_CORE_1_DSWB2\n  csw2: eth0=CD_WAN_LINK_2, eth1=CD_CORE_PEER_1, eth2=CD_CORE_PEER_2, eth3=CD_CORE_2_DSW1, eth4=CD_CORE_2_DSW2, eth5=CD_CORE_2_DSWB1, eth6=CD_CORE_2_DSWB2\n  dswa1: eth0=CD_DSW_1_A1, eth1=CD_DSW_1_A2, eth2=CD_DSW_1_A3, eth3=CD_DSW_PEER_1, eth4=CD_DSW_PEER_2, eth5=CD_CORE_1_DSW1, eth6=CD_CORE_2_DSW1\n  dswa2: eth0=CD_DSW_2_A1, eth1=CD_DSW_2_A2, eth2=CD_DSW_2_A3, eth3=CD_DSW_PEER_1, eth4=CD_DSW_PEER_2, eth5=CD_CORE_1_DSW2, eth6=CD_CORE_2_DSW2\n  dswb1: eth0=CD_DSW_1_B1, eth1=CD_DSW_1_B2, eth2=CD_DSW_1_B3, eth3=CD_DSW_PEER_B_1, eth4=CD_DSW_PEER_B_2, eth5=CD_CORE_1_DSWB1, eth6=CD_CORE_2_DSWB1\n  dswb2: eth0=CD_DSW_2_B1, eth1=CD_DSW_2_B2, eth2=CD_DSW_2_B3, eth3=CD_DSW_PEER_B_1, eth4=CD_DSW_PEER_B_2, eth5=CD_CORE_1_DSWB2, eth6=CD_CORE_2_DSWB2\n  ispa: eth0=CD_ISP_R1, eth1=CD_ISPA_ISPB\n  ispb: eth0=CD_ISPB_R1, eth1=CD_ISPA_ISPB\n  laptop1: eth0=CD_LINK_A2\n  pc1: eth0=link_a2_pc\n  pc2: eth0=CD_CLIENT_A3\n  pc3: eth0=CD_CLIENT_B2\n  r1: eth0=CD_WAN_LINK_1, eth1=CD_WAN_LINK_2, eth2=CD_ISP_R1, eth3=CD_ISPB_R1\n  srv1: eth0=CD_CLIENT_B3\n\nCollision domains (shared L2 segments):\n  CD_CLIENT_A1: aswa1.eth0\n  CD_CLIENT_A3: aswa3.eth0, pc2.eth0\n  CD_CLIENT_B1: aswb1.eth0\n  CD_CLIENT_B2: aswb2.eth0, pc3.eth0\n  CD_CLIENT_B3: aswb3.eth0, srv1.eth0\n  CD_CORE_1_DSW1: csw1.eth3, dswa1.eth5\n  CD_CORE_1_DSW2: csw1.eth4, dswa2.eth5\n  CD_CORE_1_DSWB1: csw1.eth5, dswb1.eth5\n  CD_CORE_1_DSWB2: csw1.eth6, dswb2.eth5\n  CD_CORE_2_DSW1: csw2.eth3, dswa1.eth6\n  CD_CORE_2_DSW2: csw2.eth4, dswa2.eth6\n  CD_CORE_2_DSWB1: csw2.eth5, dswb1.eth6\n  CD_CORE_2_DSWB2: csw2.eth6, dswb2.eth6\n  CD_CORE_PEER_1: csw1.eth1, csw2.eth1\n  CD_CORE_PEER_2: csw1.eth2, csw2.eth2\n  CD_DSW_1_A1: aswa1.eth2, dswa1.eth0\n  CD_DSW_1_A2: aswa2.eth1, dswa1.eth1\n  CD_DSW_1_A3: aswa3.eth1, dswa1.eth2\n  CD_DSW_1_B1: aswb1.eth1, dswb1.eth0\n  CD_DSW_1_B2: aswb2.eth1, dswb1.eth1\n  CD_DSW_1_B3: aswb3.eth1, dswb1.eth2\n  CD_DSW_2_A1: aswa1.eth3, dswa2.eth0\n  CD_DSW_2_A2: aswa2.eth2, dswa2.eth1\n  CD_DSW_2_A3: aswa3.eth2, dswa2.eth2\n  CD_DSW_2_B1: aswb1.eth2, dswb2.eth0\n  CD_DSW_2_B2: aswb2.eth2, dswb2.eth1\n  CD_DSW_2_B3: aswb3.eth2, dswb2.eth2\n  CD_DSW_PEER_1: dswa1.eth3, dswa2.eth3\n  CD_DSW_PEER_2: dswa1.eth4, dswa2.eth4\n  CD_DSW_PEER_B_1: dswb1.eth3, dswb2.eth3\n  CD_DSW_PEER_B_2: dswb1.eth4, dswb2.eth4\n  CD_ISPA_ISPB: ispa.eth1, ispb.eth1\n  CD_ISPB_R1: ispb.eth0, r1.eth3\n  CD_ISP_R1: ispa.eth0, r1.eth2\n  CD_LINK_A2: aswa1.eth1, laptop1.eth0\n  CD_WAN_LINK_1: csw1.eth0, r1.eth0\n  CD_WAN_LINK_2: csw2.eth0, r1.eth1\n  link_a2_pc: aswa2.eth0, pc1.eth0\n\n# Symptom (user report)\nOffice A users report a brief connectivity outage to their\ndefault gateway (10.1.0.1, 10.6.0.1, 10.0.0.1), then service\nrestored. After the event, traffic appears to take a slightly\nlonger path. The gateways still respond. Find what caused the\nevent."
+}

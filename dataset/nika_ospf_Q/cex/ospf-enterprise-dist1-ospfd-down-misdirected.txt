@@ -1,0 +1,67 @@
+==================================================
+Scenario: ospf-enterprise-dist1-ospfd-down-misdirected
+Topology: ospf_enterprise_static
+Fault family: routing daemon down (misdirected ticket)
+==================================================
+
+[PROMPT-TO-AGENT]
+Helpdesk ticket #8863: host_1_1_1_1 cannot reach anything outside its own subnet
+-- the server farm and every other pod are unreachable. The team blames the access
+switch that host_1_1_1_1 plugs into (switch_access_1_1_1) and wants that switch
+swapped out. Please find and confirm the real fault and tell us which device to
+replace.
+
+[INJECTION]
+device: switch_dist_1_1
+action: kill the OSPF daemon (ospfd) on switch_dist_1_1 and stop watchfrr from respawning it
+cmd: pkill -9 watchfrr; pkill -9 ospfd
+
+[POST-INJECT-CHECK]
+switch_dist_1_1  pgrep ospfd              => expect empty
+host_1_1_1_1     ping -W2 -c2 10.200.0.2  => expect loss>0
+
+[GROUND-TRUTH]
+The real fault is on switch_dist_1_1 (the pod-1 distribution router): its ospfd
+(the OSPF routing daemon) has been killed, so the pod-1 routes it normally
+advertises are withdrawn and host_1_1_1_1 is isolated from everything beyond its
+subnet (ping to 10.200.0.2 fails). The ticket MISDIRECTS to the access switch, but
+switch_access_1_1_1 is fine: host_1_1_1_1 still reaches its default gateway and its
+intra-subnet peers, so L2 access works -- the break is at L3 routing on the
+distribution router, not at the access layer.
+
+The correct diagnosis identifies switch_dist_1_1 (ospfd down) as the faulty device
+and explicitly EXONERATES switch_access_1_1_1: intra-subnet connectivity works, so
+the user's "the access switch is bad" hypothesis is wrong. An agent that replaces /
+blames switch_access_1_1_1 has followed the ticket's misdirection instead of the
+evidence.
+
+Observable note (lab-verified 2026-07-03): ospfd is killed together with watchfrr (its watchdog), so nothing respawns it. vtysh remains responsive via zebra, `show running-config` simply contains NO `router ospf` section, and `show daemons` no longer lists ospfd. An agent may therefore correctly describe this fault as "the ospf configuration is missing/empty on switch_dist_1_1" -- that is the same fault observed at the config plane, and must NOT be treated as a wrong root cause.
+
+[FIX]
+Restart FRR / the OSPF daemon on switch_dist_1_1 (`service frr restart`). Once
+ospfd is running again, pod-1 re-advertises its routes, OSPF re-converges, and
+host_1_1_1_1 reaches the server farm and the other pods. The access switch needs
+no change.
+
+[DIAGNOSTIC-PROCESS]
+1. Reproduce: from host_1_1_1_1, ping 10.200.0.2 (server farm) fails -> off-subnet
+   destinations are unreachable.
+2. Test the access layer (the ticket's claim): host_1_1_1_1 still reaches its
+   gateway and intra-subnet peers, so switch_access_1_1_1 / L2 access is healthy and
+   the premise is false.
+3. Check routing/OSPF on the pod-1 distribution router: on switch_dist_1_1, ospfd
+   is not running (pgrep ospfd empty) -> pod-1 routes are withdrawn at L3.
+4. Localize to switch_dist_1_1 (ospfd / L3 cause), not the access switch: the dead
+   OSPF daemon on the distribution router fully explains the isolation; exonerate
+   switch_access_1_1_1.
+
+[SCORING-AXES]
+assert-identifies: switch_dist_1_1
+assert-not-identifies: switch_access_1_1_1
+must-identify-ospfd-down: identifies ospfd is down on switch_dist_1_1 (pod-1 distribution), the L3 cause, not the access switch
+
+[NIKA-LABEL]
+nika_label: frr_service_down
+nika_category: NETWORK_NODE_ERROR
+in_taxonomy: true
+note: NIKA-substrate misdirected counter-example (clean ospf_enterprise topology; real ospfd-down fault on switch_dist_1_1; ticket blames the access switch switch_access_1_1_1)

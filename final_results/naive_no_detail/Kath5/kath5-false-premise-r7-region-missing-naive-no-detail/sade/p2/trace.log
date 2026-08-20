@@ -1,0 +1,94 @@
+[AGENT] sade starts on lab=Kath5__w1
+[TEXT] I'll start with Phase 1 — a topology-wide reachability map before doing anything else.
+[TOOL] ToolSearch({'query': 'select:mcp__kathara_base_mcp_server__get_reachability', 'max_results': 1})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_base_mcp_server__get_reachability'}]
+[TOOL] mcp__kathara_base_mcp_server__get_reachability({})
+[RESULT] {"result":"{\"hosts\":{\"pc0\":\"20.1.1.10\",\"pc12\":\"120.1.1.10\"},\"results\":[{\"src\":\"pc0\",\"dst\":\"pc12\",\"dst_ip\":\"120.1.1.10\",\"tx\":2,\"rx\":2,\"loss_percent\":0.0,\"time_ms\":1004.0,\"rtt_avg_ms\":3.7,\"rtt_min_ms\":1.918,\"rtt_max_ms\":5.483,\"rtt_mdev_ms\":1.782,\"status\":\"ok\"},{\"src\":\"pc12\",\"dst\":\"pc0\",\"dst_ip\":\"20.1.1.10\",\"tx\":2,\"rx\":2,\"loss_percent\":0.0
+[TEXT] **Phase 1 complete.** The reachability map covers only two end-hosts (`pc0` ↔ `pc12`) and both show **0% loss**. No confirmed symptom from Phase 1.
+
+**Phase 2 branch:** The user's report ("entire region wiped off the map") implies routing prefixes disappearing, but I have no direct evidence of loss yet. Proceeding to **Phase 4 — broad-search escalation**.
+
+First action: enter the broad-search methodology skill.
+[TOOL] Skill({'skill': 'diagnosis-methodology-skill'})
+[RESULT] Launching skill: diagnosis-methodology-skill
+[TEXT] **Phase A — L2 and infrastructure triage.** Running both required helpers simultaneously.
+[TOOL] mcp__helper_server__run_helper({'script_name': 'infra_sweep'})
+[TOOL] mcp__helper_server__run_helper({'script_name': 'l2_snapshot'})
+[RESULT] {"result":"=== INFRA SWEEP ===\nLab: Kath5__w1\nScope: hosts, routers, switches, servers, bmv2_switches, ovs_switches, sdn_controllers, other_devices\nDevices scanned: 15\nFlagged devices: 0\n\nCategories inspected:\n  - ACL/firewall drop fingerprints: 0 device(s) with rules matched (0 means no protocol-specific drops seen)\n  - Static ARP entries (CM/PM/PERMANENT) on hosts: 0 found\n  - Fabricate
+[RESULT] {"result":"=== L2 SNAPSHOT ===\nLab: Kath5__w1\nScope: hosts, routers, switches, servers, bmv2_switches, ovs_switches, sdn_controllers, other_devices\nDevices scanned: 15\nDuplicate MAC groups: 0\nFlagged devices: 0\nDevices with bridge members: 0\nDevice errors: 0\nLink-discovery warnings: 12\n\nAll 15 devices' L2 identity is clean (no duplicate MACs, no down/missing interfaces).\nUse --show-clea
+[TEXT] **Phase A clean.** No ACL drops, no duplicate MACs, no addressing anomalies. Advancing to **Phase B — Control plane and routing**.
+
+The topology has 13 routers and the user explicitly points to the "routing brain." Running the OSPF/FRR snapshot.
+[TOOL] mcp__helper_server__run_helper({'script_name': 'ospf_snapshot'})
+[RESULT] {"result":"=== OSPF SNAPSHOT ===\nLab: Kath5__w1\nRouters scanned: 13\nFlags:\n  - r12: no OSPF network statements\n  - r12: non-Full neighbors present: {'is': 1}\n  - r13: FRR control sockets missing (ospfd_vty) — daemon likely down\n  - r13: no OSPF network statements\n  - r13: zero OSPF neighbors\n  - r4: OSPF interface VLINK0 (45.1.1.1/8) is running in area 0.0.0.0 but the matching network sta
+[TEXT] **Phase B has surfaced multiple anomalies.** Key findings:
+
+1. **r8**: Orphaned area `0.0.0.2` — 0 full adjacencies across 5 active interfaces; no peer shares this area. Also VLINK0 area mismatch (running in 0.0.0.0 vs declared 0.0.0.1).
+2. **r13**: `ospfd_vty` socket missing — daemon likely down; zero neighbors, zero OSPF routes.
+3. **r12**: No OSPF network statements, non-Full neighbor.
+
+The "entire region wiped off the map" maps clearly to **r8's orphaned OSPF area 0.0.0.2** — a whole area with no adjacencies. Leaving broad search, entering the OSPF fault family.
+[TOOL] Skill({'skill': 'ospf-fault-skill'})
+[RESULT] Launching skill: ospf-fault-skill
+[TEXT] Skill loaded. Active leads: **r8** (orphaned area 0.0.0.2) and **r13** (ospfd likely down). Getting direct config evidence on both simultaneously.
+[TOOL] mcp__kathara_frr_mcp_server__frr_show_running_config({'router_name': 'r8'})
+[RESULT] {"result":"Building configuration...\n\nCurrent configuration:\n!\nfrr version 10.5.3\nfrr defaults traditional\nhostname r8\nlog file /var/log/frr/frr.log\nno service integrated-vtysh-config\n!\npassword zebra\nenable password zebra\n!\nrouter ospf\n network 18.0.0.0/8 area 2\n network 58.0.0.0/8 area 1\n network 80.0.0.0/8 area 2\n area 1 virtual-link 14.1.4.1\nexit\n!\nend"}
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'r13', 'command': "ps aux | grep -E 'zebra|ospfd|watchfrr' | grep -v grep"})
+[RESULT] {"result":"root          69  0.0  0.1   8668  3864 ?        Ss   08:41   0:00 /usr/lib/frr/watchfrr -d mgmtd zebra eigrpd staticd\nfrr           82  0.0  0.4 318388 10504 ?        Ssl  08:41   0:00 /usr/lib/frr/zebra -d -F traditional -A 127.0.0.1 -s 90000000"}
+[TEXT] Critical finding on **r13**: `watchfrr` is managing `mgmtd zebra eigrpd staticd` — **ospfd is completely absent**. On **r8**, I can see the config: area 2 has `18.0.0.0/8` and `80.0.0.0/8`, with a virtual-link to `14.1.4.1` through area 1. I need to verify if r8's virtual link is actually up, and check r4's matching config.
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'r8', 'command': "vtysh -c 'show ip ospf neighbor'"})
+[RESULT] {"result":"Neighbor ID     Pri State           Up Time         Dead Time Address         Interface                        RXmtL RqstL DBsmL\n15.1.4.1          1 Full/Backup     5m20s             34.533s 58.1.1.1        eth0:58.1.1.2                        0     0     0\n14.1.4.1          1 Full/DROther    5m05s             34.131s 45.1.1.1        VLINK0                               0     0     0"
+[TOOL] mcp__kathara_frr_mcp_server__frr_show_running_config({'router_name': 'r4'})
+[TOOL] mcp__kathara_frr_mcp_server__frr_show_running_config({'router_name': 'r13'})
+[RESULT] {"result":"Building configuration...\n\nCurrent configuration:\n!\nfrr version 10.5.3\nfrr defaults traditional\nhostname r4\nlog file /var/log/frr/frr.log\nno service integrated-vtysh-config\n!\npassword zebra\nenable password zebra\n!\nrouter ospf\n network 14.0.0.0/8 area 1\n network 34.0.0.0/8 area 0\n network 40.0.0.0/8 area 1\n network 45.0.0.0/8 area 1\n network 46.0.0.0/8 area 1\n area 1 v
+[RESULT] {"result":"Building configuration...\n\nCurrent configuration:\n!\nfrr version 10.5.3\nfrr defaults traditional\nhostname r13\nlog file /var/log/frr/frr.log\nno service integrated-vtysh-config\n!\npassword zebra\nenable password zebra\n!\nrouter eigrp 100\n network 103.0.0.0/8\n network 113.1.1.0/24\n network 113.1.2.0/24\n network 113.1.3.0/24\n network 113.1.4.0/24\nexit\n!\nend"}
+[TEXT] This reveals the diagnosis conclusively. Key evidence:
+
+**r8** — VLINK0 is **Full** with 14.1.4.1 (r4); eth0 is **Full** with 15.1.4.1 (r5). The virtual link is working. Area 0.0.0.2 is a valid single-router non-backbone area connected through the virtual link — the "orphaned" flag was a false alarm.
+
+**r13** — Running config shows **EIGRP 100**, not OSPF:
+```
+router eigrp 100
+ network 103.0.0.0/8
+ network 113.1.1.0/24
+ network 113.1.2.0/24
+ network 113.1.3.0/24
+ network 113.1.4.0/24
+```
+And its `watchfrr` manages `eigrpd` — **ospfd is entirely absent**. r13's only peer on FF is r11, which runs OSPF. EIGRP has zero peers, zero adjacencies, and zero redistribution into OSPF. Five prefixes (including four `113.1.x.0/24` subnets and `103.0.0.0/8`) are completely invisible to the OSPF domain.
+
+[FINAL] stop=end_turn tool_calls=12
+[SUBMITTED] parsed_ok=True is_anomaly=True faulty_devices=['r13']
+[FINAL-TEXT] This reveals the diagnosis conclusively. Key evidence:
+
+**r8** — VLINK0 is **Full** with 14.1.4.1 (r4); eth0 is **Full** with 15.1.4.1 (r5). The virtual link is working. Area 0.0.0.2 is a valid single-router non-backbone area connected through the virtual link — the "orphaned" flag was a false alarm.
+
+**r13** — Running config shows **EIGRP 100**, not OSPF:
+```
+router eigrp 100
+ network 103.0.0.0/8
+ network 113.1.1.0/24
+ network 113.1.2.0/24
+ network 113.1.3.0/24
+ network 113.1.4.0/24
+```
+And its `watchfrr` manages `eigrpd` — **ospfd is entirely absent**. r13's only peer on FF is r11, which runs OSPF. EIGRP has zero peers, zero adjacencies, and zero redistribution into OSPF. Five prefixes (including four `113.1.x.0/24` subnets and `103.0.0.0/8`) are completely invisible to the OSPF domain.
+
+This is the "entire region wiped off the map."
+
+---
+
+=== DIAGNOSIS ===
+is_anomaly: true
+faulty_devices: r13
+diagnosis_text:
+**Affected component:** The OSPF routing daemon on r13 is not running at all. Instead, r13 is configured to run EIGRP (AS 100) — the wrong routing protocol for this topology.
+
+**Mechanism:** r13 owns five prefixes: `103.0.0.0/8` and `113.1.1.0/24`, `113.1.2.0/24`, `113.1.3.0/24`, `113.1.4.0/24`. These subnets are configured under `router eigrp 100` in r13's FRR configuration, with `eigrpd` running but `ospfd` completely absent (confirmed by both the missing `ospfd_vty` socket and the `watchfrr` process list, which manages `eigrpd` but has no `ospfd` entry). r13's only physical neighbor is r11 via the FF collision domain. r11 runs OSPF, not EIGRP, so r13's EIGRP process has no peers, forms no adjacencies, and no redistribution between EIGRP and OSPF is configured anywhere in the domain. The result is that r13's five prefixes never enter the OSPF LSDB, so no router in the fabric has any route toward the `113.1.x.0/24` region or `103.0.0.0/8`.
+
+**Localization:** r13, its `eth0` interface on the FF segment, and the FRR EIGRP/OSPF daemon configuration.
+
+**Root cause:** r13 is configured with EIGRP instead of OSPF, so `ospfd` was never started, and the `113.1.x.0/24` region plus `103.0.0.0/8` are permanently absent from the OSPF routing domain.
+
+**Fix:** Replace r13's `router eigrp 100` stanza with an `router ospf` stanza placing all five networks in the correct OSPF area (matching r11's area 0.0.0.3 or the area used on the FF segment), and restart FRR so that `ospfd` starts and forms adjacency with r11.
+=== END ===

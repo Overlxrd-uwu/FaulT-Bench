@@ -1,0 +1,109 @@
+[AGENT] sade starts on lab=Kath1
+[TOOL] ToolSearch({'query': 'select:mcp__kathara_base_mcp_server__get_reachability'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_base_mcp_server__get_reachability'}]
+[TOOL] mcp__kathara_base_mcp_server__get_reachability({})
+[RESULT] {"result":"{\"hosts\":{\"pc1\":\"10.1.0.100\",\"pc2\":\"10.1.0.101\",\"pc3\":\"10.3.0.100\"},\"results\":[{\"src\":\"pc1\",\"dst\":\"pc2\",\"dst_ip\":\"10.1.0.101\",\"tx\":2,\"rx\":2,\"loss_percent\":0.0,\"time_ms\":1066.0,\"rtt_avg_ms\":3.736,\"rtt_min_ms\":3.24,\"rtt_max_ms\":4.232,\"rtt_mdev_ms\":0.496,\"status\":\"ok\"},{\"src\":\"pc1\",\"dst\":\"pc3\",\"dst_ip\":\"10.3.0.100\",\"tx\":2,\"rx\"
+[TEXT] **Phase 1 result:** All internal host pairs (pc1↔pc2, pc1↔pc3, pc2↔pc3) show 0% loss. The reachability map covers only internal lab hosts — no Internet destinations are tested, so the user-reported symptom (TCP to public Internet timing out) is **not yet confirmed** by Phase 1 evidence.
+
+**Phase 2 branch:** No real symptom surfaced from Phase 1 → proceed to **Phase 4 broad-search escalation**.
+[TOOL] Skill({'skill': 'diagnosis-methodology-skill'})
+[RESULT] Launching skill: diagnosis-methodology-skill
+[TEXT] Starting Phase A — running both triage helpers simultaneously.
+[TOOL] ToolSearch({'query': 'select:mcp__helper_server__run_helper'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__helper_server__run_helper'}]
+[TOOL] mcp__helper_server__run_helper({'script_name': 'infra_sweep'})
+[TOOL] mcp__helper_server__run_helper({'script_name': 'l2_snapshot'})
+[RESULT] {"result":"Unknown machine type: ispb with image kathara/dhcp\nUnknown machine type: ispa with image kathara/dhcp\nUnknown machine type: r1 with image kathara/dhcp\nUnknown machine type: ispb with image kathara/dhcp\nUnknown machine type: ispa with image kathara/dhcp\nUnknown machine type: r1 with image kathara/dhcp\n=== INFRA SWEEP ===\nLab: Kath1\nScope: hosts, routers, switches, servers, bmv2_s
+[RESULT] {"result":"Unknown machine type: ispb with image kathara/dhcp\nUnknown machine type: ispa with image kathara/dhcp\nUnknown machine type: r1 with image kathara/dhcp\n=== L2 SNAPSHOT ===\nLab: Kath1\nScope: hosts, routers, switches, servers, bmv2_switches, ovs_switches, sdn_controllers, other_devices\nDevices scanned: 20\nDuplicate MAC groups: 0\nFlagged devices: 4\nDevices with bridge members: 8\nD
+[TEXT] **Phase A findings — key anomaly surfaced:**
+
+`infra_sweep` shows **ispa** (eth0, facing r1) has active nftables drop rules for RFC 1918 source addresses:
+- `iifname "eth0" ip saddr 10.0.0.0/8 … counter packets 5 bytes 300 drop` ← **5 active hits**
+- `iifname "eth0" ip saddr 172.16.0.0/12` and `192.168.0.0/16` (0 hits each)
+
+**ispb** has the **identical rules** but with zero hits (traffic not flowing that path).
+
+**r1** only flagged for SSH drop (tcp dport 22, 0 hits).
+
+`l2_snapshot` shows 0 duplicate MACs — L2 identity is clean.
+
+This is a real symptom: packets with RFC 1918 source IPs are **actively reaching ispa's eth0 and being dropped**. This implicates an ACL fault family. Exiting Phase 4 broad-search and entering Phase 3 symptom-first diagnosis.
+
+**Active lead:** ispa's nftables is 
+[TOOL] Skill({'skill': 'acl-skill'})
+[RESULT] Launching skill: acl-skill
+[TEXT] The infra_sweep already fingered **ispa** and **r1**. I need to confirm the complete nftables ruleset on both to distinguish whether the fault is:
+- An injected ACL on **ispa** (drop rules added to block RFC 1918 sources), or
+- Missing source NAT on **r1** (private IPs leak to ispa's legitimate BCP38 filter)
+[TOOL] ToolSearch({'query': 'select:mcp__kathara_base_mcp_server__exec_shell'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_base_mcp_server__exec_shell'}]
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'ispa', 'command': 'nft list ruleset'})
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'r1', 'command': 'nft list ruleset'})
+[RESULT] {"result":"table ip nat {\n\tchain DOCKER_OUTPUT {\n\t\tip daddr 127.0.0.11 tcp dport 53 counter packets 0 bytes 0 dnat to 127.0.0.11:36969\n\t\tip daddr 127.0.0.11 udp dport 53 counter packets 0 bytes 0 dnat to 127.0.0.11:48973\n\t}\n\n\tchain OUTPUT {\n\t\ttype nat hook output priority -100; policy accept;\n\t\tip daddr 127.0.0.11 counter packets 0 bytes 0 jump DOCKER_OUTPUT\n\t}\n\n\tchain DOCK
+[RESULT] {"result":"table ip nat {\n\tchain DOCKER_OUTPUT {\n\t\tip daddr 127.0.0.11 tcp dport 53 counter packets 0 bytes 0 dnat to 127.0.0.11:37813\n\t\tip daddr 127.0.0.11 udp dport 53 counter packets 0 bytes 0 dnat to 127.0.0.11:54134\n\t}\n\n\tchain OUTPUT {\n\t\ttype nat hook output priority -100; policy accept;\n\t\tip daddr 127.0.0.11 counter packets 0 bytes 0 jump DOCKER_OUTPUT\n\t}\n\n\tchain DOCK
+[TEXT] **Critical differential confirmed:**
+
+**r1's nft ruleset — POSTROUTING chain is empty:**
+```
+chain POSTROUTING {
+    type nat hook postrouting priority srcnat; policy accept;
+    ← NO masquerade/SNAT rule
+}
+```
+r1 also has a PREROUTING DNAT rule (`203.0.113.113 → 10.5.0.4`), proving NAT was intentionally configured — but the outbound masquerade is absent.
+
+**ispa's nft ruleset — INPUT chain actively dropping:**
+```
+iifname "eth0" ip saddr 10.0.0.0/8  → 5 packets / 300 bytes dropped  ← HIT
+iifname "eth0" ip saddr 172.16.0.0/12 → 0 hits
+iifname "eth0" ip saddr 192.168.0.0/16 → 0 hits
+```
+
+**ispb** has the identical RFC 1918 filter rules (0 hits) — symmetric BCP38 ingress filtering on both ISP uplinks is standard behaviour, not the injected fault.
+
+**Causal chain:**
+1. r1 has no SNAT/masquera
+[FINAL] stop=end_turn tool_calls=10
+[SUBMITTED] parsed_ok=True is_anomaly=True faulty_devices=['r1']
+[FINAL-TEXT] **Critical differential confirmed:**
+
+**r1's nft ruleset — POSTROUTING chain is empty:**
+```
+chain POSTROUTING {
+    type nat hook postrouting priority srcnat; policy accept;
+    ← NO masquerade/SNAT rule
+}
+```
+r1 also has a PREROUTING DNAT rule (`203.0.113.113 → 10.5.0.4`), proving NAT was intentionally configured — but the outbound masquerade is absent.
+
+**ispa's nft ruleset — INPUT chain actively dropping:**
+```
+iifname "eth0" ip saddr 10.0.0.0/8  → 5 packets / 300 bytes dropped  ← HIT
+iifname "eth0" ip saddr 172.16.0.0/12 → 0 hits
+iifname "eth0" ip saddr 192.168.0.0/16 → 0 hits
+```
+
+**ispb** has the identical RFC 1918 filter rules (0 hits) — symmetric BCP38 ingress filtering on both ISP uplinks is standard behaviour, not the injected fault.
+
+**Causal chain:**
+1. r1 has no SNAT/masquerade rule → outbound packets leave r1 toward ispa carrying private source IPs (e.g. 10.1.0.100)  
+2. ispa's standard BCP38 INPUT filter drops any packet arriving on eth0 (customer port) with a private-space source  
+3. SYN packets never reach the public Internet → no SYN-ACK returns → TCP connections time out  
+4. Internal traffic and DNS never transit r1→ispa, so they are unaffected
+
+The faulty device is **r1** (missing masquerade), not ISPA. The ISP's filter is working exactly as designed.
+
+=== DIAGNOSIS ===
+is_anomaly: true
+faulty_devices: r1
+diagnosis_text:
+**Affected component:** The `table ip nat / chain POSTROUTING` on router r1 is missing its source-NAT (masquerade) rule. r1 has an intentional PREROUTING DNAT entry (`203.0.113.113 → 10.5.0.4`), confirming NAT was designed into this device, but no corresponding outbound masquerade rule exists.
+
+**Mechanism:** Without masquerade, every packet leaving the corporate network toward the Internet retains its private RFC 1918 source address (e.g. 10.1.0.100). These unmasqueraded packets traverse r1 and arrive at ispa's eth0 — the customer-facing interface — still carrying a 10.x.x.x source. Both ISP devices (ispa and ispb) run standard BCP38 ingress filters that drop any packet arriving from the customer side with a private-space source. ispa's `chain INPUT` shows 5 packets / 300 bytes already dropped, directly confirming the mechanism is active. TCP SYN packets are silently discarded; no SYN-ACK is ever returned; the connection times out.
+
+**Localization:** r1 (the border router), specifically its `table ip nat / chain POSTROUTING` hook, which is completely empty. ispa's ACL is the enforcement point but is operating correctly per BCP38; it is not the fault.
+
+**Root cause:** r1 is missing the outbound source-NAT masquerade rule, causing corporate RFC 1918 traffic to reach the ISP with private source IPs that the ISP's ingress filter legitimately drops.
+
+**Fix:** Add a masquerade rule to r1's POSTROUTING chain: `nft add rule ip nat POSTROUTING oifname "eth0" masquerade` (or equivalent for the ISP-A uplink interface). This will translate private source IPs to r1's public IP before forwarding, bypassing ispa's BCP38 filter. The ISP circuit is healthy; no carrier fault ticket is warranted.
+=== END ===

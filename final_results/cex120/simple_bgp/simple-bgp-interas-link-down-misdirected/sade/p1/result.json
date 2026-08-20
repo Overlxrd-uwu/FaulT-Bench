@@ -1,0 +1,165 @@
+{
+  "scenario": {
+    "scenario_id": "simple-bgp-interas-link-down-misdirected",
+    "topology": "simple_bgp",
+    "fault_family": "link down (misdirected ticket)",
+    "prompt_to_agent": "Helpdesk ticket #9105: A user on pc1 (195.11.14.2) reports they have completely\nlost connectivity to the partner network -- they cannot reach pc2 (200.1.1.2) in\nthe peer AS since this morning. The team is convinced the peer's router, router2,\ndropped the peering and want router2 restarted. Please find and confirm the real\nfault and tell us which device to restart.",
+    "injection": {
+      "device": "router1",
+      "action": "administratively down the inter-AS interface (eth0) on router1",
+      "command": "ip link set eth0 down",
+      "note": null
+    },
+    "pre_check": [],
+    "post_inject_check": [
+      {
+        "device": "router1",
+        "command": "ip -br link show eth0 | grep -c UP",
+        "expect": "0"
+      },
+      {
+        "device": "pc1",
+        "command": "ping -W2 -c2 200.1.1.2",
+        "expect": "loss>0"
+      }
+    ],
+    "ground_truth": "The real fault is the inter-AS link on router1: router1's eth0 (the interface to\nrouter2) is DOWN, so the physical/L2 path between the two ASes is broken. As a\nCONSEQUENCE the eBGP session between router1 and router2 drops and the inter-AS\nprefixes are withdrawn, so pc1 (195.11.14.2) cannot reach pc2 (200.1.1.2). The\nticket MISDIRECTS to router2 (\"router2 dropped the peering\"), but the fault is on\nthe LOCAL side: it is router1's own inter-AS interface that is down. router2 is\nhealthy -- its bgpd is still running and its inter-AS interface is up; the session\nis down only because router1's link went away.\n\nThe correct diagnosis identifies router1 (inter-AS link / eth0 down) as the root\ncause and explicitly EXONERATES router2: router2's BGP daemon and interface are\nfine, so the user's \"router2 dropped the peering\" hypothesis is wrong. An agent\nthat restarts / blames router2 has followed the ticket's misdirection instead of\nthe evidence.",
+    "fix_spec": "Bring the inter-AS link back up: on router1 run `ip link set eth0 up`. Once eth0\nis up again, the eBGP session to router2 re-establishes, the inter-AS prefixes are\nre-exchanged, and pc1 reaches pc2 normally. router2 needs no change -- it was\nhealthy the whole time.",
+    "scoring_axes": [
+      "assert-identifies: router1",
+      "assert-not-identifies: router2",
+      "must-identify-link-down: identifies the inter-AS link (router1 eth0) is down as the root cause, with BGP loss as a consequence",
+      "bonus-notes-router2-healthy: notes router2's bgpd is up and its inter-AS interface is healthy, rejecting the ticket's \"router2 dropped the peering\" hypothesis"
+    ],
+    "source_path": "dataset/nika_bgp_Q/cex/simple-bgp-interas-link-down-misdirected.txt",
+    "scenario_class": "wrong-device"
+  },
+  "agent": "sade",
+  "timestamp": "2026-07-05T13:46:18.126033+00:00",
+  "phases": {
+    "lstart": {
+      "ok": true,
+      "containers": 4,
+      "expected": 4
+    },
+    "settle": {
+      "converge_wait": 90
+    },
+    "injection": {
+      "applied": true,
+      "skipped_reason": null,
+      "rc": 0,
+      "output": ""
+    },
+    "post_inject_check": {
+      "results": [
+        {
+          "line": {
+            "device": "router1",
+            "command": "ip -br link show eth0 | grep -c UP",
+            "expect": "0"
+          },
+          "passed": true,
+          "actual": "0",
+          "rationale": "got 0, expected 0"
+        },
+        {
+          "line": {
+            "device": "pc1",
+            "command": "ping -W2 -c2 200.1.1.2",
+            "expect": "loss>0"
+          },
+          "passed": true,
+          "actual": "PING 200.1.1.2 (200.1.1.2) 56(84) bytes of data.\nFrom 195.11.14.1 icmp_seq=1 Destination Net Unreachable\nFrom 195.11.14.1 icmp_seq=2 Destination Net Unreachable\n\n--- 200.1.1.2 ping statistics ---\n2 packets transmitted, 0 received, +2 errors, 100% packet loss, time 1039ms",
+          "rationale": "loss=100%"
+        }
+      ],
+      "wait_seconds": 0
+    },
+    "agent": {
+      "diagnosis_text": "**Affected component:** The inter-router physical interface `eth0` on router1 (193.10.11.1/24), which is the sole BGP peering link between AS 1 (router1) and AS 2 (router2).\n\n**Mechanism:** Router1's `eth0` is in `DOWN` state (no `LOWER_UP` flag visible in `ip addr show eth0`). With the physical link down, the Linux kernel immediately tears down any TCP sockets using routes through that interface. bgpd on router1 lost its TCP session to router2 (193.10.11.2:179) and transitioned to `Active` state, with the internal reset reason recorded as *\"No path to specified Neighbor\"* and FD = -1 (no live socket). Without an established BGP session, router1 holds no route to 200.1.1.0/24, so every packet from pc1 toward pc2 is rejected by router1 with `Destination Net Unreachable`. On the reverse path, router2's session is still nominally `Established` because it is still within the 180-second BGP hold timer (last keepalive received ~2.5 min ago), but the next-hop 193.10.11.1 is unreachable through the downed link, causing router2 to return `Destination Host Unreachable` to pc2.\n\n**Localization:** router1, interface `eth0`. router2 and its bgpd are functioning correctly; the \"Established\" state on router2 is a transient artefact of the hold timer not yet expiring.\n\n**Root cause:** router1's `eth0` interface was brought down (administratively or by a link-fault injection), severing the BGP peering link and collapsing cross-AS routing.\n\n**Fix:** Bring router1's `eth0` back up \u2014 `ip link set eth0 up` on router1. The BGP session will re-establish automatically within seconds, both routers will re-exchange prefixes, and pc1 \u2194 pc2 connectivity will be restored. There is no need to restart router2.",
+      "is_anomaly": true,
+      "faulty_devices": [
+        "router1"
+      ],
+      "parsed_ok": true,
+      "in_tokens": 23,
+      "cache_read_tokens": 148062,
+      "cache_write_tokens": 21156,
+      "out_tokens": 8277,
+      "cost_usd": 0.24871860000000004,
+      "tool_calls": 15,
+      "hit_max_turns": false,
+      "error": null
+    },
+    "score": {
+      "must_passed": 3,
+      "must_total": 3,
+      "bonus_passed": 1,
+      "bonus_total": 1,
+      "outcome_score": 1.0,
+      "fix_score": 1.0,
+      "reasoning_score": 1.0,
+      "reasoning_dims": {
+        "grounding": 1.0,
+        "causality": 1.0,
+        "coverage": 1.0
+      },
+      "final_score": 1.0,
+      "per_axis": [
+        {
+          "axis": "assert-identifies: router1",
+          "kind": "assert",
+          "score": 1.0,
+          "rationale": "culprit 'router1' named (good)"
+        },
+        {
+          "axis": "assert-not-identifies: router2",
+          "kind": "assert",
+          "score": 1.0,
+          "rationale": "decoy 'router2' absent (good)"
+        },
+        {
+          "axis": "must-identify-link-down: identifies the inter-AS link (router1 eth0) is down as the root cause, with BGP loss as a consequence",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The diagnosis explicitly names router1's inter-AS interface eth0 as DOWN and describes BGP session loss as a consequence while exonerating router2, matching the ground truth."
+        },
+        {
+          "axis": "bonus-notes-router2-healthy: notes router2's bgpd is up and its inter-AS interface is healthy, rejecting the ticket's \"router2 dropped the peering\" hypothesis",
+          "kind": "bonus",
+          "score": 1.0,
+          "rationale": "The diagnosis explicitly exonerates router2, noting its bgpd is up and the inter\u2011AS interface is healthy while the session's 'Established' state is a transient artifact of the hold timer."
+        },
+        {
+          "axis": "[FIX]",
+          "kind": "fix",
+          "score": 1.0,
+          "rationale": "Proposes bringing router1's eth0 up with `ip link set eth0 up`, which directly matches the expected fix and will restore the BGP session and connectivity."
+        },
+        {
+          "axis": "reason:grounding",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "The agent's investigation log contains explicit, relevant observations (failed pings with router ICMPs, BGP snapshot, ip addr outputs showing router1 eth0 DOWN, and neighbor show outputs), and the writeup correctly and logically links those observations to the root cause and exonerates router2. The evidence, inferences, and remediation are all present and consistent."
+        },
+        {
+          "axis": "reason:causality",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "The agent's investigation log contains explicit, relevant observations (failed pings with router ICMPs, BGP snapshot, ip addr outputs showing router1 eth0 DOWN, and neighbor show outputs), and the writeup correctly and logically links those observations to the root cause and exonerates router2. The evidence, inferences, and remediation are all present and consistent."
+        },
+        {
+          "axis": "reason:coverage",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "The agent's investigation log contains explicit, relevant observations (failed pings with router ICMPs, BGP snapshot, ip addr outputs showing router1 eth0 DOWN, and neighbor show outputs), and the writeup correctly and logically links those observations to the root cause and exonerates router2. The evidence, inferences, and remediation are all present and consistent."
+        }
+      ],
+      "judge_model": "gpt-5-mini",
+      "reasoning_mode": "trace",
+      "error": null
+    }
+  },
+  "agent_input_prompt": "# Topology overview (devices + L2 connectivity)\nTopology: simple_bgp\n\nDevices:\n  Routers (FRR): router1, router2\n  Hosts: pc1, pc2\n\nLinks (device:iface <-> device:iface):\n  router1:eth0 <-> router2:eth0\n  router1:eth1 <-> pc1:eth0\n  router2:eth1 <-> pc2:eth0\n\n# Symptom (user report)\nHelpdesk ticket #9105: A user on pc1 (195.11.14.2) reports they have completely\nlost connectivity to the partner network -- they cannot reach pc2 (200.1.1.2) in\nthe peer AS since this morning. The team is convinced the peer's router, router2,\ndropped the peering and want router2 restarted. Please find and confirm the real\nfault and tell us which device to restart."
+}

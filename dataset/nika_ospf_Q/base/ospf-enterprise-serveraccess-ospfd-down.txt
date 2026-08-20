@@ -1,0 +1,80 @@
+==================================================
+Scenario: ospf-enterprise-serveraccess-ospfd-down
+Topology: ospf_enterprise_static
+Fault family: routing daemon down
+==================================================
+
+[PROMPT-TO-AGENT]
+Helpdesk ticket #8872: Users in BOTH pods report the entire data center is
+gone: from host_1_1_1_1 and host_2_1_1_1, every 10.200.0.x address times out,
+DNS queries to 10.200.0.2 time out, and no portal loads by name or by IP.
+Pod-to-pod traffic between the two user hosts still works. The server team
+says the servers themselves are up and can still ping each other and their
+gateway 10.200.0.1. Diagnose.
+
+[INJECTION]
+device: switch_server_access
+action: kill the OSPF daemon (ospfd) on switch_server_access and stop watchfrr from respawning it
+cmd: pkill -9 watchfrr; pkill -9 ospfd
+
+[POST-INJECT-CHECK]
+switch_server_access  pgrep ospfd              => expect empty
+host_1_1_1_1          ping -W2 -c2 10.200.0.2  => expect loss>0
+host_2_1_1_1          ping -W2 -c2 10.200.0.3  => expect loss>0
+dns_server            ping -W2 -c2 10.200.0.1  => expect 0% loss   (farm-local gateway still OK)
+
+[GROUND-TRUTH]
+Affected component: switch_server_access ospfd
+Mechanism: switch_server_access is the server farm's L3 edge: it owns the
+  farm gateway 10.200.0.1 on br0 and advertises 10.200.0.0/24 into OSPF
+  area 0 over its uplink to router_core_3 (172.16.0.10/31). With ospfd
+  killed, zebra flushes its OSPF-learned routes immediately, so replies
+  leaving the farm via 10.200.0.1 have no route back to 10.1.1.0/24 or
+  10.2.1.0/24 and die at the gateway; the backbone then ages out its LSAs
+  and withdraws 10.200.0.0/24. Farm-internal L2 and the gateway address
+  itself keep working (bridging and zebra are untouched), and pod-to-pod
+  traffic never crosses this device.
+Localization: switch_server_access
+Root cause: ospfd not running on switch_server_access
+Fix: restart FRR on switch_server_access (`service frr restart`).
+
+Observable note (same kill pattern lab-verified on this topology 2026-07-03):
+ospfd is killed together with watchfrr (its watchdog), so nothing respawns it.
+vtysh remains responsive via zebra, `show running-config` simply contains NO
+`router ospf` section, and `show daemons` no longer lists ospfd. An agent may
+therefore correctly describe this fault as "the ospf configuration is
+missing/empty on switch_server_access" -- that is the same fault observed at
+the config plane, and must NOT be treated as a wrong root cause.
+
+[FIX]
+Restart FRR / the OSPF daemon on switch_server_access (`service frr restart`).
+The OSPF config lives in /etc/frr/frr.conf (the injection killed the process,
+not the file), so a plain restart reloads it, 10.200.0.0/24 is re-advertised
+into area 0, and both pods regain the server farm.
+
+[DIAGNOSTIC-PROCESS]
+1. Scope the symptom: both pods lose the whole 10.200.0.0/24 farm while
+   pod-to-pod traffic works -- the common element is the farm's own L3 edge,
+   not either pod or the core interconnects.
+2. Confirm the farm is internally healthy: servers ping each other and
+   10.200.0.1, so bridging on switch_server_access and the servers are fine.
+3. Check the backbone routing: the 10.200.0.0/24 prefix is missing from the
+   core routers' tables and router_core_3's adjacency toward
+   switch_server_access is gone.
+4. Check the routing daemon on switch_server_access: `pgrep ospfd` is empty;
+   `show running-config` has no `router ospf` section -- the daemon is dead.
+5. Localize to switch_server_access ospfd: rule out the uplink (interface
+   UP), the servers (locally reachable), and the cores (adjacencies among
+   router_core_1/2/3 still Full).
+
+[SCORING-AXES]
+assert-identifies: switch_server_access
+must-identify-device: switch_server_access
+must-identify-component: ospfd / OSPF daemon down
+bonus-rules-out-l2: notes farm-internal reachability and the 10.200.0.1 gateway still work, so the fault is L3/OSPF on switch_server_access, not the bridge or the servers
+# These axes score the outcome metric only; fix and reasoning are judged separately.
+
+[NIKA-LABEL]
+nika_label: frr_service_down
+nika_category: NETWORK_NODE_ERROR
+in_taxonomy: true

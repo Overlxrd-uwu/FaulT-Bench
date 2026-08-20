@@ -1,0 +1,80 @@
+[AGENT] sade starts on lab=Kath5
+[TOOL] ToolSearch({'query': 'select:mcp__kathara_base_mcp_server__get_reachability'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_base_mcp_server__get_reachability'}]
+[TOOL] mcp__kathara_base_mcp_server__get_reachability({})
+[RESULT] {"result":"{\"hosts\":{\"pc0\":\"20.1.1.10\",\"pc12\":\"120.1.1.10\"},\"results\":[{\"src\":\"pc0\",\"dst\":\"pc12\",\"dst_ip\":\"120.1.1.10\",\"tx\":2,\"rx\":2,\"loss_percent\":0.0,\"time_ms\":1037.0,\"rtt_avg_ms\":1.039,\"rtt_min_ms\":0.915,\"rtt_max_ms\":1.164,\"rtt_mdev_ms\":0.124,\"status\":\"ok\"},{\"src\":\"pc12\",\"dst\":\"pc0\",\"dst_ip\":\"20.1.1.10\",\"tx\":2,\"rx\":2,\"loss_percent\":0
+[TEXT] **Phase 1 complete.** pc0 ↔ pc12 shows 0 % loss in both directions — no reachability failure in the probe data. However, the reachability map only covers the two end-hosts; the user explicitly reports OSPF Area 2 routes missing from r1's RIB, a control-plane symptom that the host-pair ping wouldn't expose.
+
+**Phase 2 decision:** Phase 1 evidence alone does not satisfy the "real symptom" gate (no loss_percent > 0). → **Phase 4: broad-search escalation.**
+[TOOL] Skill({'skill': 'diagnosis-methodology-skill'})
+[RESULT] Launching skill: diagnosis-methodology-skill
+[TEXT] Following the methodology: **Phase A first** — run both triage helpers simultaneously.
+[TOOL] ToolSearch({'query': 'select:mcp__helper_server__run_helper,mcp__helper_server__list_helpers'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__helper_server__run_helper'}, {'type': 'tool_reference', 'tool_name': 'mcp__helper_server__list_helpers'}]
+[TOOL] mcp__helper_server__run_helper({'script_name': 'infra_sweep'})
+[TOOL] mcp__helper_server__run_helper({'script_name': 'l2_snapshot'})
+[RESULT] {"result":"=== INFRA SWEEP ===\nLab: Kath5\nScope: hosts, routers, switches, servers, bmv2_switches, ovs_switches, sdn_controllers, other_devices\nDevices scanned: 15\nFlagged devices: 0\n\nCategories inspected:\n  - ACL/firewall drop fingerprints: 0 device(s) with rules matched (0 means no protocol-specific drops seen)\n  - Static ARP entries (CM/PM/PERMANENT) on hosts: 0 found\n  - Fabricated-pa
+[RESULT] {"result":"=== L2 SNAPSHOT ===\nLab: Kath5\nScope: hosts, routers, switches, servers, bmv2_switches, ovs_switches, sdn_controllers, other_devices\nDevices scanned: 15\nDuplicate MAC groups: 0\nFlagged devices: 0\nDevices with bridge members: 0\nDevice errors: 0\nLink-discovery warnings: 12\n\nAll 15 devices' L2 identity is clean (no duplicate MACs, no down/missing interfaces).\nUse --show-clean to
+[TEXT] Phase A clean — no ACL drops, no duplicate MACs, no addressing anomalies. **Phase B — routing/control plane.** The user explicitly reports OSPF, so run `ospf_snapshot`.
+[TOOL] mcp__helper_server__run_helper({'script_name': 'ospf_snapshot'})
+[RESULT] {"result":"=== OSPF SNAPSHOT ===\nLab: Kath5\nRouters scanned: 13\nFlags:\n  - r12: no OSPF network statements\n  - r12: non-Full neighbors present: {'is': 1}\n  - r13: FRR control sockets missing (ospfd_vty) — daemon likely down\n  - r13: no OSPF network statements\n  - r13: zero OSPF neighbors\n  - r4: OSPF interface VLINK0 (45.1.1.1/8) is running in area 0.0.0.0 but the matching network stateme
+[TEXT] **Phase B has surfaced a clear anomaly.** Active lead locked in: **r8 is the sole router declaring area 0.0.0.2 — orphaned area, 0 full adjacencies, and area 0.0.0.0 active with 0 interfaces on r8.** Meanwhile r4 carries a VLINK0 with 0 adjacencies. This is an OSPF fault.
+
+Entering the matching family skill:
+[TOOL] Skill({'skill': 'ospf-fault-skill'})
+[RESULT] Launching skill: ospf-fault-skill
+[TEXT] Direct config evidence needed on r8 and r4 to confirm the virtual-link asymmetry. Loading the FRR tools and checking both simultaneously.
+[TOOL] ToolSearch({'query': 'select:mcp__kathara_frr_mcp_server__frr_show_running_config'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_frr_mcp_server__frr_show_running_config'}]
+[TOOL] mcp__kathara_frr_mcp_server__frr_show_running_config({'router_name': 'r8'})
+[TOOL] mcp__kathara_frr_mcp_server__frr_show_running_config({'router_name': 'r4'})
+[RESULT] {"result":"Building configuration...\n\nCurrent configuration:\n!\nfrr version 9.1.3\nfrr defaults traditional\nhostname r8\ndomainname localdomain\nlog file /var/log/frr/frr.log\nno ipv6 forwarding\nno service integrated-vtysh-config\n!\npassword zebra\nenable password zebra\n!\nrouter ospf\n network 18.0.0.0/8 area 2\n network 58.0.0.0/8 area 1\n network 80.0.0.0/8 area 2\nexit\n!\nend"}
+[RESULT] {"result":"Building configuration...\n\nCurrent configuration:\n!\nfrr version 9.1.3\nfrr defaults traditional\nhostname r4\ndomainname localdomain\nlog file /var/log/frr/frr.log\nno ipv6 forwarding\nno service integrated-vtysh-config\n!\npassword zebra\nenable password zebra\n!\nrouter ospf\n network 14.0.0.0/8 area 1\n network 34.0.0.0/8 area 0\n network 40.0.0.0/8 area 1\n network 45.0.0.0/8 ar
+[TEXT] **Confirming evidence found.** The configs make the fault unambiguous:
+
+- **r4**: `area 1 virtual-link 18.1.4.1` — r4 has its side of the virtual link configured, pointing to r8's router-ID (`18.1.4.1`).
+- **r8**: no `area ... virtual-link ...` statement at all — r8's side was removed during the maintenance touch.
+
+This exactly explains the `ospf_snapshot` observations:
+- r4's VLINK0: `state=Point-To-Point, nbr=0, adj=0` — no peer responds
+- r8: `area 0.0.0.0 (adj=0, iface=0)` — r8 has zero backbone connectivity
+- r8: area 0.0.0.2 orphaned — area 2 is only known to r8, no other router sees it
+- r1 loses all area-2 routes because r8 never becomes an ABR
+
+Fault family confirmed: **ospf_neighbor_missing** (virtual-link peer missing on r8 side). Advancing to Phase 5.
+
+---
+
+=== DIAGNOSIS ===
+is
+[FINAL] stop=end_turn tool_calls=11
+[SUBMITTED] parsed_ok=True is_anomaly=True faulty_devices=['r8']
+[FINAL-TEXT] **Confirming evidence found.** The configs make the fault unambiguous:
+
+- **r4**: `area 1 virtual-link 18.1.4.1` — r4 has its side of the virtual link configured, pointing to r8's router-ID (`18.1.4.1`).
+- **r8**: no `area ... virtual-link ...` statement at all — r8's side was removed during the maintenance touch.
+
+This exactly explains the `ospf_snapshot` observations:
+- r4's VLINK0: `state=Point-To-Point, nbr=0, adj=0` — no peer responds
+- r8: `area 0.0.0.0 (adj=0, iface=0)` — r8 has zero backbone connectivity
+- r8: area 0.0.0.2 orphaned — area 2 is only known to r8, no other router sees it
+- r1 loses all area-2 routes because r8 never becomes an ABR
+
+Fault family confirmed: **ospf_neighbor_missing** (virtual-link peer missing on r8 side). Advancing to Phase 5.
+
+---
+
+=== DIAGNOSIS ===
+is_anomaly: true
+faulty_devices: r8
+diagnosis_text:
+**Affected component:** OSPF virtual-link configuration on r8's `router ospf` process.
+
+**Mechanism:** This topology uses a virtual link through Area 1 to extend the backbone (Area 0) to r8, which acts as the ABR between Area 1 and Area 2. In OSPF, a virtual link must be declared symmetrically on *both* endpoints. r4 correctly declares `area 1 virtual-link 18.1.4.1` (r8's router-ID), but r8's running configuration contains only three `network` statements and no `virtual-link` entry whatsoever. Because r8 never sends a Hello on the virtual link, no adjacency forms: r4's VLINK0 stays at `Point-To-Point, nbr=0, adj=0`. Without that virtual link, r8 has no active Area 0 interface and cannot qualify as an ABR. FRR therefore does not redistribute any of r8's Area 2 LSAs (18.0.0.0/8, 80.0.0.0/8) into the rest of the OSPF domain, and all inter-area routes for Area 2 disappear from every router's RIB, including r1.
+
+**Localization:** r8 — `router ospf` stanza, missing `area 0.0.0.1 virtual-link <r4-router-id>` statement.
+
+**Root cause:** The maintenance touch on r8 removed the `area 0.0.0.1 virtual-link <r4-router-id>` line from r8's OSPF configuration, breaking the only path by which r8 can reach the backbone and function as an ABR for Area 2.
+
+**Fix:** Restore the virtual-link on r8 by running in `vtysh`: `router ospf` → `area 0.0.0.1 virtual-link <r4-router-id>` (r4's router-ID, obtainable via `show ip ospf` on r4). Once both endpoints are configured the virtual-link adjacency will form, r8 will rejoin the backbone, and Area 2 routes will repopulate r1's RIB within one OSPF convergence cycle.
+=== END ===

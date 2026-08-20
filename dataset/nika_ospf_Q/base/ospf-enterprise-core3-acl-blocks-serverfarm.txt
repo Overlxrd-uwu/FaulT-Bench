@@ -1,0 +1,77 @@
+==================================================
+Scenario: ospf-enterprise-core3-acl-blocks-serverfarm
+Topology: ospf_enterprise_static
+Fault family: ACL drops legitimate transit
+==================================================
+
+[PROMPT-TO-AGENT]
+Helpdesk ticket #8877: Since a firewall change window this morning, BOTH pods
+have lost access to every 10.200.0.x server: DNS queries to 10.200.0.2 time
+out and no portal loads by name or by IP. Pod-to-pod traffic between
+host_1_1_1_1 and host_2_1_1_1 still works. Monitoring shows all OSPF
+adjacencies Full and the 10.200.0.0/24 route present on every router.
+Identify what is blocking the server farm.
+
+[INJECTION]
+device: router_core_3
+action: add a FORWARD DROP rule for all traffic destined to the server farm
+cmd: iptables -A FORWARD -d 10.200.0.0/24 -j DROP
+
+[POST-INJECT-CHECK]
+router_core_3  iptables -S FORWARD | grep -c 10.200.0.0/24  => expect 1
+host_1_1_1_1   ping -W2 -c2 10.200.0.2                      => expect loss>0
+host_2_1_1_1   ping -W2 -c2 10.200.0.3                      => expect loss>0
+
+[GROUND-TRUTH]
+Affected component: router_core_3 iptables FORWARD chain
+Mechanism: router_core_3 is the mandatory transit for the server farm --
+  switch_server_access attaches only to router_core_3 (172.16.0.10/31). The
+  new rule `-A FORWARD -d 10.200.0.0/24 -j DROP` silently discards every
+  FORWARDED packet destined to the farm, from both pods. Routing is
+  genuinely healthy: OSPF hellos are INPUT/OUTPUT traffic on router_core_3
+  (not FORWARD), so all adjacencies stay Full and 10.200.0.0/24 remains in
+  every table -- the drop happens at the firewall layer after the routing
+  decision. Pod-to-pod traffic transits router_core_1<->router_core_2 and
+  matches no rule. Note: router_core_3's OWN pings to the farm still succeed
+  (locally generated traffic traverses OUTPUT, not FORWARD) -- a useful
+  discriminator.
+Localization: router_core_3
+Root cause: extraneous iptables FORWARD DROP rule for destination
+  10.200.0.0/24 on router_core_3
+Fix: `iptables -D FORWARD -d 10.200.0.0/24 -j DROP` on router_core_3
+
+[FIX]
+remove the DROP rule on router_core_3 --
+`iptables -D FORWARD -d 10.200.0.0/24 -j DROP`
+
+[DIAGNOSTIC-PROCESS]
+1. Scope the selective failure: both pods lose exactly the 10.200.0.0/24
+   destinations while pod-to-pod traffic works -- a destination-dependent
+   pattern that points at a filter on the farm's transit path, not routing.
+2. Verify routing is healthy: adjacencies are Full on all core routers and
+   10.200.0.0/24 is present in the tables -- the control plane is intact, so
+   the loss is happening in the data plane after the routing decision.
+3. Identify the transit choke point: all farm-bound traffic must cross
+   router_core_3 (sole attachment of switch_server_access), so inspect it
+   first.
+4. Inspect the firewall: `iptables -nL FORWARD` (or `iptables -S FORWARD`)
+   on router_core_3 shows a DROP rule for destination 10.200.0.0/24 in the
+   FORWARD chain.
+5. Confirm the mechanism: router_core_3 itself can still ping 10.200.0.2
+   (OUTPUT chain unaffected) while forwarded pings from either pod die --
+   exactly the transit-filter signature. Rule out link, daemon, and host
+   faults accordingly.
+
+[SCORING-AXES]
+assert-identifies: router_core_3
+must-identify-device: router_core_3
+must-identify-component: iptables FORWARD DROP rule / firewall filter, not a routing fault
+must-recognize-filter-pattern: recognizes that healthy OSPF plus present routes with silent forwarding loss indicates packet filtering on the transit path
+bonus-notes-transit-choke: notes all farm traffic must transit router_core_3 (sole attachment of switch_server_access), which is why both pods are affected
+# These axes score the outcome metric only; fix and reasoning are judged separately.
+
+[NIKA-LABEL]
+nika_label: icmp_acl_block
+nika_category: MISCONFIGURATION
+in_taxonomy: true
+note: partial: the ACL drops ALL farm-bound transit, not one protocol (NIKA acl_block is per-protocol)

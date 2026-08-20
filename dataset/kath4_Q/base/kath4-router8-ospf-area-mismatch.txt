@@ -1,0 +1,80 @@
+==================================================
+Scenario: kath4-router8-ospf-area-mismatch
+Topology: Kath4
+Fault family: OSPF area mismatch
+==================================================
+
+[PROMPT-TO-AGENT]
+After a configuration change on router8, router7 reports that its
+OSPF adjacency with router8 dropped (neighbor went INIT/DOWN, then
+gone) and some Campus 2 routes flapped. Campus-1-to-Campus-1
+traffic still works and Campus 2 PCs reach their local SVI. Find
+what broke the router7<->router8 adjacency.
+
+[INJECTION]
+device: router8
+action: change OSPF area for the 172.25.1.0 network to a
+  mismatched area (area 7 instead of area 0)
+cmd: |
+  vtysh -c "configure terminal" \
+        -c "router ospf" \
+        -c "no network 172.25.1.0/24 area 0" \
+        -c "network 172.25.1.0/24 area 7" \
+        -c "exit" -c "exit"
+  vtysh -c "clear ip ospf process"
+
+[POST-INJECT-CHECK]
+router7  vtysh -c "show ip ospf neighbor" | grep -c 172.29.10.1  => expect 0
+
+[GROUND-TRUTH]
+Affected component: router8 OSPF area configuration on the
+  172.25.1.0/24 link
+Mechanism: OSPF requires both ends of an adjacency to agree
+  on the area ID. router7's eth5 is 172.25.1.1 in area 0;
+  router8's eth4 was 172.25.1.2 in area 0 and was just changed
+  to area 7. The hellos now carry mismatched area IDs, so the
+  router7<->router8 adjacency drops (Full -> Init -> gone).
+  router8 remains in OSPF via its OTHER area-0 links, so traffic
+  reroutes and Campus 1 stays mostly reachable -- the observable,
+  diagnosable fault is the dropped adjacency on the 172.25.1.0/24
+  link, not a full Campus-2 outage.
+Localization: router8
+Root cause: OSPF area mismatch on the router7<->router8 link
+  (router8 in area 7, router7 in area 0)
+Fix: on router8 — `vtysh -c "router ospf" -c "no network
+  172.25.1.0/24 area 7" -c "network 172.25.1.0/24 area 0"`
+
+[FIX]
+on router8 — `vtysh -c "router ospf" -c "no network
+  172.25.1.0/24 area 7" -c "network 172.25.1.0/24 area 0"`
+
+[DIAGNOSTIC-PROCESS]
+1. Scope the symptom: confirm Campus 1 loses routes to Campus 2
+   (172.29.10.0/24 and beyond) while Campus 1 internal traffic and
+   Campus 2 intra-campus traffic still work; router7 shows the
+   router8 adjacency in INIT or absent.
+2. Check OSPF neighbor state: on router7, run `show ip ospf neighbor`
+   — confirm the adjacency to 172.25.1.2 (router8) is stuck in INIT
+   or is missing, not Full.
+3. Compare area IDs on both ends of the link: check router7 eth5 (area
+   0) against router8 eth4 — router8 now has 172.25.1.0/24 assigned
+   to area 7, creating a mismatch that prevents hello acceptance.
+4. Confirm the consequence: run `show ip route ospf` on router7 —
+   172.29.10.0/24 and the Campus 2 prefixes are absent because
+   router8 can no longer flood LSAs into area 0.
+5. Localize to the lowest-layer root cause: router8's OSPF area
+   assignment for 172.25.1.0/24 is wrong (area 7 vs area 0),
+   ruling out a physical link failure or hello-timer mismatch.
+
+[SCORING-AXES]
+assert-identifies: router8
+must-identify-device: router8
+must-identify-component: OSPF area assignment / area mismatch
+must-identify-affected-link: router7<->router8 (172.25.1.0/24)
+bonus-explains-mechanism
+# These axes score the outcome metric only; fix and reasoning are judged separately.
+
+[NIKA-LABEL]
+nika_label: ospf_area_misconfiguration
+nika_category: MISCONFIGURATION
+in_taxonomy: true

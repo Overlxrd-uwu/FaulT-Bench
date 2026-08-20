@@ -1,0 +1,70 @@
+==================================================
+Scenario: simple-bgp-pc1-wrong-gateway
+Topology: simple_bgp
+Fault family: host misconfig (wrong default gateway)
+==================================================
+
+[PROMPT-TO-AGENT]
+The user on pc1 (195.11.14.2) reports they cannot reach pc2
+(200.1.1.2) or anything outside their own subnet since "cleaning
+up" their network settings -- their pings now fail with
+"Destination Host Unreachable". Oddly, pc1 pings its gateway
+195.11.14.1 fine. The partner side reports pc2's pings to pc1
+time out, while everything else there works. What's wrong?
+
+[INJECTION]
+device: pc1
+action: point pc1's default route at a nonexistent gateway (.254)
+cmd: ip route replace default via 195.11.14.254 dev eth0
+
+[POST-INJECT-CHECK]
+pc1   ip route show default | grep -c "via 195.11.14.254"  => expect 1
+pc1   ping -W2 -c2 200.1.1.2                               => expect loss>0
+pc1   ping -W2 -c2 195.11.14.1                             => expect 0% loss
+
+[GROUND-TRUTH]
+Affected component: pc1 default route / gateway configuration
+Mechanism: pc1's default route points at 195.11.14.254, an address
+  that exists on no device (the real gateway is router1's eth1 at
+  195.11.14.1). ARP for .254 gets no answer, so every off-subnet
+  packet from pc1 dies locally with "Destination Host Unreachable".
+  On-subnet traffic (the connected 195.11.14.0/24 route) still
+  works, which is why pc1 can ping 195.11.14.1. The network side
+  is fully healthy: router1 still advertises 195.11.14.0/24, the
+  eBGP session is Established, and pc2's pings ARE delivered to
+  pc1 -- but pc1's replies chase the phantom gateway and are never
+  sent, so pc2 sees timeouts.
+Localization: pc1
+Root cause: pc1's default route points at nonexistent gateway
+  195.11.14.254 instead of 195.11.14.1
+Fix: `ip route replace default via 195.11.14.1 dev eth0` on pc1
+
+[FIX]
+Restore pc1's default route -- `ip route replace default via 195.11.14.1 dev
+eth0` on pc1. Off-subnet connectivity returns immediately; no router or BGP
+change is needed.
+
+[DIAGNOSTIC-PROCESS]
+1. Scope to pc1: only pc1's off-subnet traffic fails, and it fails with
+   host-unreachable generated locally on pc1 -- on-subnet pings to 195.11.14.1
+   work. Everything else in both ASes is healthy.
+2. Inspect pc1's routing table: `ip route` shows `default via 195.11.14.254`,
+   not the real gateway 195.11.14.1.
+3. Confirm the phantom next-hop: 195.11.14.254 answers no ARP (`ip neigh`
+   shows it FAILED/incomplete) -- no such device exists on the LAN.
+4. Verify the network is not the problem: router1 advertises 195.11.14.0/24,
+   the eBGP session is Established, and inbound packets reach pc1; only pc1's
+   replies die at the bad default route.
+5. Localize to pc1's default route: a host-side misconfiguration, not a
+   router, link or BGP fault.
+
+[SCORING-AXES]
+assert-identifies: pc1
+must-identify-device: pc1 (host-side issue)
+must-identify-component: default route / gateway points at nonexistent 195.11.14.254 instead of 195.11.14.1
+bonus-exonerates-network: verifies the routers, the eBGP session and the advertised prefixes are healthy -- the fault is confined to pc1's own routing table
+
+[NIKA-LABEL]
+nika_label: host_incorrect_gateway
+nika_category: END_HOST_FAILURE
+in_taxonomy: true

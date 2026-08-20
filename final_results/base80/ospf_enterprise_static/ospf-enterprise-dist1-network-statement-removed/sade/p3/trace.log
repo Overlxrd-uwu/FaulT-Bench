@@ -1,0 +1,62 @@
+[AGENT] sade starts on lab=ospf_enterprise_static
+[TOOL] ToolSearch({'query': 'select:mcp__kathara_base_mcp_server__get_reachability'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_base_mcp_server__get_reachability'}]
+[TOOL] mcp__kathara_base_mcp_server__get_reachability({})
+[RESULT] {"result":"{\"hosts\":{\"host_1_1_1_1\":\"10.1.1.2\",\"host_2_1_1_1\":\"10.2.1.2\",\"web_server_0\":\"10.200.0.3\",\"web_server_1\":\"10.200.0.4\",\"web_server_2\":\"10.200.0.5\",\"web_server_3\":\"10.200.0.6\",\"dns_server\":\"10.200.0.2\"},\"results\":[{\"src\":\"dns_server\",\"dst\":\"host_1_1_1_1\",\"dst_ip\":\"10.1.1.2\",\"tx\":null,\"rx\":null,\"loss_percent\":null,\"time_ms\":null,\"rtt_avg
+[TEXT] **Phase 1 done.** The reachability map shows a clear pattern: every row involving `host_1_1_1_1` (either as src or dst) returns `status="unknown"` with null tx/rx/loss. Pod 2 and the server farm are all healthy among themselves. This matches the symptom report exactly.
+
+Per methodology, I must confirm these "unknown" rows with direct-IP probes before entering a fault-family skill.
+[TOOL] ToolSearch({'query': 'select:mcp__kathara_base_mcp_server__exec_shell'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_base_mcp_server__exec_shell'}]
+[TEXT] Running direct-IP probes in parallel to confirm the unknown rows are real path failures (not just name-resolution issues):
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'host_1_1_1_1', 'command': 'ping -c3 -W2 10.200.0.3'})
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'host_2_1_1_1', 'command': 'ping -c3 -W2 10.1.1.2'})
+[RESULT] {"result":"PING 10.200.0.3 (10.200.0.3) 56(84) bytes of data.\n\n--- 10.200.0.3 ping statistics ---\n3 packets transmitted, 0 received, 100% packet loss, time 2168ms"}
+[RESULT] {"result":"PING 10.1.1.2 (10.1.1.2) 56(84) bytes of data.\nFrom 10.2.1.1 icmp_seq=1 Destination Net Unreachable\nFrom 10.2.1.1 icmp_seq=2 Destination Net Unreachable\nFrom 10.2.1.1 icmp_seq=3 Destination Net Unreachable\n\n--- 10.1.1.2 ping statistics ---\n3 packets transmitted, 0 received, +3 errors, 100% packet loss, time 2138ms"}
+[TEXT] **Real symptoms confirmed:**
+- `host_1_1_1_1 → 10.200.0.3`: 100% packet loss (forward path broken or no return route)
+- `host_2_1_1_1 → 10.1.1.2`: **"Destination Net Unreachable"** from `10.2.1.1` (switch_dist_2_1's gateway) — meaning the routing fabric has no route to 10.1.1.0/24
+
+**Phase 3 active lead:** The `Destination Net Unreachable` from switch_dist_2_1 is the smoking gun — 10.1.1.0/24 is absent from the OSPF routing table across the backbone. This is an OSPF route-advertisement fault on switch_dist_1_1 (the pod-1 distribution router that should be originating the 10.1.1.0/24 prefix). Entering the OSPF fault family:
+[TOOL] Skill({'skill': 'ospf-fault-skill'})
+[RESULT] Launching skill: ospf-fault-skill
+[TEXT] The skill calls for `ospf_snapshot.py` as the one-pass coverage tool. Running it now:
+[TOOL] ToolSearch({'query': 'select:mcp__helper_server__run_helper'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__helper_server__run_helper'}]
+[TOOL] mcp__helper_server__run_helper({'script_name': 'ospf_snapshot'})
+[RESULT] {"result":"=== OSPF SNAPSHOT ===\nLab: ospf_enterprise_static\nRouters scanned: 6\nFlags: none\n\nCoverage inspected:\n  - FRR daemon health (vtysh + control sockets): 6/6 vtysh ok, 6/6 both sockets present\n  - OSPF neighbors: 0 routers with zero, 0 with non-Full\n  - Per-area adj < iface (some interface in the area has 0 adjacencies — normal for host-facing access ports, suspicious on uplinks): 
+[TEXT] The `ospf_snapshot` output reveals the root cause with direct evidence. Comparing the two distribution switches:
+
+| Router | Networks in OSPF config |
+|---|---|
+| **switch_dist_1_1** | `172.16.0.6/31@0.0.0.1` — **only the uplink; 10.1.1.0/24 is absent** |
+| switch_dist_2_1 | `10.2.1.0/24@0.0.0.1`, `172.16.0.8/31@0.0.0.1` — uplink + host subnet ✓ |
+
+`switch_dist_1_1` is missing the `network 10.1.1.0/24 area 0.0.0.1` statement. It never originates a Type-1 LSA for the pod-1 host subnet, so no other router in the OSPF domain learns a path back to 10.1.1.0/24. This is confirmed by the "Destination Net Unreachable" ICMP from switch_dist_2_1 — it has no FIB entry for 10.1.1.0/24. The switch_dist_1_1 eth0 uplink IS in OSPF (hence switch_dist_1_1 itself can forward outbound traffic and ping the se
+[FINAL] stop=end_turn tool_calls=8
+[SUBMITTED] parsed_ok=True is_anomaly=True faulty_devices=['switch_dist_1_1']
+[FINAL-TEXT] The `ospf_snapshot` output reveals the root cause with direct evidence. Comparing the two distribution switches:
+
+| Router | Networks in OSPF config |
+|---|---|
+| **switch_dist_1_1** | `172.16.0.6/31@0.0.0.1` — **only the uplink; 10.1.1.0/24 is absent** |
+| switch_dist_2_1 | `10.2.1.0/24@0.0.0.1`, `172.16.0.8/31@0.0.0.1` — uplink + host subnet ✓ |
+
+`switch_dist_1_1` is missing the `network 10.1.1.0/24 area 0.0.0.1` statement. It never originates a Type-1 LSA for the pod-1 host subnet, so no other router in the OSPF domain learns a path back to 10.1.1.0/24. This is confirmed by the "Destination Net Unreachable" ICMP from switch_dist_2_1 — it has no FIB entry for 10.1.1.0/24. The switch_dist_1_1 eth0 uplink IS in OSPF (hence switch_dist_1_1 itself can forward outbound traffic and ping the server farm), but return packets are dropped by every router that lacks the missing route.
+
+---
+
+=== DIAGNOSIS ===
+is_anomaly: true
+faulty_devices: switch_dist_1_1
+diagnosis_text:
+**Affected component:** OSPF network advertisement — the `network` statement for the pod-1 host subnet is missing from switch_dist_1_1's OSPF configuration.
+
+**Mechanism:** switch_dist_1_1 runs FRR/ospfd and holds a full OSPF adjacency with router_core_1 over its eth0 uplink (172.16.0.7/31, area 0.0.0.1). However, its OSPF `network` block only covers `172.16.0.6/31` — the uplink — and omits the access-facing subnet `10.1.1.0/24`. Because no Type-1 LSA is ever originated for 10.1.1.0/24, every other router in the domain (router_core_1, router_core_2, switch_dist_2_1, switch_server_access) has no return-path route for that prefix. Outbound packets from host_1_1_1_1 are forwarded normally via its gateway (10.1.1.1 = switch_dist_1_1), but reply packets are dropped at whichever upstream router is first queried — confirmed by the "Destination Net Unreachable" ICMP returned from switch_dist_2_1 (10.2.1.1) when host_2_1_1_1 tries to reach 10.1.1.2.
+
+**Localization:** switch_dist_1_1, OSPF process — eth1 interface (10.1.1.1/24, pod-1 access segment) is not covered by any OSPF `network` statement. The peer switch_dist_2_1 correctly declares `network 10.2.1.0/24 area 0.0.0.1`, making pod-2 fully reachable; pod-1 lacks the equivalent entry.
+
+**Root cause:** switch_dist_1_1 is missing `network 10.1.1.0/24 area 0.0.0.1` in its FRR OSPF configuration, so the pod-1 host subnet is never advertised into the OSPF domain.
+
+**Fix:** Add `network 10.1.1.0/24 area 0.0.0.1` under the `router ospf` stanza in switch_dist_1_1's FRR configuration (via `vtysh` or `/etc/frr/frr.conf`) and reload ospfd. Once the LSA propagates, all routers will install a return route for 10.1.1.0/24 and full bidirectional reachability to host_1_1_1_1 will be restored.
+=== END ===

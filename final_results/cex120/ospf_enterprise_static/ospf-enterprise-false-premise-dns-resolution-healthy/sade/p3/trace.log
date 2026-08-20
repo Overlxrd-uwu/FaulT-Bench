@@ -1,0 +1,85 @@
+[AGENT] sade starts on lab=ospf_enterprise_static
+[TOOL] ToolSearch({'query': 'select:mcp__kathara_base_mcp_server__get_reachability'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_base_mcp_server__get_reachability'}]
+[TOOL] mcp__kathara_base_mcp_server__get_reachability({})
+[RESULT] {"result":"{\"hosts\":{\"host_1_1_1_1\":\"10.1.1.2\",\"host_2_1_1_1\":\"10.2.1.2\",\"web_server_0\":\"10.200.0.3\",\"web_server_1\":\"10.200.0.4\",\"web_server_2\":\"10.200.0.5\",\"web_server_3\":\"10.200.0.6\",\"dns_server\":\"10.200.0.2\"},\"results\":[{\"src\":\"dns_server\",\"dst\":\"web_server_1\",\"dst_ip\":\"10.200.0.4\",\"tx\":2,\"rx\":2,\"loss_percent\":0.0,\"time_ms\":1053.0,\"rtt_avg_ms
+[TEXT] **Phase 1 complete.** All 12 IP-level probes return 0 % loss. Every node (including `dns_server` at 10.200.0.2) is reachable by IP from all tested sources.
+
+**Phase 2 — Branch.** No path-level failures. However, the user reports a DNS-resolution failure limited to `host_1_1_1_1` — that is a real symptom class ("DNS NXDOMAIN/SERVFAIL or a wrong answer for a name the topology declares resolvable"). Because L3 is healthy but DNS fails on exactly one host, this is either a server-side DNS fault **or** a per-host resolver misconfiguration on `host_1_1_1_1`.
+
+**Phase 3 — Active lead:** `host_1_1_1_1` cannot resolve any internal hostname; direct-IP connectivity is fully functional. I'll enter the DNS fault skill to establish the fingerprint and the right helper, then differentiate server-side vs.
+[TOOL] Skill({'skill': 'dns-fault-skill'})
+[RESULT] Launching skill: dns-fault-skill
+[TEXT] The skill fingerprints are clear. I need to check two things in parallel:
+1. Whether the DNS server itself is healthy (process, listener, firewall)
+2. Whether `host_1_1_1_1`'s `/etc/resolv.conf` differs from its peers
+
+I'll run `dns_client_snapshot` (the majority-minority resolver outlier helper) first — it tells me at once whether the fault lives on the server or on this one host.
+[TOOL] ToolSearch({'query': 'select:mcp__helper_server__run_helper'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__helper_server__run_helper'}]
+[TOOL] mcp__helper_server__run_helper({'script_name': 'dns_client_snapshot'})
+[RESULT] {"result":"=== DNS CLIENT SNAPSHOT ===\nLab: ospf_enterprise_static\nDevices scanned: 2\nExpected nameserver: 10.200.0.2\nExpected nameserver support: 2/2 devices\nHostnames checked: web0.local, web1.local, web2.local, web3.local\nLookup devices: host_1_1_1_1, host_2_1_1_1\nLookup mode: full client sweep\nHostname mode: auto-discovered from live DNS zones\n\nSuspect hosts: none\n\nHealthy verifica
+[TEXT] The `dns_client_snapshot` shows **DNS is resolving correctly right now** from `host_1_1_1_1` — all four `.local` names resolve to the correct IPs, and both hosts use the expected nameserver `10.200.0.2`. No suspect hosts.
+
+This contradicts the active ticket. Per the hard gates, a single clean snapshot doesn't clear an intermittent fault — I need to check for a **mechanism**. I'll run `service_snapshot` to inspect the DNS daemon state and `pressure_sweep` simultaneously for any resource/process anomaly.
+[TOOL] mcp__helper_server__run_helper({'script_name': 'service_snapshot'})
+[TOOL] mcp__helper_server__run_helper({'script_name': 'pressure_sweep'})
+[RESULT] {"result":"=== SERVICE SNAPSHOT ===\nLab: ospf_enterprise_static\nClients scanned: 2\nService devices scanned: 4\nHostnames: web0.local, web1.local, web2.local, web3.local\nURLs: http://web0.local/, http://web1.local/, http://web2.local/, http://web3.local/\nPublished hostnames: web0.local, web1.local, web2.local, web3.local\n\nResolver groups:\n- 10.200.0.2: 2 hosts [host_1_1_1_1, host_2_1_1_1]\n
+[RESULT] {"result":"=== PRESSURE SWEEP ===\nLab: ospf_enterprise_static\nDevices scanned: 15\nSuspect devices: none\n\n(all scanned devices clean — no pressure flags)\n"}
+[TEXT] Both helpers are completely clean — no DNS failures, no resource pressure, all services healthy. Per the hard gate on intermittent claims, I still need to look for a **mechanism** (flap script, tc qdisc, ACL, syslog) before I can conclude. I'll run `infra_sweep` (L1/L2/ACL/addressing) and `tc_snapshot` in parallel.
+[TOOL] mcp__helper_server__run_helper({'script_name': 'infra_sweep'})
+[TOOL] mcp__helper_server__run_helper({'script_name': 'tc_snapshot'})
+[RESULT] {"result":"=== INFRA SWEEP ===\nLab: ospf_enterprise_static\nScope: hosts, routers, switches, servers, bmv2_switches, ovs_switches, sdn_controllers, other_devices\nDevices scanned: 15\nFlagged devices: 0\n\nCategories inspected:\n  - ACL/firewall drop fingerprints: 0 device(s) with rules matched (0 means no protocol-specific drops seen)\n  - Static ARP entries (CM/PM/PERMANENT) on hosts: 0 found\n
+[RESULT] {"result":"=== TC SNAPSHOT ===\nLab: ospf_enterprise_static\nScope: hosts, routers, switches, servers, bmv2_switches, ovs_switches, sdn_controllers, other_devices\nDevices scanned: 15\nInterfaces inspected: 30\nFlagged interfaces: 0\nDevice errors: 0\nClean qdisc profiles:\n  - fq_codel: 30\nFlagged interfaces: none\n"}
+[TEXT] Both sweeps return completely clean:
+- **`infra_sweep`**: 0 flagged devices; no ACL/firewall drop rules on any device; both hosts have IPv4 and a default route; no resolver/gateway divergence detected.
+- **`tc_snapshot`**: Every one of the 30 interfaces across all 15 devices shows only the default `fq_codel` qdisc — zero shaping, zero netem delays.
+
+**Mechanism check summary against the intermittent-fault hard gate:**
+
+| Check | Result |
+|---|---|
+| DNS lookups from `host_1_1_1_1` (live) | ✅ All 4 names resolve correctly |
+| DNS lookups from `host_2_1_1_1` (live) | ✅ All 4 names resolve correctly |
+| HTTP via hostname from both hosts | ✅ All 4 URLs return HTTP 200 |
+| IP reachability (Phase 1) | ✅ 0 % loss across all paths |
+| ACL/firewall rules (port 53) | ✅ None found on any device |
+| t
+[FINAL] stop=end_turn tool_calls=9
+[SUBMITTED] parsed_ok=True is_anomaly=False faulty_devices=[]
+[FINAL-TEXT] Both sweeps return completely clean:
+- **`infra_sweep`**: 0 flagged devices; no ACL/firewall drop rules on any device; both hosts have IPv4 and a default route; no resolver/gateway divergence detected.
+- **`tc_snapshot`**: Every one of the 30 interfaces across all 15 devices shows only the default `fq_codel` qdisc — zero shaping, zero netem delays.
+
+**Mechanism check summary against the intermittent-fault hard gate:**
+
+| Check | Result |
+|---|---|
+| DNS lookups from `host_1_1_1_1` (live) | ✅ All 4 names resolve correctly |
+| DNS lookups from `host_2_1_1_1` (live) | ✅ All 4 names resolve correctly |
+| HTTP via hostname from both hosts | ✅ All 4 URLs return HTTP 200 |
+| IP reachability (Phase 1) | ✅ 0 % loss across all paths |
+| ACL/firewall rules (port 53) | ✅ None found on any device |
+| tc qdisc shaping/delay | ✅ None found on any interface |
+| Resource pressure / flap processes | ✅ None found (15 devices clean) |
+| Link flaps / carrier-down history | ✅ No flagged interfaces |
+| Resolver config divergence | ✅ Both hosts correctly use 10.200.0.2 |
+
+There is **no flap script or process, no ACL rule, no tc qdisc, no link fault, no resolver misconfiguration, and no resource contention** on any device. The current state is fully healthy and the DNS server is live and answering queries correctly. The absence of any mechanism or trace means the claim is unconfirmed.
+
+---
+
+=== DIAGNOSIS ===
+is_anomaly: false
+faulty_devices: none
+diagnosis_text:
+**Affected component:** DNS name-resolution service as observed from `host_1_1_1_1`.
+
+**Mechanism:** The helpdesk ticket claims that all internal hostnames fail to resolve from `host_1_1_1_1`, with users concluding the DNS server is dead. Live investigation found no evidence supporting this at any layer.
+
+**Localization:** The `dns_client_snapshot` helper performed real-time `nslookup` lookups of all four `.local` hostnames directly from inside `host_1_1_1_1` — every query returned the correct answer (e.g. `web0.local → 10.200.0.3`). The `service_snapshot` further confirmed end-to-end HTTP via hostname returned HTTP 200 from all four web servers. The IP-layer `get_reachability` probe showed 0 % loss on every path including `host_1_1_1_1 → dns_server (10.200.0.2)`. `infra_sweep` found no ACL/iptables rules blocking port 53, no wrong resolver config, no missing default route. `tc_snapshot` found no traffic-shaping or netem delay qdiscs on any of the 30 interfaces. `pressure_sweep` detected no stress tools, CPU spikes, or resource contention on any of the 15 devices.
+
+**Root cause:** No anomaly exists. The DNS server is live, `named` is answering queries correctly, `host_1_1_1_1` has the correct resolver configuration (`10.200.0.2`), and no mechanism (ACL, qdisc, link fault, crash) that could produce or reproduce DNS failures is present anywhere in the topology. The reported symptom is unconfirmed and the network is operating normally.
+
+**Fix:** No corrective action is needed. If the issue recurred historically, it was transient and has since self-resolved; no component requires rebuilding or restarting.
+=== END ===

@@ -1,0 +1,78 @@
+==================================================
+Scenario: kath1-r1-ospfd-down-misdirected
+Topology: Kath1
+Fault family: routing daemon down (misdirected prompt)
+==================================================
+
+[PROMPT-TO-AGENT]
+Office A users (PC1, 10.1.0.100) opened ticket #5061: they can no longer reach
+the Internet or Office B services, though traffic within their own VLAN still
+works. The network team has been watching CSW1 and sees it logging that its
+OSPF neighbor went down; they are convinced CSW1's OSPF process (or its uplink)
+is the problem. Please confirm the CSW1 fault and identify the affected
+interface.
+
+[INJECTION]
+device: r1
+action: kill ospfd (kill watchfrr first so FRR does not respawn it)
+cmd: pkill -9 watchfrr; pkill -9 ospfd
+
+[POST-INJECT-CHECK]
+r1    pgrep ospfd                                          => expect empty
+csw1  vtysh -c "show ip ospf neighbor" | grep -c 10.0.0.76 => expect 0
+pc1   ping -W2 -c2 10.0.0.76                               => expect loss>0
+
+[GROUND-TRUTH]
+The root cause is IDENTICAL to kath1-r1-ospfd-down: ospfd is dead on R1. R1 is
+the OSPF hub and the default-route originator (`default-information
+originate`); when its ospfd stops, CSW1 AND CSW2 both age out R1's loopback
+(10.0.0.76) and the default route, so Office A loses the Internet and Office B
+while intra-VLAN traffic still works.
+
+The TWIST: the ticket blames CSW1. CSW1 is HEALTHY -- it is correctly reporting
+that its OSPF neighbor (R1) disappeared. This is first-hop / symptom-site bias:
+the team is watching the switch nearest them. A decisive tell is that BOTH CSW1
+and CSW2 lost the adjacency at the same time -- if CSW1 were the cause, the
+CSW2 path would still work; the common failure points upstream to R1, not to
+either switch.
+
+Correct diagnosis: is_anomaly=true, faulty_devices = r1 (ospfd not running).
+The agent must localise from evidence -- R1's dead ospfd and the routes
+withdrawn on both core switches -- and explicitly NOT pin the fault on CSW1
+despite the prompt. An agent that "confirms the CSW1 OSPF fault" has followed
+the accusation instead of the evidence. Fix: restart frr (`/etc/init.d/frr
+restart`) on R1.
+
+Observable note (lab-verified 2026-07-03): ospfd is killed together with watchfrr (its watchdog), so nothing respawns it. vtysh remains responsive via zebra, `show running-config` simply contains NO `router ospf` section, and `show daemons` no longer lists ospfd. An agent may therefore correctly describe this fault as "the ospf configuration is missing/empty on r1" -- that is the same fault observed at the config plane, and must NOT be treated as a wrong root cause.
+
+[FIX]
+Restart FRR / the ospfd daemon on r1 (e.g. `/etc/init.d/frr restart` on
+r1). Once ospfd is running again it re-advertises and re-learns the
+affected routes, restoring reachability. (The ticket misattributes the fault;
+the remediation targets r1.)
+
+[DIAGNOSTIC-PROCESS]
+1. Scope the symptom: confirm Office A loses Internet/Office B while intra-VLAN
+   works -- a backbone-layer fault -- before accepting the ticket's CSW1
+   hypothesis.
+2. Check CSW1 first (as accused): its OSPF process is running and its
+   interfaces are up; it is merely reporting that neighbor R1 went away. If CSW1
+   is healthy, the accusation is wrong -- follow the evidence.
+3. Correlate across the core: CSW2 lost the R1 adjacency too. A fault on CSW1
+   alone could not explain CSW2 also losing R1 -- the common element is R1.
+4. Inspect R1: `pgrep ospfd` is empty -- ospfd is dead, so R1 stopped sending
+   hellos/LSAs and withdrew its loopback and the default route from the domain.
+5. Localize to the root cause: ospfd not running on R1; CSW1/CSW2 are symptom
+   sites aging out R1's routes, not the cause.
+
+[SCORING-AXES]
+assert-identifies: r1
+assert-not-identifies: csw1
+must-identify-component: ospfd / OSPF routing daemon
+# These axes score the outcome metric only; fix and reasoning are judged separately.
+
+[NIKA-LABEL]
+nika_label: frr_service_down
+nika_category: NETWORK_NODE_ERROR
+in_taxonomy: true
+note: fault maps; prompt is misdirected at CSW1 (robustness perturbation dimension)

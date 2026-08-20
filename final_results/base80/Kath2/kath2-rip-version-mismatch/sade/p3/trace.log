@@ -1,0 +1,102 @@
+[AGENT] sade starts on lab=Kath2
+[TEXT] ## Phase 1 — Blind Start
+[TOOL] ToolSearch({'query': 'select:mcp__kathara_base_mcp_server__get_reachability'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_base_mcp_server__get_reachability'}]
+[TOOL] mcp__kathara_base_mcp_server__get_reachability({})
+[RESULT] {"result":"{\"hosts\":{\"office_pc\":\"192.168.3.2\",\"pc0\":\"192.168.4.2\",\"pc1\":\"1.0.0.5\",\"pc2\":\"128.168.0.2\",\"pc3\":\"128.168.0.3\",\"pc4\":\"128.168.0.4\",\"pc5\":\"128.168.0.5\"},\"results\":[{\"src\":\"office_pc\",\"dst\":\"pc2\",\"dst_ip\":\"128.168.0.2\",\"tx\":2,\"rx\":2,\"loss_percent\":0.0,\"time_ms\":1040.0,\"rtt_avg_ms\":1.69,\"rtt_min_ms\":1.538,\"rtt_max_ms\":1.842,\"rtt_m
+[TEXT] ## Phase 2 — Branch
+
+All tested pairs show **0% loss** — no real reachability symptom surfaces from Phase 1. The user's reported fault is a **control-plane symptom** (RIP routes missing from router1's table), which doesn't manifest as packet loss in this snapshot (likely due to alternate paths or static routes). Per the workflow, I proceed to **Phase 4 — Broad-search escalation**.
+
+---
+[TOOL] Skill({'skill': 'diagnosis-methodology-skill'})
+[RESULT] Launching skill: diagnosis-methodology-skill
+[TEXT] ## Phase 4 — Phase A: L2 and Infrastructure Triage
+
+Running both Phase A triage helpers in parallel:
+[TOOL] ToolSearch({'query': 'select:mcp__helper_server__run_helper'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__helper_server__run_helper'}]
+[TOOL] mcp__helper_server__run_helper({'script_name': 'infra_sweep'})
+[TOOL] mcp__helper_server__run_helper({'script_name': 'l2_snapshot'})
+[RESULT] {"result":"=== INFRA SWEEP ===\nLab: Kath2\nScope: hosts, routers, switches, servers, bmv2_switches, ovs_switches, sdn_controllers, other_devices\nDevices scanned: 30\nFlagged devices: 0\n\nCategories inspected:\n  - ACL/firewall drop fingerprints: 0 device(s) with rules matched (0 means no protocol-specific drops seen)\n  - Static ARP entries (CM/PM/PERMANENT) on hosts: 0 found\n  - Fabricated-pa
+[RESULT] {"result":"=== L2 SNAPSHOT ===\nLab: Kath2\nScope: hosts, routers, switches, servers, bmv2_switches, ovs_switches, sdn_controllers, other_devices\nDevices scanned: 30\nDuplicate MAC groups: 0\nFlagged devices: 0\nDevices with bridge members: 6\nDevice errors: 0\n\nAll 30 devices' L2 identity is clean (no duplicate MACs, no down/missing interfaces).\nUse --show-clean to dump per-device interface li
+[TEXT] Phase A is fully clean — no L2 anomalies, no ACL rules, no duplicate MACs, no addressing issues. Moving to **Phase B — Control Plane / Routing**.
+
+The topology uses **RIP** (not OSPF/BGP), so I'll go directly to routing-table and daemon probes on the relevant routers. Let me load the FRR tools and check router1 and router2 routing tables simultaneously:
+[TOOL] ToolSearch({'query': 'select:mcp__kathara_frr_mcp_server__frr_show_ip_route,mcp__kathara_frr_mcp_server__frr_show_running_config,mcp__kathara_base_mcp_server__exec_shell'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_frr_mcp_server__frr_show_ip_route'}, {'type': 'tool_reference', 'tool_name': 'mcp__kathara_frr_mcp_server__frr_show_running_config'}, {'type': 'tool_reference', 'tool_name': 'mcp__kathara_base_mcp_server__exec_shell'}]
+[TOOL] mcp__kathara_frr_mcp_server__frr_show_ip_route({'router_name': 'router1'})
+[TOOL] mcp__kathara_frr_mcp_server__frr_show_ip_route({'router_name': 'router2'})
+[RESULT] {"result":"Codes: K - kernel route, C - connected, S - static, R - RIP,\n       O - OSPF, I - IS-IS, B - BGP, E - EIGRP, N - NHRP,\n       T - Table, v - VNC, V - VNC-Direct, A - Babel, F - PBR,\n       f - OpenFabric,\n       > - selected route, * - FIB route, q - queued, r - rejected, b - backup\n       t - trapped, o - offload failure\n\nR>* 1.0.0.0/8 [120/2] via 20.20.0.2, eth3, weight 1, 00:0
+[TOOL] mcp__kathara_frr_mcp_server__frr_show_running_config({'router_name': 'router2'})
+[RESULT] {"result":"Codes: K - kernel route, C - connected, S - static, R - RIP,\n       O - OSPF, I - IS-IS, B - BGP, E - EIGRP, N - NHRP,\n       T - Table, v - VNC, V - VNC-Direct, A - Babel, F - PBR,\n       f - OpenFabric,\n       > - selected route, * - FIB route, q - queued, r - rejected, b - backup\n       t - trapped, o - offload failure\n\nC>* 1.0.0.0/8 is directly connected, eth0, 00:02:57\nR>* 
+[RESULT] {"result":"Building configuration...\n\nCurrent configuration:\n!\nfrr version 9.1.3\nfrr defaults traditional\nhostname router2\ndomainname localdomain\nno ipv6 forwarding\nno service integrated-vtysh-config\n!\nrouter rip\n network 1.0.0.0/8\n network 128.168.0.0/16\n network 20.0.0.0/8\n version 1\nexit\n!\nend"}
+[TEXT] **Critical observation:** router1 currently shows `R>* 1.0.0.0/8` and `R>* 128.168.0.0/16` via eth3, **age 00:02:54 (174 seconds)** — just 6 seconds shy of RIP's 180-second timeout! And router2's running config shows **`version 1`**. This is highly suspicious. Let me get router1's RIP config and the live RIP database:
+[TOOL] mcp__kathara_frr_mcp_server__frr_show_running_config({'router_name': 'router1'})
+[TOOL] mcp__kathara_frr_mcp_server__frr_show_running_config({'router_name': 'router0'})
+[RESULT] {"result":"Building configuration...\n\nCurrent configuration:\n!\nfrr version 9.1.3\nfrr defaults traditional\nhostname router1\ndomainname localdomain\nno ipv6 forwarding\nno service integrated-vtysh-config\n!\nrouter rip\n network 192.168.3.0/24\n network 192.168.4.0/24\n network 10.0.0.0/8\n network 20.0.0.0/8\n version 2\nexit\n!\nend"}
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'router2', 'command': 'vtysh -c "show ip rip"'})
+[RESULT] {"result":"Building configuration...\n\nCurrent configuration:\n!\nfrr version 9.1.3\nfrr defaults traditional\nhostname router0\ndomainname localdomain\nno ipv6 forwarding\nno service integrated-vtysh-config\n!\nrouter rip\n network 192.168.1.0/24\n network 192.168.2.0/24\n network 10.0.0.0/8\n version 2\nexit\n!\nend"}
+[RESULT] {"result":"% Unknown command: \"show"}
+[TEXT] **Found the fault.** The version mismatch is confirmed:
+- **router2**: `version 1` (sends v1 broadcasts, only accepts v1)  
+- **router1**: `version 2` (sends v2 multicast 224.0.0.9, only accepts v2)
+- **router0**: `version 2` (matches router1)
+
+Let me verify that the routes are now expiring/gone and confirm the RIP state on both sides:
+[TOOL] mcp__kathara_frr_mcp_server__frr_show_ip_route({'router_name': 'router1'})
+[TOOL] ToolSearch({'query': 'select:mcp__kathara_frr_mcp_server__frr_exec'})
+[RESULT] {"result":"Codes: K - kernel route, C - connected, S - static, R - RIP,\n       O - OSPF, I - IS-IS, B - BGP, E - EIGRP, N - NHRP,\n       T - Table, v - VNC, V - VNC-Direct, A - Babel, F - PBR,\n       f - OpenFabric,\n       > - selected route, * - FIB route, q - queued, r - rejected, b - backup\n       t - trapped, o - offload failure\n\nC>* 10.0.0.0/8 is directly connected, eth2, 00:04:26\nC>*
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_frr_mcp_server__frr_exec'}]
+[TEXT] **Routes confirmed expired** — `1.0.0.0/8` and `128.168.0.0/16` are completely gone from router1's table now. The 174-second-old routes I saw earlier expired at the 180-second RIP timeout, exactly as predicted. Let me do one final confirmation of the RIP state on both routers:
+[TOOL] mcp__kathara_frr_mcp_server__frr_exec({'router_name': 'router2', 'command': 'show ip rip'})
+[TOOL] mcp__kathara_frr_mcp_server__frr_exec({'router_name': 'router1', 'command': 'show ip rip'})
+[RESULT] {"result":"Codes: R - RIP, C - connected, S - Static, O - OSPF, B - BGP\nSub-codes:\n      (n) - normal, (s) - static, (d) - default, (r) - redistribute,\n      (i) - interface\n\n     Network            Next Hop         Metric From            Tag Time\nC(i) 1.0.0.0/8          0.0.0.0               1 self              0\nR(n) 10.0.0.0/8         20.20.0.1            16 20.20.0.1         0 01:31\nC(
+[RESULT] {"result":"Codes: R - RIP, C - connected, S - Static, O - OSPF, B - BGP\nSub-codes:\n      (n) - normal, (s) - static, (d) - default, (r) - redistribute,\n      (i) - interface\n\n     Network            Next Hop         Metric From            Tag Time\nR(n) 1.0.0.0/8          20.20.0.2            16 20.20.0.2         0 01:32\nC(i) 10.0.0.0/8         0.0.0.0               1 self              0\nC(
+[TEXT] This is the complete picture. The evidence is definitive.
+
+**Router1's RIP database** shows `1.0.0.0/8` and `128.168.0.0/16` from `20.20.0.2` (router2) with **metric 16 and a 1:32 garbage-collection countdown** — these are expired, poisoned routes being purged, NOT active routes.
+
+**Router2's RIP database** mirrors this — all routes from `20.20.0.1` (router1) also show **metric 16** — confirming neither router is receiving the other's live updates.
+
+The version mismatch is the direct cause:
+| Router | RIP Config | Sends | Accepts |
+|---|---|---|---|
+| router2 | `version 1` | broadcast to 255.255.255.255 | v1 broadcasts only |
+| router1 | `version 2` | multicast to 224.0.0.9 | v2 multicast only |
+| router0 | `version 2` | multicast to 224.0.0.9 | v2 multicast only |
+
+Router2 sends v1 broadc
+[FINAL] stop=end_turn tool_calls=17
+[SUBMITTED] parsed_ok=True is_anomaly=True faulty_devices=['router2']
+[FINAL-TEXT] This is the complete picture. The evidence is definitive.
+
+**Router1's RIP database** shows `1.0.0.0/8` and `128.168.0.0/16` from `20.20.0.2` (router2) with **metric 16 and a 1:32 garbage-collection countdown** — these are expired, poisoned routes being purged, NOT active routes.
+
+**Router2's RIP database** mirrors this — all routes from `20.20.0.1` (router1) also show **metric 16** — confirming neither router is receiving the other's live updates.
+
+The version mismatch is the direct cause:
+| Router | RIP Config | Sends | Accepts |
+|---|---|---|---|
+| router2 | `version 1` | broadcast to 255.255.255.255 | v1 broadcasts only |
+| router1 | `version 2` | multicast to 224.0.0.9 | v2 multicast only |
+| router0 | `version 2` | multicast to 224.0.0.9 | v2 multicast only |
+
+Router2 sends v1 broadcasts → router1 ignores them. Router1 sends v2 multicast → router2 ignores them. Routes on both sides time out at 180s, get marked metric-16 (infinity), and are being garbage-collected. This explains exactly why reachability from the Phase 1 snapshot showed 0% loss (routes were still alive at age 174s) but the user observed recurring disappearances.
+
+---
+
+=== DIAGNOSIS ===
+is_anomaly: true
+faulty_devices: router2
+diagnosis_text:
+**Affected component:** RIP protocol version setting in router2's FRR `router rip` configuration block.
+
+**Mechanism:** RIP version 1 and version 2 are mutually incompatible at the wire level. Version 1 sends updates as UDP broadcasts to 255.255.255.255 and, in FRR's implementation, will only process incoming v1 packets. Version 2 sends updates as UDP multicast to 224.0.0.9 and will only process v2 packets. When router2 was reconfigured with `version 1`, its outbound RIP updates changed from v2 multicast to v1 broadcast. Router1 — running `version 2` — joined the 224.0.0.9 multicast group and filters out v1 broadcast packets, so it stopped receiving router2's advertisements. Simultaneously, router2 stopped accepting router1's v2 multicast updates. With no refreshes arriving, the RIP 180-second timeout expired for the affected prefixes on router1, the routes were flagged at metric 16 (infinity) and garbage-collected, and they vanished from the kernel routing table. The Phase 1 reachability snapshot coincidentally caught them at age 174 seconds — just 6 seconds before expiry — which is why pings still succeeded at that instant but had already failed or were about to.
+
+**Localization:** router2, FRR `router rip` configuration, `version 1` directive.
+
+**Root cause:** After the config change on router2, `version 1` replaced what should have been `version 2`, creating a RIP version mismatch with router1 and all other routers in the topology.
+
+**Fix:** On router2, enter FRR (`vtysh`) and change the global RIP version back to 2: `router rip` → `version 2`. This restores v2 multicast sends and v2 receive processing, allowing router1 to re-learn 1.0.0.0/8 and 128.168.0.0/16 at the next update interval (≤30 seconds).
+=== END ===

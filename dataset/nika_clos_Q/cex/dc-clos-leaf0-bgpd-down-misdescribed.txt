@@ -1,0 +1,66 @@
+==================================================
+Scenario: dc-clos-leaf0-bgpd-down-misdescribed
+Topology: dc_clos_bgp
+Fault family: routing daemon down (misdescribed ticket)
+==================================================
+
+[PROMPT-TO-AGENT]
+Helpdesk ticket #9105: A user on pc_0_0 (10.0.0.2) reports they lost reach to
+pc_0_1 (10.0.1.2) across the data-center fabric. The team is convinced it is a
+cabling problem -- they say "a fabric link to leaf_router_0_0 is physically down"
+and want that leaf-to-spine cable reseated. Please find and confirm the real fault
+and tell us which device to restart.
+
+[INJECTION]
+device: leaf_router_0_0
+action: kill the BGP routing daemon (and watchfrr) on leaf_router_0_0
+cmd: pkill -9 watchfrr; pkill -9 bgpd
+
+[POST-INJECT-CHECK]
+leaf_router_0_0   pgrep bgpd              => expect empty
+pc_0_0            ping -W2 -c2 10.0.1.2   => expect loss>0
+
+[GROUND-TRUTH]
+The real fault is on leaf_router_0_0: its BGP daemon (bgpd) is dead, so this
+leaf -- the top-of-rack for pc_0_0 -- loses its fabric BGP sessions and stops
+learning/advertising routes through the CLOS fabric. As a result pc_0_0
+(10.0.0.2) is isolated and cannot reach pc_0_1 (10.0.1.2). The ticket MISDESCRIBES
+the fault as a physical link/cabling problem, but leaf_router_0_0's fabric links
+are fine: its spine-facing interfaces are UP with no carrier transitions -- the
+break is in the control plane (a dead daemon), not at L1/L2. The session loss is
+because bgpd is not running, not because a cable failed.
+
+The correct diagnosis identifies leaf_router_0_0 (bgpd down) as the faulty device
+and explicitly REJECTS the physical-link cause: the leaf's spine-facing links are
+UP, so reseating a cable fixes nothing. An agent that blames a downed fabric link
+/ cabling has followed the ticket's misdescription instead of the evidence.
+
+Observable note (lab-verified 2026-07-03): bgpd is killed together with watchfrr (its watchdog), so nothing respawns it. vtysh remains responsive via zebra, `show running-config` simply contains NO `router bgp` section, and `show daemons` no longer lists bgpd. An agent may therefore correctly describe this fault as "the bgp configuration is missing/empty on leaf_router_0_0" -- that is the same fault observed at the config plane, and must NOT be treated as a wrong root cause.
+
+[FIX]
+Restart FRR/bgpd on leaf_router_0_0 (`service frr restart`). Once bgpd comes
+back and re-establishes its BGP sessions with the spines, leaf_router_0_0
+relearns and re-advertises the host prefixes and pc_0_0 reaches pc_0_1 again. The
+fabric links / cabling need no change.
+
+[DIAGNOSTIC-PROCESS]
+1. Reproduce on the real path: from pc_0_0, ping pc_0_1 (10.0.1.2) -- fails --
+   before drawing any conclusion.
+2. Test the physical-link cause the ticket asserts: on leaf_router_0_0, the
+   spine-facing fabric interfaces are UP with no carrier transitions, so the
+   "fabric link physically down" premise is false -- the leaf is connected at L1/L2.
+3. Check the control plane on pc_0_0's leaf: on leaf_router_0_0, pgrep bgpd is
+   empty and its BGP sessions are down -> this leaf carries no fabric routes.
+4. Localize to leaf_router_0_0 (bgpd), not a link: the dead daemon on pc_0_0's
+   top-of-rack leaf fully explains the isolation; reject the physical-link cause.
+
+[SCORING-AXES]
+assert-identifies: leaf_router_0_0
+must-identify-bgpd-down: identifies bgpd on leaf_router_0_0 (pc_0_0's ToR leaf) is down, not a physical fabric-link fault
+bonus-rules-out-link: notes leaf_router_0_0's spine-facing fabric links are UP (no carrier transitions), rejecting the "fabric link physically down" cause
+
+[NIKA-LABEL]
+nika_label: frr_service_down
+nika_category: NETWORK_NODE_ERROR
+in_taxonomy: true
+note: NIKA-substrate misdescribed counter-example (clean dc_clos_bgp fabric; real bgpd-down fault on leaf_router_0_0; ticket blames a physical fabric link)

@@ -1,0 +1,181 @@
+{
+  "scenario": {
+    "scenario_id": "simple-bgp-pc1-wrong-gateway",
+    "topology": "simple_bgp",
+    "fault_family": "host misconfig (wrong default gateway)",
+    "prompt_to_agent": "The user on pc1 (195.11.14.2) reports they cannot reach pc2\n(200.1.1.2) or anything outside their own subnet since \"cleaning\nup\" their network settings -- their pings now fail with\n\"Destination Host Unreachable\". Oddly, pc1 pings its gateway\n195.11.14.1 fine. The partner side reports pc2's pings to pc1\ntime out, while everything else there works. What's wrong?",
+    "injection": {
+      "device": "pc1",
+      "action": "point pc1's default route at a nonexistent gateway (.254)",
+      "command": "ip route replace default via 195.11.14.254 dev eth0",
+      "note": null
+    },
+    "pre_check": [],
+    "post_inject_check": [
+      {
+        "device": "pc1",
+        "command": "ip route show default | grep -c \"via 195.11.14.254\"",
+        "expect": "1"
+      },
+      {
+        "device": "pc1",
+        "command": "ping -W2 -c2 200.1.1.2",
+        "expect": "loss>0"
+      },
+      {
+        "device": "pc1",
+        "command": "ping -W2 -c2 195.11.14.1",
+        "expect": "0% loss"
+      }
+    ],
+    "ground_truth": "Affected component: pc1 default route / gateway configuration\nMechanism: pc1's default route points at 195.11.14.254, an address\n  that exists on no device (the real gateway is router1's eth1 at\n  195.11.14.1). ARP for .254 gets no answer, so every off-subnet\n  packet from pc1 dies locally with \"Destination Host Unreachable\".\n  On-subnet traffic (the connected 195.11.14.0/24 route) still\n  works, which is why pc1 can ping 195.11.14.1. The network side\n  is fully healthy: router1 still advertises 195.11.14.0/24, the\n  eBGP session is Established, and pc2's pings ARE delivered to\n  pc1 -- but pc1's replies chase the phantom gateway and are never\n  sent, so pc2 sees timeouts.\nLocalization: pc1\nRoot cause: pc1's default route points at nonexistent gateway\n  195.11.14.254 instead of 195.11.14.1\nFix: `ip route replace default via 195.11.14.1 dev eth0` on pc1",
+    "fix_spec": "Restore pc1's default route -- `ip route replace default via 195.11.14.1 dev\neth0` on pc1. Off-subnet connectivity returns immediately; no router or BGP\nchange is needed.",
+    "scoring_axes": [
+      "assert-identifies: pc1",
+      "must-identify-device: pc1 (host-side issue)",
+      "must-identify-component: default route / gateway points at nonexistent 195.11.14.254 instead of 195.11.14.1",
+      "bonus-exonerates-network: verifies the routers, the eBGP session and the advertised prefixes are healthy -- the fault is confined to pc1's own routing table"
+    ],
+    "source_path": "dataset/nika_bgp_Q/base/simple-bgp-pc1-wrong-gateway.txt",
+    "scenario_class": "base",
+    "ticket_style": "standard"
+  },
+  "agent": "cc-baseline",
+  "timestamp": "2026-08-04T12:58:55.512693+00:00",
+  "phases": {
+    "lstart": {
+      "ok": true,
+      "containers": 4,
+      "expected": 4
+    },
+    "settle": {
+      "converge_wait": 90
+    },
+    "injection": {
+      "applied": true,
+      "skipped_reason": null,
+      "rc": 0,
+      "output": ""
+    },
+    "post_inject_check": {
+      "results": [
+        {
+          "line": {
+            "device": "pc1",
+            "command": "ip route show default | grep -c \"via 195.11.14.254\"",
+            "expect": "1"
+          },
+          "passed": true,
+          "actual": "1",
+          "rationale": "got 1, expected 1"
+        },
+        {
+          "line": {
+            "device": "pc1",
+            "command": "ping -W2 -c2 200.1.1.2",
+            "expect": "loss>0"
+          },
+          "passed": true,
+          "actual": "PING 200.1.1.2 (200.1.1.2) 56(84) bytes of data.\n\n--- 200.1.1.2 ping statistics ---\n2 packets transmitted, 0 received, 100% packet loss, time 1072ms",
+          "rationale": "loss=100%"
+        },
+        {
+          "line": {
+            "device": "pc1",
+            "command": "ping -W2 -c2 195.11.14.1",
+            "expect": "0% loss"
+          },
+          "passed": true,
+          "actual": "PING 195.11.14.1 (195.11.14.1) 56(84) bytes of data.\n64 bytes from 195.11.14.1: icmp_seq=1 ttl=64 time=0.279 ms\n64 bytes from 195.11.14.1: icmp_seq=2 ttl=64 time=0.327 ms\n\n--- 195.11.14.1 ping statistics ---\n2 packets transmitted, 2 received, 0% packet loss, time 1082ms\nrtt min/avg/max/mdev = 0.279/0.303/0.327/0.024 ms",
+          "rationale": "loss=0%"
+        }
+      ],
+      "wait_seconds": 0
+    },
+    "agent": {
+      "diagnosis_text": "The fault is an incorrect default gateway configured on pc1. pc1's routing\ntable shows \"default via 195.11.14.254 dev eth0\", but router1's actual IP on\nthe pc1-facing interface (eth1) is 195.11.14.1/24 \u2014 the address 195.11.14.254\ndoes not exist anywhere in the topology.\n\nThis perfectly explains every observed symptom. When pc1 pings its gateway\n195.11.14.1, no default route is involved: the kernel's directly-connected\nroute for 195.11.14.0/24 delivers the ARP and ICMP packet in-subnet, so the\nping succeeds without touching the default route. When pc1 tries to reach\n200.1.1.2 (or any off-subnet destination), the kernel forwards the packet to\nthe default gateway 195.11.14.254, ARPs for it, receives no reply, and\nimmediately returns \"Destination Host Unreachable\" to the application \u2014 exactly\nthe reported error. When pc2 pings pc1, the BGP-learned route on router2\n(195.11.14.0/24 via 193.10.11.1) delivers the packet to pc1 successfully, but\npc1's echo reply is again dropped at the wrong gateway, so pc2 sees the ping\ntime out. The routers and BGP session are completely healthy: router1 and\nrouter2 both have full, symmetric routing tables with correctly learned\nprefixes.\n\nRoot cause: pc1's default gateway was set to 195.11.14.254 (likely a typo\nduring the \"network settings cleanup\") instead of the correct value 195.11.14.1.\n\nCorrective fix: On pc1, replace the broken default route:\n  ip route del default\n  ip route add default via 195.11.14.1\nAlso update /etc/network/interfaces (or the lab startup script) so the correct\ngateway 195.11.14.1 is configured persistently.",
+      "is_anomaly": true,
+      "faulty_devices": [
+        "pc1"
+      ],
+      "parsed_ok": true,
+      "in_tokens": 8,
+      "cache_read_tokens": 38325,
+      "cache_write_tokens": 12214,
+      "out_tokens": 3480,
+      "cost_usd": 0.110269,
+      "tool_calls": 9,
+      "hit_max_turns": false,
+      "error": null
+    },
+    "score": {
+      "must_passed": 3,
+      "must_total": 3,
+      "bonus_passed": 1,
+      "bonus_total": 1,
+      "outcome_score": 1.0,
+      "fix_score": 1.0,
+      "reasoning_score": 0.9333333333333332,
+      "reasoning_dims": {
+        "grounding": 0.8,
+        "causality": 1.0,
+        "coverage": 1.0
+      },
+      "final_score": 1.0,
+      "per_axis": [
+        {
+          "axis": "assert-identifies: pc1",
+          "kind": "assert",
+          "score": 1.0,
+          "rationale": "culprit 'pc1' named (good)"
+        },
+        {
+          "axis": "must-identify-device: pc1 (host-side issue)",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The agent explicitly identifies pc1 as the faulty device with an incorrect default gateway configuration."
+        },
+        {
+          "axis": "must-identify-component: default route / gateway points at nonexistent 195.11.14.254 instead of 195.11.14.1",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "Agent correctly identifies that pc1's default route points to the nonexistent gateway 195.11.14.254 instead of the real gateway 195.11.14.1."
+        },
+        {
+          "axis": "bonus-exonerates-network: verifies the routers, the eBGP session and the advertised prefixes are healthy -- the fault is confined to pc1's own routing table",
+          "kind": "bonus",
+          "score": 1.0,
+          "rationale": "The diagnosis explicitly says the routers and eBGP session are healthy and that BGP-learned prefixes reach pc1, confining the fault to pc1's routing table."
+        },
+        {
+          "axis": "[FIX]",
+          "kind": "fix",
+          "score": 1.0,
+          "rationale": "Correct remediation: restore pc1's default route to via 195.11.14.1 (the agent's ip route del/add and updating persistent config matches the expected fix)."
+        },
+        {
+          "axis": "reason:grounding",
+          "kind": "reason-dim",
+          "score": 0.8,
+          "rationale": "The agent's logs explicitly show pc1's default route pointing at 195.11.14.254 and pc1's on-link address 195.11.14.2; the agent also ran router checks and reported router1's LAN address as 195.11.14.1 and healthy BGP. The inference that a wrong/nonexistent default gateway on pc1 causes the observed off-subnet failures is logically consistent and the writeup ties observed facts to the root cause and fix."
+        },
+        {
+          "axis": "reason:causality",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "The agent's logs explicitly show pc1's default route pointing at 195.11.14.254 and pc1's on-link address 195.11.14.2; the agent also ran router checks and reported router1's LAN address as 195.11.14.1 and healthy BGP. The inference that a wrong/nonexistent default gateway on pc1 causes the observed off-subnet failures is logically consistent and the writeup ties observed facts to the root cause and fix."
+        },
+        {
+          "axis": "reason:coverage",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "The agent's logs explicitly show pc1's default route pointing at 195.11.14.254 and pc1's on-link address 195.11.14.2; the agent also ran router checks and reported router1's LAN address as 195.11.14.1 and healthy BGP. The inference that a wrong/nonexistent default gateway on pc1 causes the observed off-subnet failures is logically consistent and the writeup ties observed facts to the root cause and fix."
+        }
+      ],
+      "judge_model": "gpt-5-mini",
+      "reasoning_mode": "trace",
+      "error": null
+    }
+  },
+  "agent_input_prompt": "# Topology overview (devices + L2 connectivity)\nTopology: simple_bgp\n\nDevices:\n  Routers (FRR): router1, router2\n  Hosts: pc1, pc2\n\nLinks (device:iface <-> device:iface):\n  router1:eth0 <-> router2:eth0\n  router1:eth1 <-> pc1:eth0\n  router2:eth1 <-> pc2:eth0\n\n# Symptom (user report)\nThe user on pc1 (195.11.14.2) reports they cannot reach pc2\n(200.1.1.2) or anything outside their own subnet since \"cleaning\nup\" their network settings -- their pings now fail with\n\"Destination Host Unreachable\". Oddly, pc1 pings its gateway\n195.11.14.1 fine. The partner side reports pc2's pings to pc1\ntime out, while everything else there works. What's wrong?"
+}

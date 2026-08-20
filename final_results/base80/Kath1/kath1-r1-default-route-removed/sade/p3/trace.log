@@ -1,0 +1,139 @@
+[AGENT] sade starts on lab=Kath1
+[TEXT] ## Phase 1 — Blind Start
+[TOOL] ToolSearch({'query': 'select:mcp__kathara_base_mcp_server__get_reachability'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_base_mcp_server__get_reachability'}]
+[TOOL] mcp__kathara_base_mcp_server__get_reachability({})
+[RESULT] {"result":"{\"hosts\":{\"pc1\":\"10.1.0.100\",\"pc2\":\"10.1.0.101\",\"pc3\":\"10.3.0.100\"},\"results\":[{\"src\":\"pc1\",\"dst\":\"pc2\",\"dst_ip\":\"10.1.0.101\",\"tx\":2,\"rx\":2,\"loss_percent\":0.0,\"time_ms\":1037.0,\"rtt_avg_ms\":1.946,\"rtt_min_ms\":1.228,\"rtt_max_ms\":2.664,\"rtt_mdev_ms\":0.718,\"status\":\"ok\"},{\"src\":\"pc1\",\"dst\":\"pc3\",\"dst_ip\":\"10.3.0.100\",\"tx\":2,\"rx\
+[TEXT] ## Phase 2 — Branch
+
+Phase 1's evidence shows all internal paths (pc1↔pc2↔pc3) at 0% loss — consistent with the user's report that internal A↔B traffic is fine. However, `get_reachability` only tested internal hosts; the reported internet failure (to 203.0.113.1 and ISP gateways) is **not confirmed by Phase 1 evidence**. → Advancing to **Phase 4 — Broad-search escalation**.
+
+## Phase 4 — Broad-Search Escalation
+[TOOL] Skill({'skill': 'diagnosis-methodology-skill'})
+[RESULT] Launching skill: diagnosis-methodology-skill
+[TEXT] Following the methodology: **Phase A** — run both triage helpers (infra_sweep + l2_snapshot) in parallel.
+[TOOL] ToolSearch({'query': 'select:mcp__helper_server__run_helper'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__helper_server__run_helper'}]
+[TOOL] mcp__helper_server__run_helper({'script_name': 'infra_sweep'})
+[TOOL] mcp__helper_server__run_helper({'script_name': 'l2_snapshot'})
+[RESULT] {"result":"Unknown machine type: ispb with image kathara/dhcp\nUnknown machine type: ispa with image kathara/dhcp\nUnknown machine type: r1 with image kathara/dhcp\nUnknown machine type: ispb with image kathara/dhcp\nUnknown machine type: ispa with image kathara/dhcp\nUnknown machine type: r1 with image kathara/dhcp\n=== INFRA SWEEP ===\nLab: Kath1\nScope: hosts, routers, switches, servers, bmv2_s
+[RESULT] {"result":"Unknown machine type: ispb with image kathara/dhcp\nUnknown machine type: ispa with image kathara/dhcp\nUnknown machine type: r1 with image kathara/dhcp\n=== L2 SNAPSHOT ===\nLab: Kath1\nScope: hosts, routers, switches, servers, bmv2_switches, ovs_switches, sdn_controllers, other_devices\nDevices scanned: 20\nDuplicate MAC groups: 0\nFlagged devices: 4\nDevices with bridge members: 8\nD
+[TEXT] **Phase A analysis:** Two major ACL flags surfaced:
+1. **ispa** and **ispb** — nftables rules on `eth0` (their R1-facing interface) drop all RFC1918 source addresses: `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`
+2. dswa1/dswa2 — drop rule for 10.1.0.0/24 → 10.3.0.0/24 (but user says A↔B works, counters show 0 — likely baseline or ineffective)
+
+**Active lead:** The ISP devices are filtering private-address packets arriving from R1. This directly explains why R1 can't reach ISP gateways if R1's WAN interface IPs are in RFC1918 space. Let me confirm R1's WAN interface addresses and the ISP gateway IPs.
+[TOOL] ToolSearch({'query': 'select:mcp__kathara_base_mcp_server__exec_shell'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_base_mcp_server__exec_shell'}]
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'r1', 'command': 'ip addr show; ip route show'})
+[RESULT] {"result":"1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN group default qlen 1000\n    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00\n    inet 127.0.0.1/8 scope host lo\n       valid_lft forever preferred_lft forever\n    inet 10.0.0.76/32 scope global lo\n       valid_lft forever preferred_lft forever\n    inet6 ::1/128 scope host proto kernel_lo \n       valid_lft fo
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'ispa', 'command': 'ip addr show eth0; nft list ruleset'})
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'ispb', 'command': 'ip addr show eth0; nft list ruleset'})
+[RESULT] {"result":"58033: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UP group default qlen 1000\n    link/ether e2:0f:23:f0:0a:1c brd ff:ff:ff:ff:ff:ff\n    inet 203.0.113.1/30 scope global eth0\n       valid_lft forever preferred_lft forever\ntable ip nat {\n\tchain DOCKER_OUTPUT {\n\t\tip daddr 127.0.0.11 tcp dport 53 counter packets 0 bytes 0 dnat to 127.0.0.11:43813\n\t\tip 
+[RESULT] {"result":"58037: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UP group default qlen 1000\n    link/ether b6:b2:f9:98:42:81 brd ff:ff:ff:ff:ff:ff\n    inet 203.0.113.5/30 scope global eth0\n       valid_lft forever preferred_lft forever\ntable ip nat {\n\tchain DOCKER_OUTPUT {\n\t\tip daddr 127.0.0.11 tcp dport 53 counter packets 0 bytes 0 dnat to 127.0.0.11:43415\n\t\tip 
+[TEXT] **Key finding so far:**
+- R1's WAN interfaces are **public IPs** (eth2=203.0.113.2/30 ↔ ispa, eth3=203.0.113.6/30 ↔ ispb) — obtained via DHCP
+- ispa/ispb each drop RFC1918 source addresses on `eth0` (both INPUT + FORWARD chains)
+- R1's own WAN pings use 203.0.113.x as source → should NOT be blocked by that ACL
+
+This is contradictory — R1's direct pings to ISP gateways shouldn't be blocked. Let me verify R1's actual reachability to both ISP gateways and check the full routing table for a default route:
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'r1', 'command': 'ping -c3 -W2 203.0.113.1; echo "---"; ping -c3 -W2 203.0.113.5; echo "---"; ip route show | grep -E "default|203.0.113"'})
+[RESULT] {"result":"PING 203.0.113.1 (203.0.113.1) 56(84) bytes of data.\n64 bytes from 203.0.113.1: icmp_seq=1 ttl=64 time=0.287 ms\n64 bytes from 203.0.113.1: icmp_seq=2 ttl=64 time=0.368 ms\n64 bytes from 203.0.113.1: icmp_seq=3 ttl=64 time=0.308 ms\n\n--- 203.0.113.1 ping statistics ---\n3 packets transmitted, 3 received, 0% packet loss, time 2124ms\nrtt min/avg/max/mdev = 0.287/0.321/0.368/0.034 ms\n\
+[TEXT] **Interesting!** R1 can ping both ISP gateways directly (0% loss) — their WAN IPs are public (203.0.113.2/30 ↔ ispa; 203.0.113.6/30 ↔ ispb). The ACL doesn't block R1's own traffic. But notice: `grep -E "default|203.0.113"` returned **empty** — R1 has no default route!
+
+Now let me verify the full picture: can a PC actually reach 203.0.113.1, and does R1 have a default route for beyond-gateway traffic?
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'pc1', 'command': 'ping -c3 -W2 203.0.113.1; echo "---"; ip route show'})
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'r1', 'command': 'ip route show; echo "---"; ping -c2 -W2 8.8.8.8 || echo "8.8.8.8 failed"; nft list ruleset 2>/dev/null | head -40'})
+[RESULT] {"result":"PING 203.0.113.1 (203.0.113.1) 56(84) bytes of data.\nFrom 10.1.0.2 icmp_seq=1 Destination Net Unreachable\nFrom 10.1.0.2 icmp_seq=2 Destination Net Unreachable\nFrom 10.1.0.2 icmp_seq=3 Destination Net Unreachable\n\n--- 203.0.113.1 ping statistics ---\n3 packets transmitted, 0 received, +3 errors, 100% packet loss, time 2128ms\n\n\"---\"\ndefault via 10.1.0.1 dev eth0 \n10.1.0.0/24 de
+[RESULT] {"result":"10.0.0.0/28 nhid 28 proto ospf metric 20 \n\tnexthop via 10.0.0.34 dev eth0 weight 1 \n\tnexthop via 10.0.0.38 dev eth1 weight 1 \n10.0.0.1 nhid 28 proto ospf metric 20 \n\tnexthop via 10.0.0.34 dev eth0 weight 1 \n\tnexthop via 10.0.0.38 dev eth1 weight 1 \n10.0.0.16/28 nhid 28 proto ospf metric 20 \n\tnexthop via 10.0.0.34 dev eth0 weight 1 \n\tnexthop via 10.0.0.38 dev eth1 weight 1 
+[TEXT] **Critical finding!** 
+
+- `pc1 → 203.0.113.1`: **Destination Net Unreachable** from 10.1.0.2 — not a timeout, but an ICMP unreach **from within the OSPF fabric**, meaning no router in the internal network has a route to 203.0.113.x
+- `R1's routing table`: Only has directly-connected 203.0.113.0/30 and 203.0.113.4/30 — **NO default route** (`0.0.0.0/0` is absent)
+- `R1 → 8.8.8.8`: Fails — confirms R1 itself can't reach beyond its directly-connected WAN subnets
+- **R1 DOES have NAT/masquerade** rules configured on eth2/eth3 for all internal subnets
+
+**Active lead shifted**: The root cause is R1's missing default route. R1 gets its WAN IPs dynamically (DHCP from ispa/ispb) but received no default route from DHCP. Let me check the DHCP server configurations on ispa/ispb:
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'ispa', 'command': 'cat /etc/dhcp/dhcpd.conf 2>/dev/null || cat /etc/dhcpd.conf 2>/dev/null; echo "---"; ps aux | grep -i dhcp'})
+[RESULT] {"result":"default-lease-time 600;\nmax-lease-time 7200;\nauthoritative;\n\n# Pool for Link to R1 (203.0.113.0/30)\nsubnet 203.0.113.0 netmask 255.255.255.252 {\n  range 203.0.113.2 203.0.113.2; # Only assign .2\n  option routers 203.0.113.1;\n}\n\n# Empty subnet for ISPB link\nsubnet 192.0.2.0 netmask 255.255.255.252 {}\"---\"\nroot        57  0.0  0.0   9268  6512 ?        Ss   10:43   0:00 /usr
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'ispb', 'command': 'cat /etc/dhcp/dhcpd.conf 2>/dev/null || cat /etc/dhcpd.conf 2>/dev/null; echo "---"; ps aux | grep -i dhcp'})
+[RESULT] {"result":"default-lease-time 600;\nmax-lease-time 7200;\nauthoritative;\n\n# Pool for Link to R1 (203.0.113.4/30)\nsubnet 203.0.113.4 netmask 255.255.255.252 {\n  range 203.0.113.6 203.0.113.6; # Only assign .6\n  option routers 203.0.113.5;\n}\n\n# Empty subnet for ISPA link\nsubnet 192.0.2.0 netmask 255.255.255.252 {}\"---\"\nroot        52  0.0  0.0   9268  6512 ?        Ss   10:43   0:00 /usr
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'r1', 'command': 'cat /var/lib/dhcp/dhclient.leases 2>/dev/null || cat /var/lib/dhclient/dhclient.leases 2>/dev/null; echo "---"; ps aux | grep -i dhclient'})
+[RESULT] {"result":"lease {\n  interface \"eth2\";\n  fixed-address 203.0.113.2;\n  option subnet-mask 255.255.255.252;\n  option dhcp-lease-time 600;\n  option routers 203.0.113.1;\n  option dhcp-message-type 5;\n  option dhcp-server-identifier 203.0.113.1;\n  renew 0 2026/08/02 10:47:21;\n  rebind 0 2026/08/02 10:51:39;\n  expire 0 2026/08/02 10:52:54;\n}\nlease {\n  interface \"eth2\";\n  fixed-address 
+[TEXT] **Excellent!** The DHCP servers DO advertise `option routers` (203.0.113.1 for ispa, 203.0.113.5 for ispb). R1's DHCP lease files confirm the `option routers` WAS received. But R1's routing table still has **no default route**. This means R1's DHCP client is ignoring or not applying the `routers` option.
+
+Let me check R1's dhclient configuration:
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'r1', 'command': 'cat /etc/dhcp/dhclient.conf 2>/dev/null; echo "==="; cat /etc/dhclient.conf 2>/dev/null; echo "==="; ls /etc/dhcp/ 2>/dev/null; ls /lib/dhcpcd/ 2>/dev/null; cat /sbin/dhclient-script 2>/dev/null | head -30'})
+[RESULT] {"result":"# Configuration file for /sbin/dhclient.\n#\n# This is a sample configuration file for dhclient. See dhclient.conf's\n#\tman page for more information about the syntax of this file\n#\tand a more comprehensive list of the parameters understood by\n#\tdhclient.\n#\n# Normally, if the DHCP server provides reasonable information and does\n#\tnot leave anything out (like the domain name, fo
+[TEXT] **Critical lead!** There's a `debug` file and `dhclient-enter-hooks.d`/`dhclient-exit-hooks.d` directories in `/etc/dhcp/`. These hooks run during DHCP events and could be suppressing default route installation. Let me inspect them:
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'r1', 'command': 'ls -la /etc/dhcp/dhclient-enter-hooks.d/ 2>/dev/null; echo "---"; ls -la /etc/dhcp/dhclient-exit-hooks.d/ 2>/dev/null; echo "---"; cat /etc/dhcp/dhclient-enter-hooks.d/* 2>/dev/null; echo "==="; cat /etc/dhcp/dhclient-exit-hooks.d/* 2>/dev/null; echo "==="; cat /etc/d)
+[RESULT] {"result":"total 8\ndrwxr-xr-x 2 root root 4096 Jan 15  2025 .\ndrwxr-xr-x 1 root root 4096 Aug  2 10:42 ..\nlrwxrwxrwx 1 root root    8 Apr 17  2023 debug -> ../debug\n\"---\"\ntotal 16\ndrwxr-xr-x 2 root root 4096 Jan 15  2025 .\ndrwxr-xr-x 1 root root 4096 Aug  2 10:42 ..\nlrwxrwxrwx 1 root root    8 Apr 17  2023 debug -> ../debug\n-rw-r--r-- 1 root root 1756 Apr 17  2023 rfc3442-classless-rout
+[TEXT] The hook scripts are inactive. The `routers` option is in the request list and was received in the lease. Yet no default route exists. Let me check R1's OSPF configuration (which might need `default-information originate`) and also inspect the dhclient-script for any route suppression:
+[TOOL] mcp__kathara_frr_mcp_server__frr_get_ospf_conf({'router_name': 'r1'})
+[RESULT] {"result":"OSPF Routing Process, Router ID: 10.0.0.76\n Supports only single TOS (TOS0) routes\n This implementation conforms to RFC2328\n RFC1583Compatibility flag is disabled\n OpaqueCapability flag is disabled\n Initial SPF scheduling delay 0 millisec(s)\n Minimum hold time between consecutive SPFs 50 millisec(s)\n Maximum hold time between consecutive SPFs 5000 millisec(s)\n Hold time multipli
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'r1', 'command': 'grep -n "routers\\|default-route\\|supersede\\|ignore" /sbin/dhclient-script 2>/dev/null | head -30; echo "==="; cat /etc/network/interfaces 2>/dev/null; echo "==="; ls /startup* /root/*.sh /root/startup* 2>/dev/null; cat /startup 2>/dev/null | head -40'})
+[RESULT] {"result":"\"===\"\n# interfaces(5) file used by ifup(8) and ifdown(8)\n# Include files from /etc/network/interfaces.d:\nsource /etc/network/interfaces.d/*\n\"===\""}
+[TEXT] R1's OSPF shows it's an ASBR but with **0 external LSAs** — it's not injecting anything into OSPF. Let me check R1's full FRR running config to see what `default-information originate` is configured, and also check all routing tables:
+[TOOL] mcp__kathara_frr_mcp_server__frr_show_running_config({'router_name': 'r1'})
+[RESULT] {"result":"Building configuration...\n\nCurrent configuration:\n!\nfrr version 9.1.3\nfrr defaults traditional\nhostname r1\ndomainname localdomain\nlog file /var/log/frr/frr.log\nno ipv6 forwarding\nno service integrated-vtysh-config\n!\npassword zebra\nenable password zebra\n!\ninterface lo\n ip address 10.0.0.76/32\n ip ospf passive\nexit\n!\nrouter ospf\n ospf router-id 10.0.0.76\n network 10.
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'r1', 'command': 'ip route show table all | grep -E "default|203.0|0.0.0.0"; echo "==="; ip rule show'})
+[RESULT] {"result":"\"===\"\n0:\tfrom all lookup local\n32766:\tfrom all lookup main\n32767:\tfrom all lookup default"}
+[TEXT] **Smoking gun found!** R1's FRR OSPF config has:
+```
+default-information originate
+```
+Without the `always` keyword. This only injects a default route into OSPF if R1 **itself** already has a default route. Since `ip route show table all` returned **absolutely nothing** for a default route — R1 has no `0.0.0.0/0` despite receiving `option routers` from DHCP.
+
+Let me verify that the dhclient-script actually handles route installation (the grep for "routers" returned nothing, which is suspicious for a stock script):
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'r1', 'command': 'wc -l /sbin/dhclient-script; grep -c "new_routers\\|make_resolv_conf\\|ip route" /sbin/dhclient-script; grep -n "new_routers" /sbin/dhclient-script | head -20'})
+[TOOL] mcp__kathara_frr_mcp_server__frr_show_ip_route({'router_name': 'r1'})
+[RESULT] {"result":"434 /sbin/dhclient-script\n/sbin/dhclient-script:0"}
+[RESULT] {"result":"Codes: K - kernel route, C - connected, S - static, R - RIP,\n       O - OSPF, I - IS-IS, B - BGP, E - EIGRP, N - NHRP,\n       T - Table, v - VNC, V - VNC-Direct, A - Babel, F - PBR,\n       f - OpenFabric,\n       > - selected route, * - FIB route, q - queued, r - rejected, b - backup\n       t - trapped, o - offload failure\n\nO>* 10.0.0.0/28 [110/25] via 10.0.0.34, eth0, weight 1, 0
+[TEXT] **Definitive evidence found:**
+- `/sbin/dhclient-script` has 434 lines but **0 occurrences** of `new_routers`, `make_resolv_conf`, or `ip route`
+- A standard Debian dhclient-script of that size would have multiple `ip route` calls and references to `$new_routers` for default gateway installation
+- This script has been **stripped of its route-installation logic**
+
+This is the root cause. Let me confirm by viewing the script's route-handling section:
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'r1', 'command': 'grep -n "route\\|gateway\\|BOUND\\|RENEW\\|REBIND\\|routers" /sbin/dhclient-script | head -30'})
+[RESULT] {"result":""}
+[TEXT] **Confirmed.** Zero results for `route|gateway|BOUND|RENEW|REBIND|routers` in a 434-line dhclient-script proves beyond doubt that all DHCP event-handling and route-installation logic has been removed from R1's `/sbin/dhclient-script`. The causal chain is now fully established:
+
+## Phase 5 — Final Diagnosis
+
+The complete evidence trail:
+1. ✅ ispa/ispb DHCP servers correctly provide `option routers` (203.0.113.1 and 203.0.113.5)
+2. ✅ R1's dhclient processes receive and store the lease with `option routers`
+3. ❌ R1's dhclient-script (434 lines, 0 route keywords) never installs the default gateway → **no `0.0.0.0/0` in R1's routing table**
+4. ❌ R1's OSPF `default-information originate` (without `always`) only fires when R1 itself has a default route → **0 Type-5 External LSAs injected**
+5. ❌ A
+[FINAL] stop=end_turn tool_calls=25
+[SUBMITTED] parsed_ok=True is_anomaly=True faulty_devices=['r1']
+[FINAL-TEXT] **Confirmed.** Zero results for `route|gateway|BOUND|RENEW|REBIND|routers` in a 434-line dhclient-script proves beyond doubt that all DHCP event-handling and route-installation logic has been removed from R1's `/sbin/dhclient-script`. The causal chain is now fully established:
+
+## Phase 5 — Final Diagnosis
+
+The complete evidence trail:
+1. ✅ ispa/ispb DHCP servers correctly provide `option routers` (203.0.113.1 and 203.0.113.5)
+2. ✅ R1's dhclient processes receive and store the lease with `option routers`
+3. ❌ R1's dhclient-script (434 lines, 0 route keywords) never installs the default gateway → **no `0.0.0.0/0` in R1's routing table**
+4. ❌ R1's OSPF `default-information originate` (without `always`) only fires when R1 itself has a default route → **0 Type-5 External LSAs injected**
+5. ❌ All internal routers (CSW/DSW/ASW) have no default route → "Destination Net Unreachable" for any internet destination
+6. ❌ R1 itself can reach ISP gateways (directly connected 203.0.113.0/30, /4) but not beyond them
+
+---
+
+=== DIAGNOSIS ===
+is_anomaly: true
+faulty_devices: r1
+diagnosis_text:
+**Affected component:** R1's DHCP client script (`/sbin/dhclient-script`) and, cascading from it, OSPF default-route origination.
+
+**Mechanism:** R1 obtains public WAN addresses (203.0.113.2/30 via ispa, 203.0.113.6/30 via ispb) through DHCP. Both ISP DHCP servers correctly advertise `option routers` with their gateway IPs. R1's dhclient processes store the received leases — including the `option routers` field — in the lease file. However, R1's `/sbin/dhclient-script` (434 lines) has been stripped of all routing-related logic: it contains zero occurrences of `BOUND`, `RENEW`, `new_routers`, `ip route`, or `gateway`. The script processes DHCP exchanges but never calls `ip route add default via ...`, so no default route is ever installed in the kernel routing table.
+
+**Localization:** Faulty device is **r1**; the fault lives in `/sbin/dhclient-script`. The downstream effect is that R1's FRR OSPF process has `default-information originate` configured *without* the `always` keyword, which only injects a Type-5 External LSA for `0.0.0.0/0` into OSPF when R1 itself holds a default route. Since no default route exists, zero External LSAs are injected, and every internal router (CSW, DSW, ASW) and end-host has no route to any non-RFC1918 destination. PCs receive "Destination Net Unreachable" from their first-hop OSPF gateway for all internet-bound traffic.
+
+**Root cause:** R1's `/sbin/dhclient-script` has had its route-installation logic removed, preventing the DHCP-provided default gateway from being installed, which in turn prevents OSPF from distributing a default route to the campus.
+
+**Fix:** Restore the standard Debian dhclient-script on r1 (reinstall `isc-dhcp-client`) so DHCP lease events correctly install `default via 203.0.113.1 dev eth2` and `default via 203.0.113.5 dev eth3`. Alternatively, add a static default route on r1 and change OSPF to `default-information originate always`.
+=== END ===

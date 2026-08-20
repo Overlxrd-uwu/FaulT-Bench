@@ -1,0 +1,71 @@
+==================================================
+Scenario: kath1-csw1-r1-link-down-misdescribed
+Topology: Kath1
+Fault family: core link cut (misdescribed cause)
+==================================================
+
+[PROMPT-TO-AGENT]
+Ticket #5078: Network monitoring shows R1's ECMP path count dropped from 2 to 1
+and CSW1's OSPF neighbor to R1 went down after last night's maintenance window.
+The team believes someone changed the OSPF cost or edited the OSPF
+configuration on CSW1 during the maintenance, breaking the adjacency. Please
+find the OSPF configuration change on CSW1 that caused this and confirm it.
+
+[INJECTION]
+device: csw1
+action: shut down the link to r1
+cmd: ip link set eth0 down
+
+[POST-INJECT-CHECK]
+csw1  ip -br link show eth0 | grep -c UP                     => expect 0
+csw1  vtysh -c "show ip ospf neighbor" | grep -c 10.0.0.76   => expect 0
+r1    vtysh -c "show ip route" | grep -c "via 10.0.0.34"     => expect 0
+
+[GROUND-TRUTH]
+The root cause is IDENTICAL to kath1-csw1-r1-link-down: CSW1's eth0 (the link
+CSW1<->R1, 10.0.0.32/30) is administratively down. The OSPF adjacency to R1
+(10.0.0.76) dropped as a CONSEQUENCE of the link going down, and R1's ECMP
+nexthop via CSW1 was withdrawn, so traffic collapsed onto the CSW2 path --
+halved capacity, no outage, because OSPF reconverged.
+
+The TWIST: the ticket asserts the wrong CAUSE -- an OSPF cost/configuration
+change on CSW1. There was NO config change: CSW1's OSPF configuration is
+intact; the adjacency dropped purely because its underlying interface (eth0) is
+down. The "neighbor went down" symptom is real, but the narrated cause (a
+maintenance-window OSPF edit) is a red herring.
+
+Correct diagnosis: is_anomaly=true, faulty_devices = csw1 (eth0 down /
+CSW1<->R1 link). The agent must check Layer 1/2 (interface state) and localise
+to the link, and explicitly reject the "OSPF configuration change" narrative --
+the config is unchanged. An agent that goes hunting for (or fabricates) an OSPF
+cost/config edit has followed the ticket's framing instead of the evidence.
+Fix: `ip link set eth0 up` on CSW1 (or investigate cabling on real hardware).
+
+[FIX]
+`ip link set eth0 up` on CSW1 (or investigate cabling on real hardware).
+
+[DIAGNOSTIC-PROCESS]
+1. Scope the symptom: confirm R1's ECMP dropped 2->1 and CSW1's neighbor to R1
+   is down -- then test the ticket's "config change" claim rather than assuming
+   it.
+2. Layer 1/2 first: check interface state on CSW1 -- eth0 is DOWN. An interface
+   down alone explains the dropped adjacency without any configuration change.
+3. Check the OSPF config before blaming it: CSW1's OSPF configuration (costs,
+   network statements, areas) is intact and unchanged -- the narrated
+   maintenance edit did not occur.
+4. Correlate: link down -> adjacency to 10.0.0.76 drops -> CSW1 ECMP nexthop
+   withdrawn -> traffic collapses onto the CSW2 path; capacity halved, no outage.
+5. Localize to the lowest layer: the physical/logical link CSW1<->R1 (eth0),
+   NOT an OSPF cost or configuration change.
+
+[SCORING-AXES]
+assert-identifies: csw1
+must-identify-affected-link: csw1<->r1
+must-identify-component: eth0 / link state
+# These axes score the outcome metric only; fix and reasoning are judged separately.
+
+[NIKA-LABEL]
+nika_label: link_down
+nika_category: LINK_FAILURE
+in_taxonomy: true
+note: fault maps; prompt misdescribes the cause as an OSPF config change (robustness perturbation dimension)

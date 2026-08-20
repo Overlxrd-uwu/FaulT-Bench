@@ -1,0 +1,75 @@
+==================================================
+Scenario: simple-bgp-router1-neighbor-removed
+Topology: simple_bgp
+Fault family: BGP neighbor statement removed
+==================================================
+
+[PROMPT-TO-AGENT]
+pc1 (195.11.14.2) has lost all connectivity to the partner AS --
+pings to pc2 (200.1.1.2) fail. The partner operator says their
+router2 shows the eBGP session to us as down and keeps retrying,
+and swears they changed nothing on their side. Our router1 is up
+and pc1 can still reach its gateway 195.11.14.1. Find what broke.
+
+[INJECTION]
+device: router1
+action: remove the eBGP neighbor statement for router2 from router1's BGP config
+cmd: |
+  vtysh -c "configure terminal" \
+        -c "router bgp 1" \
+        -c "no neighbor 193.10.11.2" \
+        -c "exit" -c "exit"
+
+[POST-INJECT-CHECK]
+router1   vtysh -c "show running-config" | grep -c "neighbor 193.10.11.2"  => expect 0
+pc1       ping -W2 -c2 200.1.1.2                                           => expect loss>0
+
+[GROUND-TRUTH]
+Affected component: router1 BGP configuration (neighbor statement)
+Mechanism: router1's `router bgp 1` section no longer contains
+  `neighbor 193.10.11.2 remote-as 2`. Deleting the peer tears the
+  eBGP session down immediately: router1 loses the learned route
+  to 200.1.1.0/24 and stops advertising 195.11.14.0/24, so pc1 and
+  pc2 lose each other in both directions. bgpd is still RUNNING on
+  router1 (pgrep bgpd is non-empty) and `router bgp 1` with its
+  `network 195.11.14.0/24` line is still present -- only the
+  neighbor definition is gone. router2 is healthy: its config and
+  daemon are intact and it cycles trying to re-establish, because
+  router1 no longer has it configured as a peer.
+Localization: router1
+Root cause: BGP neighbor statement for 193.10.11.2 (remote-as 2)
+  missing from router1's configuration
+Fix: re-add the neighbor statement on router1 (see [FIX])
+
+[FIX]
+Re-add the neighbor on router1:
+`vtysh -c "configure terminal" -c "router bgp 1" -c "neighbor 193.10.11.2 remote-as 2"`
+The eBGP session re-establishes and the inter-AS prefixes are re-exchanged.
+(A `service frr restart` on router1 also restores it, since /etc/frr/frr.conf
+on disk was never modified.)
+
+[DIAGNOSTIC-PROCESS]
+1. Reproduce on the real path: from pc1, ping pc2 (200.1.1.2) -- it fails (no
+   route to the peer AS on router1).
+2. Check the eBGP session from both ends: router2's bgpd is up and shows the
+   session to 193.10.11.1 down/retrying; on router1, `show bgp summary` lists NO
+   neighbor at all.
+3. Inspect router1's config: bgpd is running and `router bgp 1` is present, but
+   the `neighbor 193.10.11.2 remote-as 2` line is missing from the running
+   config -- the peer is simply unconfigured.
+4. Localize to router1's configuration: a missing neighbor statement, not a
+   daemon crash (bgpd runs) and not a link failure (eth0 is UP and
+   193.10.11.1<->193.10.11.2 pings work); exonerate router2.
+
+[SCORING-AXES]
+assert-identifies: router1
+must-identify-device: router1
+must-identify-component: BGP neighbor statement for 193.10.11.2 missing from router1's config
+must-distinguish-from-daemon-down: recognizes bgpd is still running on router1 and the peer is unconfigured, not a crashed daemon or a link failure
+bonus-exonerates-router2: notes router2's config/daemon are intact and its session retries fail only because router1 no longer has the peer configured
+
+[NIKA-LABEL]
+nika_label: none
+nika_category: NOVEL
+in_taxonomy: false
+note: BGP neighbor statement removed; NIKA has ospf_neighbor_missing but no BGP neighbor-removal fault

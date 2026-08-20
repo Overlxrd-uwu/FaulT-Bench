@@ -1,0 +1,83 @@
+==================================================
+Scenario: ospf-enterprise-dist1-network-statement-removed
+Topology: ospf_enterprise_static
+Fault family: OSPF network statement removed
+==================================================
+
+[PROMPT-TO-AGENT]
+Helpdesk ticket #8873: host_1_1_1_1 (10.1.1.2) reports it cannot reach
+anything outside its own subnet -- the server farm and the other pod all time
+out -- though it still pings its gateway 10.1.1.1 fine. Oddly, when we logged
+into switch_dist_1_1 itself, the switch CAN ping the server farm. Pod 2 is
+unaffected. Find what broke.
+
+[INJECTION]
+device: switch_dist_1_1
+action: remove the OSPF network statement that advertises the pod-1 host subnet
+cmd: |
+  vtysh -c "configure terminal" \
+        -c "router ospf" \
+        -c "no network 10.1.1.0/24 area 1" \
+        -c "exit" -c "exit"
+
+[POST-INJECT-CHECK]
+switch_dist_1_1  vtysh -c "show running-config" | grep -c "network 10.1.1.0/24 area 1"  => expect 0
+host_1_1_1_1     ping -W2 -c2 10.200.0.2                                                => expect loss>0
+host_1_1_1_1     ping -W2 -c2 10.1.1.1                                                  => expect 0% loss   (gateway still reachable)
+
+[GROUND-TRUTH]
+Affected component: switch_dist_1_1 OSPF configuration (missing
+  `network 10.1.1.0/24 area 1` statement)
+Mechanism: switch_dist_1_1 normally advertises the pod-1 host subnet
+  10.1.1.0/24 into OSPF area 1; router_core_1 (the ABR) summarizes it into
+  the area-0 backbone. With the network statement removed, the prefix is
+  withdrawn everywhere, so the rest of the network loses its RETURN route to
+  pod 1. The forward path still works -- switch_dist_1_1 keeps learning all
+  remote routes over its uplink (172.16.0.6/31 is still in OSPF) -- so
+  host_1_1_1_1's packets reach the farm and the replies are dropped on the
+  way back: classic missing-advertisement asymmetry. switch_dist_1_1's own
+  pings succeed because they source from its uplink address 172.16.0.7,
+  which is still advertised.
+Localization: switch_dist_1_1
+Root cause: `network 10.1.1.0/24 area 1` removed from `router ospf` on
+  switch_dist_1_1, so pod 1's subnet is no longer advertised
+Fix: re-add the network statement on switch_dist_1_1 (see [FIX]).
+
+[FIX]
+On switch_dist_1_1:
+`vtysh -c "configure terminal" -c "router ospf" -c "network 10.1.1.0/24 area 1"`
+(`service frr restart` also heals it: the change was made only to the running
+config, and /etc/frr/frr.conf still contains the statement.)
+
+[DIAGNOSTIC-PROCESS]
+1. Scope the symptom: host_1_1_1_1 reaches its gateway but nothing beyond,
+   pod 2 is fine, and -- the key clue -- switch_dist_1_1 itself CAN reach the
+   farm. The data plane out of pod 1 works; something breaks the reverse
+   direction.
+2. Trace both directions: packets from host_1_1_1_1 arrive at the far side,
+   but remote routers (e.g. switch_server_access, router_core_3) have NO
+   route to 10.1.1.0/24 in their tables -- the prefix has vanished.
+3. Check the advertisement source: on switch_dist_1_1, `show running-config`
+   shows `router ospf` with the uplink network statement present but NO
+   `network 10.1.1.0/24 area 1` -- the host subnet is no longer put into
+   OSPF.
+4. Explain the asymmetry: the switch's own pings source from 172.16.0.7 on
+   the still-advertised uplink /31, which is why the gateway can ping the
+   farm while its hosts cannot.
+5. Localize to switch_dist_1_1's OSPF config: rule out the uplink (UP,
+   adjacency Full), the daemon (ospfd running), and the host (correct IP,
+   netmask, and gateway).
+
+[SCORING-AXES]
+assert-identifies: switch_dist_1_1
+must-identify-device: switch_dist_1_1
+must-identify-component: missing OSPF network statement / 10.1.1.0/24 no longer advertised
+must-identify-mechanism: return-path failure -- the rest of the network lost its route back to pod 1 while the forward path still works
+bonus-explains-gateway-anomaly: explains why switch_dist_1_1 itself still reaches the farm (pings source from its still-advertised uplink address)
+# These axes score the outcome metric only; fix and reasoning are judged separately.
+
+[NIKA-LABEL]
+nika_label: ospf_area_misconfiguration
+nika_category: MISCONFIGURATION
+in_taxonomy: true
+note: partial: a prefix advertisement (network statement) is removed rather than assigned a wrong area ID; closest NIKA OSPF-misconfiguration label

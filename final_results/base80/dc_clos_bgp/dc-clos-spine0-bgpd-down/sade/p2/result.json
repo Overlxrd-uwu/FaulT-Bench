@@ -1,0 +1,173 @@
+{
+  "scenario": {
+    "scenario_id": "dc-clos-spine0-bgpd-down",
+    "topology": "dc_clos_bgp",
+    "fault_family": "routing daemon down (redundancy loss, no user outage)",
+    "prompt_to_agent": "Monitoring raised a fabric alarm: super_spine_router_0 and BOTH leaf\nrouters each report their BGP session toward spine_router_0_0 going\ndown within seconds of each other. No user has complained -- pc_0_0\n(10.0.0.2) and pc_0_1 (10.0.1.2) still reach each other -- but the\nfabric is now running without its usual redundancy. All of\nspine_router_0_0's interfaces still show UP. Find what broke.",
+    "injection": {
+      "device": "spine_router_0_0",
+      "action": "kill the BGP routing daemon (and watchfrr) on spine_router_0_0",
+      "command": "pkill -9 watchfrr; pkill -9 bgpd",
+      "note": null
+    },
+    "pre_check": [],
+    "post_inject_check": [
+      {
+        "device": "spine_router_0_0",
+        "command": "pgrep bgpd",
+        "expect": "empty"
+      },
+      {
+        "device": "pc_0_0",
+        "command": "ping -W2 -c2 10.0.1.2",
+        "expect": "0% loss   (still OK -- redundant fabric via spine_router_0_1)"
+      }
+    ],
+    "ground_truth": "Affected component: spine_router_0_0 bgpd\nMechanism: spine_router_0_0 (AS 65100) peers with super_spine_router_0\n  (172.16.0.0, AS 65000), leaf_router_0_0 (172.16.0.5, AS 65200) and\n  leaf_router_0_1 (172.16.0.7, AS 65201). Killing bgpd tears down all\n  three sessions at once (the peers see the TCP session close and fall\n  to Idle/Active). The CLOS fabric is redundant: both leaves still peer\n  with spine_router_0_1, so 10.0.0.0/24 and 10.0.1.0/24 stay reachable\n  via the other spine and users see at most a brief blip. The impact is\n  loss of path redundancy, not an outage.\nLocalization: spine_router_0_0\nRoot cause: bgpd not running on spine_router_0_0\nFix: restart FRR on spine_router_0_0 (`service frr restart`) -- the\n  config persists in /etc/frr/frr.conf, so the restart restores all\n  three sessions.\n\nObservable note: bgpd is killed together with watchfrr (its watchdog),\nso nothing respawns it (this kill pattern is lab-verified on this\nfabric's leaf routers, 2026-07-03; the spines run the same image and\nFRR config layout). vtysh remains responsive via zebra,\n`show running-config` on spine_router_0_0 simply contains NO\n`router bgp` section, and `show daemons` no longer lists bgpd. An agent\nmay therefore correctly describe this fault as \"the bgp configuration\nis missing/empty on spine_router_0_0\" -- that is the same fault observed\nat the config plane, and must NOT be treated as a wrong root cause.",
+    "fix_spec": "`service frr restart` on spine_router_0_0. The persistent\n/etc/frr/frr.conf brings bgpd back with its full neighbor configuration;\nthe sessions to the super-spine and both leaves re-establish and the\nfabric regains its second spine path.",
+    "scoring_axes": [
+      "assert-identifies: spine_router_0_0",
+      "must-identify-device: spine_router_0_0",
+      "must-identify-component: bgpd / BGP daemon down",
+      "must-distinguish-symptom-pattern: all three peers (super-spine + both leaves) lost their session to spine_router_0_0 at once while end-to-end traffic keeps flowing",
+      "bonus-notes-redundancy: explains that reachability survives because spine_router_0_1 still carries both host prefixes (loss of redundancy, not an outage)"
+    ],
+    "source_path": "dataset/nika_clos_Q/base/dc-clos-spine0-bgpd-down.txt",
+    "scenario_class": "base",
+    "ticket_style": "standard"
+  },
+  "agent": "sade",
+  "timestamp": "2026-08-04T12:15:24.100729+00:00",
+  "phases": {
+    "lstart": {
+      "ok": true,
+      "containers": 7,
+      "expected": 7
+    },
+    "settle": {
+      "converge_wait": 90
+    },
+    "injection": {
+      "applied": true,
+      "skipped_reason": null,
+      "rc": 0,
+      "output": ""
+    },
+    "post_inject_check": {
+      "results": [
+        {
+          "line": {
+            "device": "spine_router_0_0",
+            "command": "pgrep bgpd",
+            "expect": "empty"
+          },
+          "passed": true,
+          "actual": "",
+          "rationale": "output empty"
+        },
+        {
+          "line": {
+            "device": "pc_0_0",
+            "command": "ping -W2 -c2 10.0.1.2",
+            "expect": "0% loss   (still OK -- redundant fabric via spine_router_0_1)"
+          },
+          "passed": true,
+          "actual": "PING 10.0.1.2 (10.0.1.2) 56(84) bytes of data.\n64 bytes from 10.0.1.2: icmp_seq=1 ttl=61 time=1.09 ms\n64 bytes from 10.0.1.2: icmp_seq=2 ttl=61 time=0.932 ms\n\n--- 10.0.1.2 ping statistics ---\n2 packets transmitted, 2 received, 0% packet loss, time 1054ms\nrtt min/avg/max/mdev = 0.932/1.010/1.088/0.078 ms",
+          "rationale": "loss=0%"
+        }
+      ],
+      "wait_seconds": 0
+    },
+    "agent": {
+      "diagnosis_text": "**Affected component:** The FRR BGP daemon (`bgpd`) and its supervisor (`watchfrr`) on `spine_router_0_0`. The `frr.service` systemd unit is in state `inactive (dead)`.\n\n**Mechanism:** BGP sessions are TCP connections initiated to port 179. When `bgpd` is not running, no process is listening on port 179 on `spine_router_0_0`. Its three configured peers \u2014 `leaf_router_0_0`, `leaf_router_0_1`, and `super_spine_router_0` \u2014 each attempt to open a TCP session but receive no SYN-ACK. They enter the BGP `Active` state (retry loop), which is exactly what the fabric alarm reported. Because `watchfrr` is also absent, there is no FRR watchdog to detect the crash and attempt a restart.\n\n**Localization:** Solely `spine_router_0_0`. All other routers (`spine_router_0_1`, both leaf routers, `super_spine_router_0`) show FRR healthy with `bgpd` and `watchfrr` running. `spine_router_0_1` has all three of its BGP sessions `Established`, so the alternate spine path carries the data plane \u2014 explaining why `pc_0_0` and `pc_0_1` still reach each other with 0% loss.\n\n**Root cause:** The FRR service (`frr.service`) is stopped/dead on `spine_router_0_0`, taking `bgpd` down with it and rendering the router BGP-deaf. No configuration was corrupted; the configuration stored on disk is intact.\n\n**Fix:** Restart the FRR service on `spine_router_0_0` with `systemctl start frr`. This will bring up `watchfrr`, `zebra`, and `bgpd` in order, re-establish the three dormant BGP sessions, and restore full fabric redundancy.",
+      "is_anomaly": true,
+      "faulty_devices": [
+        "spine_router_0_0"
+      ],
+      "parsed_ok": true,
+      "in_tokens": 20,
+      "cache_read_tokens": 132495,
+      "cache_write_tokens": 19840,
+      "out_tokens": 5524,
+      "cost_usd": 0.19801649999999998,
+      "tool_calls": 12,
+      "hit_max_turns": false,
+      "error": null
+    },
+    "score": {
+      "must_passed": 4,
+      "must_total": 4,
+      "bonus_passed": 1,
+      "bonus_total": 1,
+      "outcome_score": 1.0,
+      "fix_score": 1.0,
+      "reasoning_score": 0.8333333333333334,
+      "reasoning_dims": {
+        "grounding": 0.8,
+        "causality": 0.9,
+        "coverage": 0.8
+      },
+      "final_score": 1.0,
+      "per_axis": [
+        {
+          "axis": "assert-identifies: spine_router_0_0",
+          "kind": "assert",
+          "score": 1.0,
+          "rationale": "culprit 'spine_router_0_0' named (good)"
+        },
+        {
+          "axis": "must-identify-device: spine_router_0_0",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The diagnosis explicitly localizes the fault to spine_router_0_0, stating the FRR/bgpd/watchfrr are down only on that device."
+        },
+        {
+          "axis": "must-identify-component: bgpd / BGP daemon down",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The report explicitly states bgpd is not running on spine_router_0_0 (FRR service inactive), satisfying the requirement to identify the BGP daemon as down."
+        },
+        {
+          "axis": "must-distinguish-symptom-pattern: all three peers (super-spine + both leaves) lost their session to spine_router_0_0 at once while end-to-end traffic keeps flowing",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The diagnosis explicitly notes bgpd/watchfrr are down on spine_router_0_0 causing all three peers to lose sessions simultaneously and explains that spine_router_0_1 keeps data-plane traffic flowing, matching the symptom pattern."
+        },
+        {
+          "axis": "bonus-notes-redundancy: explains that reachability survives because spine_router_0_1 still carries both host prefixes (loss of redundancy, not an outage)",
+          "kind": "bonus",
+          "score": 1.0,
+          "rationale": "The agent explicitly notes spine_router_0_1 has all BGP sessions Established and carries the data plane, explaining reachability is preserved and this is a loss of redundancy rather than an outage."
+        },
+        {
+          "axis": "[FIX]",
+          "kind": "fix",
+          "score": 1.0,
+          "rationale": "Starting the frr service (systemctl start frr) will bring back watchfrr/bgpd and re-establish the BGP sessions, which matches the expected remediation."
+        },
+        {
+          "axis": "reason:grounding",
+          "kind": "reason-dim",
+          "score": 0.8,
+          "rationale": "The investigation log clearly shows bgpd/watchfrr absent, frr.service inactive, and no listener on port 179 while data-plane reachability is ok \u2014 supporting the daemon-down root cause. One minor ungrounded claim (asserting on-disk config intact / zebra alive) is not shown in the log but does not invalidate the main diagnosis."
+        },
+        {
+          "axis": "reason:causality",
+          "kind": "reason-dim",
+          "score": 0.9,
+          "rationale": "The investigation log clearly shows bgpd/watchfrr absent, frr.service inactive, and no listener on port 179 while data-plane reachability is ok \u2014 supporting the daemon-down root cause. One minor ungrounded claim (asserting on-disk config intact / zebra alive) is not shown in the log but does not invalidate the main diagnosis."
+        },
+        {
+          "axis": "reason:coverage",
+          "kind": "reason-dim",
+          "score": 0.8,
+          "rationale": "The investigation log clearly shows bgpd/watchfrr absent, frr.service inactive, and no listener on port 179 while data-plane reachability is ok \u2014 supporting the daemon-down root cause. One minor ungrounded claim (asserting on-disk config intact / zebra alive) is not shown in the log but does not invalidate the main diagnosis."
+        }
+      ],
+      "judge_model": "gpt-5-mini",
+      "reasoning_mode": "trace",
+      "error": null
+    }
+  },
+  "agent_input_prompt": "# Topology overview (devices + L2 connectivity)\nTopology: dc_clos_bgp\n\nDevices:\n  Routers (FRR): leaf_router_0_0, leaf_router_0_1, spine_router_0_0, spine_router_0_1, super_spine_router_0\n  Hosts: pc_0_0, pc_0_1\n\nLinks (device:iface <-> device:iface):\n  leaf_router_0_0:eth2 <-> pc_0_0:eth0\n  leaf_router_0_1:eth2 <-> pc_0_1:eth0\n  spine_router_0_0:eth1 <-> leaf_router_0_0:eth0\n  spine_router_0_0:eth2 <-> leaf_router_0_1:eth0\n  spine_router_0_1:eth1 <-> leaf_router_0_0:eth1\n  spine_router_0_1:eth2 <-> leaf_router_0_1:eth1\n  super_spine_router_0:eth0 <-> spine_router_0_0:eth0\n  super_spine_router_0:eth1 <-> spine_router_0_1:eth0\n\n# Symptom (user report)\nMonitoring raised a fabric alarm: super_spine_router_0 and BOTH leaf\nrouters each report their BGP session toward spine_router_0_0 going\ndown within seconds of each other. No user has complained -- pc_0_0\n(10.0.0.2) and pc_0_1 (10.0.1.2) still reach each other -- but the\nfabric is now running without its usual redundancy. All of\nspine_router_0_0's interfaces still show UP. Find what broke."
+}

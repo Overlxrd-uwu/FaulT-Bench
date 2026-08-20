@@ -1,0 +1,165 @@
+{
+  "scenario": {
+    "scenario_id": "dc-clos-leaf0-hostlink-down-misdirected",
+    "topology": "dc_clos_bgp",
+    "fault_family": "link down (misdirected ticket)",
+    "prompt_to_agent": "Helpdesk ticket #9103: A user on pc_0_0 (10.0.0.2) reports they lost all\nconnectivity -- pc_0_0 can't reach pc_0_1 (10.0.1.2) or anything across the\nfabric. The team blames the fabric -- they say \"spine_router_0_0 has failed,\nswap the spine\". Please find and confirm the real fault and tell us which\ndevice or link to restart.",
+    "injection": {
+      "device": "leaf_router_0_0",
+      "action": "take down pc_0_0's access link (eth2) on leaf_router_0_0",
+      "command": "ip link set eth2 down",
+      "note": null
+    },
+    "pre_check": [],
+    "post_inject_check": [
+      {
+        "device": "leaf_router_0_0",
+        "command": "ip -br link show eth2 | grep -c UP",
+        "expect": "0"
+      },
+      {
+        "device": "pc_0_0",
+        "command": "ping -W2 -c2 10.0.1.2",
+        "expect": "loss>0"
+      }
+    ],
+    "ground_truth": "The real fault is on leaf_router_0_0: pc_0_0's access link -- the host-facing\ninterface eth2 (leaf_router_0_0 -> pc_0_0) -- is DOWN, so pc_0_0 (10.0.0.2) is\ncut off at its own top-of-rack leaf and cannot reach pc_0_1 (10.0.1.2) or\nanything beyond. The ticket MISDIRECTS to the fabric / a spine, but the fabric\nis healthy: the CLOS fabric is redundant and the OTHER leaf (leaf_router_0_1)\nstill reaches the fabric normally through both spines, which it could not do if\nspine_router_0_0 had failed. The symptom is purely the down access link at\npc_0_0's leaf, not a spine/fabric fault.\n\nThe correct diagnosis identifies leaf_router_0_0 (host-facing access link eth2\ndown) as the faulty device and explicitly EXONERATES spine_router_0_0: the\nspines and fabric still carry the other leaf, so the user's \"spine has failed\"\nhypothesis is wrong. An agent that swaps / blames spine_router_0_0 has followed\nthe ticket's misdirection instead of the evidence.",
+    "fix_spec": "Bring pc_0_0's access link back up: on leaf_router_0_0, `ip link set eth2 up`.\nOnce eth2 is UP again, pc_0_0 reattaches to its leaf and reaches pc_0_1 across\nthe fabric. spine_router_0_0 / the fabric needs no change.",
+    "scoring_axes": [
+      "assert-identifies: leaf_router_0_0",
+      "assert-not-identifies: spine_router_0_0",
+      "must-identify-link-down: identifies pc_0_0's access link (leaf_router_0_0 eth2) is down, not a fabric/spine fault",
+      "bonus-exonerates-spine: explicitly notes the spines/fabric still carry the other leaf, rejecting the ticket's spine hypothesis"
+    ],
+    "source_path": "dataset/nika_clos_Q/cex/dc-clos-leaf0-hostlink-down-misdirected.txt",
+    "scenario_class": "wrong-device"
+  },
+  "agent": "sade",
+  "timestamp": "2026-07-05T14:29:59.092860+00:00",
+  "phases": {
+    "lstart": {
+      "ok": true,
+      "containers": 7,
+      "expected": 7
+    },
+    "settle": {
+      "converge_wait": 90
+    },
+    "injection": {
+      "applied": true,
+      "skipped_reason": null,
+      "rc": 0,
+      "output": ""
+    },
+    "post_inject_check": {
+      "results": [
+        {
+          "line": {
+            "device": "leaf_router_0_0",
+            "command": "ip -br link show eth2 | grep -c UP",
+            "expect": "0"
+          },
+          "passed": true,
+          "actual": "0",
+          "rationale": "got 0, expected 0"
+        },
+        {
+          "line": {
+            "device": "pc_0_0",
+            "command": "ping -W2 -c2 10.0.1.2",
+            "expect": "loss>0"
+          },
+          "passed": true,
+          "actual": "PING 10.0.1.2 (10.0.1.2) 56(84) bytes of data.\n\n--- 10.0.1.2 ping statistics ---\n2 packets transmitted, 0 received, 100% packet loss, time 1013ms",
+          "rationale": "loss=100%"
+        }
+      ],
+      "wait_seconds": 0
+    },
+    "agent": {
+      "diagnosis_text": "**Affected component:** Interface `eth2` on `leaf_router_0_0` \u2014 the access-side link connecting the leaf router to host `pc_0_0` (10.0.0.2) on the 10.0.0.0/24 subnet.\n\n**Mechanism:** `eth2` is administratively/operationally DOWN despite having IP address `10.0.0.1/24` configured. When an interface is DOWN, the Linux kernel does not install a connected route for its subnet. Without a connected route for `10.0.0.0/24` in the FIB, FRR's BGP `network 10.0.0.0/24` statement finds no matching installed prefix and therefore does not advertise that prefix to any BGP peer. As a result, `leaf_router_0_1` and every other router in the fabric has no route to `10.0.0.0/24`, causing `leaf_router_0_1` to return \"Destination Net Unreachable\" when `pc_0_1` tries to reach `pc_0_0`. Simultaneously, `pc_0_0` cannot ARP for its gateway (`10.0.0.1`) because `eth2` is not forwarding, producing \"Destination Host Unreachable\" from its own IP.\n\n**Localization:** `leaf_router_0_0`, interface `eth2` \u2014 confirmed DOWN via `ip addr show eth2` (`<BROADCAST,MULTICAST>`, state DOWN, no LOWER_UP flag) and corroborated by the absent `10.0.0.0/24` connected route in `ip route show` and in the FRR routing table.\n\n**Root cause:** The eth2 interface on `leaf_router_0_0` is DOWN, severing the host-to-fabric path for `pc_0_0` and suppressing BGP advertisement of `10.0.0.0/24` fabric-wide. The spine routers are all healthy (BGP fully Established with 3 peers each).\n\n**Fix:** Bring `eth2` up on `leaf_router_0_0` (`ip link set eth2 up`). This will restore the connected route, trigger BGP to advertise `10.0.0.0/24`, and restore end-to-end reachability between `pc_0_0` and `pc_0_1`.",
+      "is_anomaly": true,
+      "faulty_devices": [
+        "leaf_router_0_0"
+      ],
+      "parsed_ok": true,
+      "in_tokens": 22,
+      "cache_read_tokens": 139166,
+      "cache_write_tokens": 19879,
+      "out_tokens": 7110,
+      "cost_usd": 0.22395405,
+      "tool_calls": 13,
+      "hit_max_turns": false,
+      "error": null
+    },
+    "score": {
+      "must_passed": 3,
+      "must_total": 3,
+      "bonus_passed": 1,
+      "bonus_total": 1,
+      "outcome_score": 1.0,
+      "fix_score": 1.0,
+      "reasoning_score": 1.0,
+      "reasoning_dims": {
+        "grounding": 1.0,
+        "causality": 1.0,
+        "coverage": 1.0
+      },
+      "final_score": 1.0,
+      "per_axis": [
+        {
+          "axis": "assert-identifies: leaf_router_0_0",
+          "kind": "assert",
+          "score": 1.0,
+          "rationale": "culprit 'leaf_router_0_0' named (good)"
+        },
+        {
+          "axis": "assert-not-identifies: spine_router_0_0",
+          "kind": "assert",
+          "score": 1.0,
+          "rationale": "decoy 'spine_router_0_0' absent (good)"
+        },
+        {
+          "axis": "must-identify-link-down: identifies pc_0_0's access link (leaf_router_0_0 eth2) is down, not a fabric/spine fault",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The report explicitly identifies leaf_router_0_0 interface eth2 as DOWN (pc_0_0's access link) and states the spines/fabric are healthy, matching the required diagnosis."
+        },
+        {
+          "axis": "bonus-exonerates-spine: explicitly notes the spines/fabric still carry the other leaf, rejecting the ticket's spine hypothesis",
+          "kind": "bonus",
+          "score": 1.0,
+          "rationale": "The write-up explicitly states the spine routers are healthy (BGP established) and attributes the fault to leaf_router_0_0's eth2, thereby rejecting the ticket's spine-failure hypothesis."
+        },
+        {
+          "axis": "[FIX]",
+          "kind": "fix",
+          "score": 1.0,
+          "rationale": "Proposes the exact corrective action\u2014bring eth2 up on leaf_router_0_0 (ip link set eth2 up), which restores the connected route and BGP advertisement."
+        },
+        {
+          "axis": "reason:grounding",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "The investigation log directly shows the key observations (ping unreachable messages, BGP sessions established, missing connected route, and eth2 state DOWN) and the writeup draws correct, logical inferences from them; the conclusion and fix are fully supported."
+        },
+        {
+          "axis": "reason:causality",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "The investigation log directly shows the key observations (ping unreachable messages, BGP sessions established, missing connected route, and eth2 state DOWN) and the writeup draws correct, logical inferences from them; the conclusion and fix are fully supported."
+        },
+        {
+          "axis": "reason:coverage",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "The investigation log directly shows the key observations (ping unreachable messages, BGP sessions established, missing connected route, and eth2 state DOWN) and the writeup draws correct, logical inferences from them; the conclusion and fix are fully supported."
+        }
+      ],
+      "judge_model": "gpt-5-mini",
+      "reasoning_mode": "trace",
+      "error": null
+    }
+  },
+  "agent_input_prompt": "# Topology overview (devices + L2 connectivity)\nTopology: dc_clos_bgp\n\nDevices:\n  Routers (FRR): leaf_router_0_0, leaf_router_0_1, spine_router_0_0, spine_router_0_1, super_spine_router_0\n  Hosts: pc_0_0, pc_0_1\n\nLinks (device:iface <-> device:iface):\n  leaf_router_0_0:eth2 <-> pc_0_0:eth0\n  leaf_router_0_1:eth2 <-> pc_0_1:eth0\n  spine_router_0_0:eth1 <-> leaf_router_0_0:eth0\n  spine_router_0_0:eth2 <-> leaf_router_0_1:eth0\n  spine_router_0_1:eth1 <-> leaf_router_0_0:eth1\n  spine_router_0_1:eth2 <-> leaf_router_0_1:eth1\n  super_spine_router_0:eth0 <-> spine_router_0_0:eth0\n  super_spine_router_0:eth1 <-> spine_router_0_1:eth0\n\n# Symptom (user report)\nHelpdesk ticket #9103: A user on pc_0_0 (10.0.0.2) reports they lost all\nconnectivity -- pc_0_0 can't reach pc_0_1 (10.0.1.2) or anything across the\nfabric. The team blames the fabric -- they say \"spine_router_0_0 has failed,\nswap the spine\". Please find and confirm the real fault and tell us which\ndevice or link to restart."
+}

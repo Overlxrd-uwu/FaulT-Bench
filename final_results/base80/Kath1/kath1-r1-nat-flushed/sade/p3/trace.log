@@ -1,0 +1,54 @@
+[AGENT] sade starts on lab=Kath1
+[TOOL] ToolSearch({'query': 'select:mcp__kathara_base_mcp_server__get_reachability'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_base_mcp_server__get_reachability'}]
+[TOOL] mcp__kathara_base_mcp_server__get_reachability({})
+[RESULT] {"result":"{\"hosts\":{\"pc1\":\"10.1.0.100\",\"pc2\":\"10.1.0.101\",\"pc3\":\"10.3.0.100\"},\"results\":[{\"src\":\"pc1\",\"dst\":\"pc2\",\"dst_ip\":\"10.1.0.101\",\"tx\":2,\"rx\":2,\"loss_percent\":0.0,\"time_ms\":1038.0,\"rtt_avg_ms\":1.789,\"rtt_min_ms\":1.515,\"rtt_max_ms\":2.063,\"rtt_mdev_ms\":0.274,\"status\":\"ok\"},{\"src\":\"pc2\",\"dst\":\"pc1\",\"dst_ip\":\"10.1.0.100\",\"tx\":2,\"rx\
+[TEXT] **Phase 1 result:** Internal reachability is clean — all pc1↔pc2 and pc3↔pc{1,2} pairs report 0% loss. However, the reachability map only tested internal hosts; no external/internet destination was probed, so the user-reported Internet failure is **not confirmed by Phase 1 evidence**.
+
+**Phase 2 branch → Phase 4** (inconclusive reachability for the specific symptom → broad-search escalation).
+[TOOL] Skill({'skill': 'diagnosis-methodology-skill'})
+[RESULT] Launching skill: diagnosis-methodology-skill
+[TEXT] Phase A triage — running both `infra_sweep` and `l2_snapshot` simultaneously.
+[TOOL] ToolSearch({'query': 'select:mcp__helper_server__run_helper,mcp__helper_server__list_helpers'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__helper_server__run_helper'}, {'type': 'tool_reference', 'tool_name': 'mcp__helper_server__list_helpers'}]
+[TOOL] mcp__helper_server__run_helper({'script_name': 'infra_sweep'})
+[TOOL] mcp__helper_server__run_helper({'script_name': 'l2_snapshot'})
+[RESULT] {"result":"Unknown machine type: r1 with image kathara/dhcp\nUnknown machine type: ispb with image kathara/dhcp\nUnknown machine type: ispa with image kathara/dhcp\nUnknown machine type: r1 with image kathara/dhcp\nUnknown machine type: ispb with image kathara/dhcp\nUnknown machine type: ispa with image kathara/dhcp\n=== INFRA SWEEP ===\nLab: Kath1\nScope: hosts, routers, switches, servers, bmv2_s
+[RESULT] {"result":"Unknown machine type: r1 with image kathara/dhcp\nUnknown machine type: ispb with image kathara/dhcp\nUnknown machine type: ispa with image kathara/dhcp\n=== L2 SNAPSHOT ===\nLab: Kath1\nScope: hosts, routers, switches, servers, bmv2_switches, ovs_switches, sdn_controllers, other_devices\nDevices scanned: 20\nDuplicate MAC groups: 0\nFlagged devices: 4\nDevices with bridge members: 8\nD
+[TEXT] **Phase A result:** Two critical findings surfaced:
+1. **`ispa`**: Active drop rules on `eth0` (facing r1) — drops ALL packets from RFC 1918 ranges (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`). Counter shows **5 packets / 300 bytes already dropped** from `10.0.0.0/8` — live evidence matching the symptom.
+2. **`dswa1/dswa2`**: Drop rules for `10.1.0.0/24 → 10.3.0.0/24` (0 packets, not active).
+3. **`r1`**: Only a `tcp dport 22 drop` rule flagged — **no NAT/masquerade rule visible**.
+
+The active lead: packets from PC1 (10.1.0.100) are reaching `ispa` with the private source IP intact, being dropped. This implies r1 is **not performing source NAT** before forwarding to the ISP. Let me confirm r1's full NAT table.
+[TOOL] ToolSearch({'query': 'select:mcp__kathara_base_mcp_server__exec_shell'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_base_mcp_server__exec_shell'}]
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'r1', 'command': 'nft list ruleset'})
+[RESULT] {"result":"table ip nat {\n\tchain DOCKER_OUTPUT {\n\t\tip daddr 127.0.0.11 tcp dport 53 counter packets 0 bytes 0 dnat to 127.0.0.11:33059\n\t\tip daddr 127.0.0.11 udp dport 53 counter packets 0 bytes 0 dnat to 127.0.0.11:47338\n\t}\n\n\tchain OUTPUT {\n\t\ttype nat hook output priority -100; policy accept;\n\t\tip daddr 127.0.0.11 counter packets 0 bytes 0 jump DOCKER_OUTPUT\n\t}\n\n\tchain DOCK
+[TEXT] **Smoking gun confirmed.** R1's `POSTROUTING` chain exists but is **completely empty** — there is no `masquerade` or SNAT rule. The chain should translate private source IPs before forwarding to the ISP, but it doesn't. The `PREROUTING` DNAT rule (inbound traffic to 203.0.113.113 → 10.5.0.4) confirms the NAT table structure was deliberately set up for NAT use — the outbound masquerade rule is simply missing.
+
+Chained against `ispa`'s live ingress filter (`iifname "eth0" ip saddr 10.0.0.0/8 drop`, 5 packets already counted), this perfectly explains the symptom: PC1's TCP packets leave r1 with source IP 10.1.0.100, ispa drops them, the external server never replies, and TCP times out. DNS resolves because it's handled by an **internal** DNS server — those queries never reach ispa.
+
+=== DIAGN
+[FINAL] stop=end_turn tool_calls=8
+[SUBMITTED] parsed_ok=True is_anomaly=True faulty_devices=['r1']
+[FINAL-TEXT] **Smoking gun confirmed.** R1's `POSTROUTING` chain exists but is **completely empty** — there is no `masquerade` or SNAT rule. The chain should translate private source IPs before forwarding to the ISP, but it doesn't. The `PREROUTING` DNAT rule (inbound traffic to 203.0.113.113 → 10.5.0.4) confirms the NAT table structure was deliberately set up for NAT use — the outbound masquerade rule is simply missing.
+
+Chained against `ispa`'s live ingress filter (`iifname "eth0" ip saddr 10.0.0.0/8 drop`, 5 packets already counted), this perfectly explains the symptom: PC1's TCP packets leave r1 with source IP 10.1.0.100, ispa drops them, the external server never replies, and TCP times out. DNS resolves because it's handled by an **internal** DNS server — those queries never reach ispa.
+
+=== DIAGNOSIS ===
+is_anomaly: true
+faulty_devices: r1
+diagnosis_text:
+**Affected component:** The `POSTROUTING` chain in r1's nftables `nat` table — the chain that should perform source NAT (masquerade) for traffic leaving toward the ISP is fully populated structurally but contains **zero rules**.
+
+**Mechanism:** PC1 (10.1.0.100) sends TCP packets destined for public IPs. R1 routes them correctly out its WAN interface toward `ispa`, but without a masquerade rule the packets depart with their private source address (10.1.0.100) intact. `ispa` enforces standard ISP ingress filtering (BCP 38): its nftables rule `iifname "eth0" ip saddr 10.0.0.0/8 drop` silently discards every packet from RFC 1918 space arriving from r1 — confirmed by a live counter of 5 packets / 300 bytes already dropped. The external server never receives a SYN, so TCP connections time out. DNS appears functional because name resolution is handled by an internal recursive resolver that never sends queries through the ISP path.
+
+**Localization:** Faulty device is **r1**, specifically its `nft table ip nat chain POSTROUTING`. The ISP-side filter on `ispa` is a normal, expected anti-spoofing mechanism; it is not the injected fault.
+
+**Root cause:** R1 is missing the outbound source NAT masquerade rule that should translate private client addresses to r1's public WAN IP before forwarding to the ISP.
+
+**Fix:** Add a masquerade rule to r1's POSTROUTING chain, e.g.:
+`nft add rule ip nat POSTROUTING oifname "eth2" masquerade`
+(and/or `eth3` for the secondary ISP link). This will rewrite the source IP to r1's public address, allowing replies to return correctly and satisfying `ispa`'s ingress filter.
+=== END ===

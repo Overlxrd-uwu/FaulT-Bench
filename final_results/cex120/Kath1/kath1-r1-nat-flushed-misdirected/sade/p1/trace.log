@@ -1,0 +1,67 @@
+[AGENT] sade starts on lab=Kath1
+[TOOL] ToolSearch({'query': 'select:mcp__kathara_base_mcp_server__get_reachability'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_base_mcp_server__get_reachability'}]
+[TOOL] mcp__kathara_base_mcp_server__get_reachability({})
+[RESULT] {"result":"{\"hosts\":{\"pc1\":\"10.1.0.100\",\"pc2\":\"10.1.0.101\",\"pc3\":\"10.3.0.100\"},\"results\":[{\"src\":\"pc1\",\"dst\":\"pc3\",\"dst_ip\":\"10.3.0.100\",\"tx\":2,\"rx\":2,\"loss_percent\":0.0,\"time_ms\":1011.0,\"rtt_avg_ms\":3.13,\"rtt_min_ms\":2.663,\"rtt_max_ms\":3.597,\"rtt_mdev_ms\":0.467,\"status\":\"ok\"},{\"src\":\"pc1\",\"dst\":\"pc2\",\"dst_ip\":\"10.1.0.101\",\"tx\":2,\"rx\"
+[TEXT] **Phase 1 complete.** The reachability map shows all internal host pairs (pc1↔pc2, pc1↔pc3, pc2↔pc3) with 0% loss — internal L3 is healthy.
+
+**Phase 2 branch.** The user-reported symptom (TCP connections to public Internet time out while internal ICMP and DNS work) is a real symptom (TCP timeout). Proceeding to Phase 3.
+
+**Phase 3 — Active lead:** PC1 cannot complete any TCP session to the public Internet, while internal ICMP and DNS work fine. This dual-ISP topology (r1→ispa, r1→ispb) uses inter-AS routing. ISP maintenance could have caused BGP session drops / route withdrawal, making internet prefixes unreachable. Mapping to **bgp-fault-skill**.
+[TOOL] Skill({'skill': 'bgp-fault-skill'})
+[RESULT] Launching skill: bgp-fault-skill
+[TOOL] ToolSearch({'query': 'select:mcp__helper_server__run_helper,mcp__helper_server__list_helpers'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__helper_server__run_helper'}, {'type': 'tool_reference', 'tool_name': 'mcp__helper_server__list_helpers'}]
+[TOOL] mcp__helper_server__run_helper({'script_name': 'bgp_snapshot'})
+[RESULT] {"result":"Unknown machine type: ispb with image kathara/dhcp\nUnknown machine type: r1 with image kathara/dhcp\nUnknown machine type: ispa with image kathara/dhcp\n=== BGP SNAPSHOT ===\nLab: Kath1\nRouters scanned: 12\nFlags:\n  - aswa1: missing FRR process(es): bgpd\n  - aswa1: zero BGP neighbors in summary\n  - aswa2: missing FRR process(es): bgpd\n  - aswa2: zero BGP neighbors in summary\n  - 
+[TEXT] The BGP snapshot couldn't scan r1, ispa, ispb (they use the `kathara/dhcp` image type). The internal switches don't run bgpd — that's expected. I need to examine r1 and the ISP routers directly. Let me run `infra_sweep` for a topology-wide view, then inspect the WAN path.
+[TOOL] mcp__helper_server__run_helper({'script_name': 'infra_sweep'})
+[RESULT] {"result":"Unknown machine type: ispb with image kathara/dhcp\nUnknown machine type: r1 with image kathara/dhcp\nUnknown machine type: ispa with image kathara/dhcp\nUnknown machine type: ispb with image kathara/dhcp\nUnknown machine type: r1 with image kathara/dhcp\nUnknown machine type: ispa with image kathara/dhcp\n=== INFRA SWEEP ===\nLab: Kath1\nScope: hosts, routers, switches, servers, bmv2_s
+[TEXT] **Key finding:** `ispa.eth0` is dropping packets with private RFC 1918 source addresses (`iifname "eth0" ip saddr 10.0.0.0/8 — counter: 5 packets hit`). The fact that packets are actually being received and dropped at ISPA means the WAN link is UP — the circuit isn't down. The dropped packets with private source IPs strongly suggest r1 is **not performing NAT/masquerade**, so packets from pc1 (10.1.0.100) arrive at ISPA with a private source IP and get dropped.
+
+Let me verify r1's NAT configuration and routing table directly.
+[TOOL] ToolSearch({'query': 'select:mcp__kathara_base_mcp_server__exec_shell'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_base_mcp_server__exec_shell'}]
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'r1', 'command': "iptables -t nat -L -n -v 2>/dev/null; echo '---NFT---'; nft list ruleset 2>/dev/null"})
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'r1', 'command': "ip addr show; echo '---ROUTES---'; ip route show"})
+[RESULT] {"result":"Chain PREROUTING (policy ACCEPT 0 packets, 0 bytes)\n pkts bytes target     prot opt in     out     source               destination         \n    0     0 DNAT       0    --  *      *       0.0.0.0/0            203.0.113.113        to:10.5.0.4\n\nChain INPUT (policy ACCEPT 0 packets, 0 bytes)\n pkts bytes target     prot opt in     out     source               destination         \n\nCh
+[RESULT] {"result":"1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN group default qlen 1000\n    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00\n    inet 127.0.0.1/8 scope host lo\n       valid_lft forever preferred_lft forever\n    inet 10.0.0.76/32 scope global lo\n       valid_lft forever preferred_lft forever\n    inet6 ::1/128 scope host proto kernel_lo \n       valid_lft fo
+[TEXT] **Confirmed root cause.** The evidence is definitive:
+
+1. **r1's NAT POSTROUTING chain is empty** — no `MASQUERADE` or `SNAT` rule exists. Outbound packets from corporate clients (10.x.x.x) leave r1's eth2 (203.0.113.2) with their **original private source IPs unmodified**.
+
+2. **ISPA is UP and receiving those packets** — ispa.eth0 shows `counter packets 5 bytes 300 drop` on the rule `ip saddr 10.0.0.0/8 drop`, proving the WAN link is live and traffic is flowing — but being discarded by ISPA's standard RFC 1918 ingress filter.
+
+3. **r1 has a valid default route** via `203.0.113.1 dev eth2` (ISPA) and full public IPs on eth2 (`203.0.113.2/30`) and eth3 (`203.0.113.6/30`) — the routing table is correct.
+
+4. **The ISP circuit is NOT down** — the circuit is fully operational; the problem is en
+[FINAL] stop=end_turn tool_calls=9
+[SUBMITTED] parsed_ok=True is_anomaly=True faulty_devices=['r1']
+[FINAL-TEXT] **Confirmed root cause.** The evidence is definitive:
+
+1. **r1's NAT POSTROUTING chain is empty** — no `MASQUERADE` or `SNAT` rule exists. Outbound packets from corporate clients (10.x.x.x) leave r1's eth2 (203.0.113.2) with their **original private source IPs unmodified**.
+
+2. **ISPA is UP and receiving those packets** — ispa.eth0 shows `counter packets 5 bytes 300 drop` on the rule `ip saddr 10.0.0.0/8 drop`, proving the WAN link is live and traffic is flowing — but being discarded by ISPA's standard RFC 1918 ingress filter.
+
+3. **r1 has a valid default route** via `203.0.113.1 dev eth2` (ISPA) and full public IPs on eth2 (`203.0.113.2/30`) and eth3 (`203.0.113.6/30`) — the routing table is correct.
+
+4. **The ISP circuit is NOT down** — the circuit is fully operational; the problem is entirely within r1's own NAT configuration.
+
+There is no ISPA fault to escalate. The outage is self-inflicted by a missing masquerade rule on r1.
+
+---
+
+=== DIAGNOSIS ===
+is_anomaly: true
+faulty_devices: r1
+diagnosis_text:
+**Affected component:** The NAT/POSTROUTING chain on r1. The `iptables` and `nftables` NAT POSTROUTING tables are both completely empty — there is no MASQUERADE or SNAT rule for outbound internet traffic.
+
+**Mechanism:** When pc1 (10.1.0.100) sends a TCP SYN to a public internet server, the packet is routed correctly through the campus fabric to r1, then forwarded out eth2 (203.0.113.2/30, the ISPA-facing link) via r1's default route (`via 203.0.113.1`). However, because no MASQUERADE rule exists, the packet's source IP is never translated — it arrives at ISPA still carrying the private source address 10.1.0.100. ISPA's standard RFC 1918 ingress filter (`iifname "eth0" ip saddr 10.0.0.0/8 … drop`) discards the packet; ISPA's own counters confirm 5 packets (300 bytes) already dropped. With no SYN-ACK ever returned, every TCP connection times out from the client's perspective. DNS works because an internal resolver handles name resolution without going to the internet.
+
+**Localization:** r1, NAT POSTROUTING chain (both iptables and nftables). All WAN interfaces (eth2, eth3) are UP with valid public IPs; the ISPA WAN circuit is fully operational. The internal OSPF routing table and all LAN paths are clean.
+
+**Root cause:** r1 is missing the outbound NAT masquerade rule that translates private RFC 1918 source addresses to r1's public IP before packets leave toward the ISP. The ISP circuit is healthy and should NOT be fault-ticketed.
+
+**Fix:** Add `iptables -t nat -A POSTROUTING -o eth2 -j MASQUERADE` (and optionally `-o eth3 -j MASQUERADE` for ISPB failover) on r1, and persist it across reboots.
+=== END ===

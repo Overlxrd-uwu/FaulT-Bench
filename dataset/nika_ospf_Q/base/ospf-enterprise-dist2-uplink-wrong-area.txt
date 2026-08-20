@@ -1,0 +1,80 @@
+==================================================
+Scenario: ospf-enterprise-dist2-uplink-wrong-area
+Topology: ospf_enterprise_static
+Fault family: OSPF area mismatch
+==================================================
+
+[PROMPT-TO-AGENT]
+Helpdesk ticket #8874: After a change window this morning, host_2_1_1_1 lost
+all connectivity beyond its gateway 10.2.1.1 -- the server farm and pod 1
+both time out. Monitoring shows switch_dist_2_1 now has NO OSPF neighbors:
+its adjacency to router_core_2 dropped and never re-formed, yet the physical
+uplink interface still shows UP on both ends. Pod 1 and the server farm are
+otherwise healthy. Find what broke the adjacency.
+
+[INJECTION]
+device: switch_dist_2_1
+action: move the core-facing uplink network into the wrong OSPF area (area 0 instead of area 1)
+cmd: |
+  vtysh -c "configure terminal" \
+        -c "router ospf" \
+        -c "no network 172.16.0.8/31 area 1" \
+        -c "network 172.16.0.8/31 area 0" \
+        -c "exit" -c "exit"
+  vtysh -c "clear ip ospf process"
+
+[POST-INJECT-CHECK]
+switch_dist_2_1  vtysh -c "show running-config" | grep -c "network 172.16.0.8/31 area 0"  => expect 1
+switch_dist_2_1  vtysh -c "show ip ospf neighbor" | grep -c Full                          => expect 0
+host_2_1_1_1     ping -W2 -c2 10.200.0.2                                                  => expect loss>0
+
+[GROUND-TRUTH]
+Affected component: switch_dist_2_1 OSPF area assignment on the uplink
+  network 172.16.0.8/31
+Mechanism: OSPF requires both ends of a link to agree on the area ID.
+  router_core_2's side of the 172.16.0.8/31 uplink is in area 1;
+  switch_dist_2_1's side was just moved to area 0. Hellos now carry
+  mismatched area IDs and are rejected in both directions, so the adjacency
+  never re-forms even though the link is physically UP. With its only
+  adjacency gone, switch_dist_2_1 learns no remote routes and pod 2
+  (10.2.1.0/24) is isolated; the rest of the network also withdraws pod 2's
+  prefix once router_core_2 stops hearing switch_dist_2_1's LSAs.
+Localization: switch_dist_2_1
+Root cause: OSPF area mismatch on the router_core_2<->switch_dist_2_1 uplink
+  (switch_dist_2_1 in area 0, router_core_2 in area 1)
+Fix: restore area 1 on switch_dist_2_1 (see [FIX]).
+
+[FIX]
+On switch_dist_2_1:
+`vtysh -c "configure terminal" -c "router ospf" -c "no network 172.16.0.8/31 area 0" -c "network 172.16.0.8/31 area 1"`
+(`service frr restart` also heals it: the change was made only to the running
+config, and /etc/frr/frr.conf still has the correct area-1 statement.)
+
+[DIAGNOSTIC-PROCESS]
+1. Scope the symptom: host_2_1_1_1 reaches its gateway but nothing beyond;
+   pod 1 and the farm are healthy -- the break is at pod 2's uplink into the
+   core.
+2. Check the adjacency: on switch_dist_2_1, `show ip ospf neighbor` is empty
+   (no Full neighbor toward router_core_2), while the uplink interface is UP
+   -- so this is a control-plane failure, not cabling.
+3. Compare both ends of the link: router_core_2 has 172.16.0.8/31 in area 1;
+   switch_dist_2_1's running config now shows `network 172.16.0.8/31 area 0`
+   -- an area-ID mismatch that makes each side drop the other's hellos.
+4. Confirm the consequence: switch_dist_2_1's table has no OSPF routes, and
+   the core routers no longer carry 10.2.1.0/24.
+5. Localize to switch_dist_2_1's area assignment: rule out a link failure
+   (UP both ends), a dead daemon (ospfd running), and host-side faults
+   (gateway reachable).
+
+[SCORING-AXES]
+assert-identifies: switch_dist_2_1
+must-identify-device: switch_dist_2_1
+must-identify-component: OSPF area assignment / area mismatch on the uplink (area 0 vs area 1)
+must-identify-mechanism: hello area-ID mismatch prevents the adjacency from re-forming while the link stays physically UP
+bonus-rules-out-physical: explicitly notes the uplink is UP on both ends, distinguishing the config fault from a cable/interface failure
+# These axes score the outcome metric only; fix and reasoning are judged separately.
+
+[NIKA-LABEL]
+nika_label: ospf_area_misconfiguration
+nika_category: MISCONFIGURATION
+in_taxonomy: true

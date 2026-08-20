@@ -1,0 +1,79 @@
+[AGENT] sade starts on lab=dc_clos_bgp
+[TEXT] ## Phase 1 — Blind Start
+[TOOL] ToolSearch({'query': 'select:mcp__kathara_base_mcp_server__get_reachability'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_base_mcp_server__get_reachability'}]
+[TOOL] mcp__kathara_base_mcp_server__get_reachability({})
+[RESULT] {"result":"{\"hosts\":{\"pc_0_0\":\"10.0.0.2\",\"pc_0_1\":\"10.0.1.2\"},\"results\":[{\"src\":\"pc_0_0\",\"dst\":\"pc_0_1\",\"dst_ip\":\"10.0.1.2\",\"tx\":null,\"rx\":null,\"loss_percent\":null,\"time_ms\":null,\"rtt_avg_ms\":null,\"rtt_min_ms\":null,\"rtt_max_ms\":null,\"rtt_mdev_ms\":null,\"status\":\"unknown\"},{\"src\":\"pc_0_1\",\"dst\":\"pc_0_0\",\"dst_ip\":\"10.0.0.2\",\"tx\":null,\"rx\":nu
+[TEXT] ## Phase 2 — Branch
+
+Both rows show `status="unknown"` with null tx/rx/loss — this must be confirmed with a direct-IP probe before promoting to a real symptom. I'll re-test using the IPs from the payload.
+[TOOL] ToolSearch({'query': 'select:mcp__kathara_base_mcp_server__exec_shell'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_base_mcp_server__exec_shell'}]
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'pc_0_0', 'command': 'ping -c3 10.0.1.2'})
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'pc_0_1', 'command': 'ping -c3 10.0.0.2'})
+[RESULT] {"result":"PING 10.0.1.2 (10.0.1.2) 56(84) bytes of data.\nFrom 10.0.0.1 icmp_seq=1 Destination Net Unreachable\nFrom 10.0.0.1 icmp_seq=2 Destination Net Unreachable\nFrom 10.0.0.1 icmp_seq=3 Destination Net Unreachable\n\n--- 10.0.1.2 ping statistics ---\n3 packets transmitted, 0 received, +3 errors, 100% packet loss, time 2174ms"}
+[RESULT] {"result":"PING 10.0.0.2 (10.0.0.2) 56(84) bytes of data.\nFrom 10.0.1.1 icmp_seq=1 Destination Net Unreachable\nFrom 10.0.1.1 icmp_seq=2 Destination Net Unreachable\nFrom 10.0.1.1 icmp_seq=3 Destination Net Unreachable\n\n--- 10.0.0.2 ping statistics ---\n3 packets transmitted, 0 received, +3 errors, 100% packet loss, time 2179ms"}
+[TEXT] **Real symptom confirmed.** Both directions return 100% loss with `Destination Net Unreachable` from the local gateway. The gateway itself is reachable (user confirmed ping to 10.0.0.1 works) but has no fabric route.
+
+## Phase 3 — Symptom-first Diagnosis
+
+**Active lead:** Both spine routers lost their BGP session to `leaf_router_0_0` simultaneously while its uplink interfaces stayed UP — this is a BGP control-plane failure that strips the spine's route to `10.0.0.0/24`, cascading to `leaf_router_0_1` losing the route as well.
+
+**Fault family → BGP**
+[TOOL] Skill({'skill': 'bgp-fault-skill'})
+[RESULT] Launching skill: bgp-fault-skill
+[TEXT] Now I'll run the BGP snapshot helper as directed by the skill.
+[TOOL] ToolSearch({'query': 'select:mcp__helper_server__run_helper'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__helper_server__run_helper'}]
+[TOOL] mcp__helper_server__run_helper({'script_name': 'bgp_snapshot'})
+[RESULT] {"result":"=== BGP SNAPSHOT ===\nLab: dc_clos_bgp\nRouters scanned: 5\nFlags:\n  - leaf_router_0_0: missing FRR process(es): watchfrr, bgpd\n  - leaf_router_0_0: zero BGP neighbors in summary\n  - spine_router_0_0: non-established BGP neighbors present: {'Established': 2, 'Active': 1}\n  - spine_router_0_1: non-established BGP neighbors present: {'Established': 2, 'Active': 1}\n\nleaf_router_0_0\n
+[TEXT] The BGP snapshot is conclusive. Let me do a single-device confirmation on `leaf_router_0_0` to lock down the faulty device.
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'leaf_router_0_0', 'command': 'pgrep -a bgpd; pgrep -a watchfrr; pgrep -a zebra'})
+[RESULT] {"result":"51 /usr/lib/frr/zebra -d -F traditional -s 90000000 --daemon -A 127.0.0.1"}
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'leaf_router_0_0', 'command': 'ip route show'})
+[RESULT] {"result":"10.0.0.0/24 dev eth2 proto kernel scope link src 10.0.0.1 \n172.16.0.4/31 dev eth0 proto kernel scope link src 172.16.0.5 \n172.16.0.8/31 dev eth1 proto kernel scope link src 172.16.0.9"}
+[TEXT] **Confirmed.** `pgrep` returns nothing for `bgpd` and `watchfrr` — only `zebra` (PID 51) is alive on `leaf_router_0_0`. The kernel routing table shows only three directly-connected routes; there are zero BGP-learned routes, including no path to `10.0.1.0/24`.
+
+## Phase 5 — Final Diagnosis
+
+All evidence chains converge on a single device and a single process:
+
+| Check | Finding |
+|---|---|
+| `bgp_snapshot` — leaf_router_0_0 FRR processes | `bgpd=no`, `watchfrr=no`, `zebra=yes` |
+| `pgrep bgpd` on leaf_router_0_0 | No output — process absent |
+| `ip route show` on leaf_router_0_0 | Only 3 connected routes; no BGP-learned prefixes |
+| spine_router_0_0 / spine_router_0_1 BGP summary | 1 `Active` neighbor each (leaf_router_0_0's sessions retrying) |
+| leaf_router_0_1, spine, super-spine | All d
+[FINAL] stop=end_turn tool_calls=10
+[SUBMITTED] parsed_ok=True is_anomaly=True faulty_devices=['leaf_router_0_0']
+[FINAL-TEXT] **Confirmed.** `pgrep` returns nothing for `bgpd` and `watchfrr` — only `zebra` (PID 51) is alive on `leaf_router_0_0`. The kernel routing table shows only three directly-connected routes; there are zero BGP-learned routes, including no path to `10.0.1.0/24`.
+
+## Phase 5 — Final Diagnosis
+
+All evidence chains converge on a single device and a single process:
+
+| Check | Finding |
+|---|---|
+| `bgp_snapshot` — leaf_router_0_0 FRR processes | `bgpd=no`, `watchfrr=no`, `zebra=yes` |
+| `pgrep bgpd` on leaf_router_0_0 | No output — process absent |
+| `ip route show` on leaf_router_0_0 | Only 3 connected routes; no BGP-learned prefixes |
+| spine_router_0_0 / spine_router_0_1 BGP summary | 1 `Active` neighbor each (leaf_router_0_0's sessions retrying) |
+| leaf_router_0_1, spine, super-spine | All daemons healthy, all sessions Established |
+
+---
+
+=== DIAGNOSIS ===
+is_anomaly: true
+faulty_devices: leaf_router_0_0
+diagnosis_text:
+**Affected component:** The FRR `bgpd` process (and its supervisor `watchfrr`) on `leaf_router_0_0` has crashed or been killed. The `zebra` daemon is still running, which keeps the two uplink interfaces (`eth0` toward spine_router_0_0 and `eth1` toward spine_router_0_1) in an UP/UP state — exactly what the NOC observed.
+
+**Mechanism:** With `bgpd` dead, `leaf_router_0_0` holds no BGP sessions and cannot advertise its directly-attached prefix `10.0.0.0/24` to either spine. Both spine routers therefore withdraw that prefix from their routing tables and mark the neighbor as `Active` (retrying). Because `leaf_router_0_1` learns `10.0.0.0/24` exclusively via the two spines, it also loses the route, causing it to return "Destination Net Unreachable" to `pc_0_1`. Simultaneously, `leaf_router_0_0`'s own routing table contains only its three connected routes — no path to `10.0.1.0/24` — so it returns "Destination Net Unreachable" to `pc_0_0`. Cross-fabric traffic fails in both directions while intra-subnet (host-to-gateway) pings remain functional.
+
+**Localization:** `leaf_router_0_0` exclusively — all other devices (`leaf_router_0_1`, `spine_router_0_0`, `spine_router_0_1`, `super_spine_router_0`) have their FRR daemons intact and their BGP sessions fully Established.
+
+**Root cause:** The `bgpd` daemon on `leaf_router_0_0` is not running (and `watchfrr` is absent to restart it), eliminating all BGP sessions from that leaf and propagating a routing black-hole across the fabric.
+
+**Fix:** Restart the FRR suite on `leaf_router_0_0` — run `service frr restart` (or `systemctl restart frr`) inside the container. This will bring `watchfrr`, `bgpd`, and related daemons back up, re-establish the two BGP sessions to the spine routers, re-advertise `10.0.0.0/24` fabric-wide, and restore full host-to-host reachability.
+=== END ===

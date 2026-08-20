@@ -1,0 +1,165 @@
+{
+  "scenario": {
+    "scenario_id": "dc-clos-leaf0-bgpd-down-misdirected",
+    "topology": "dc_clos_bgp",
+    "fault_family": "routing daemon down (misdirected ticket)",
+    "prompt_to_agent": "Helpdesk ticket #9101: A user on pc_0_0 (10.0.0.2) reports they lost reach to\npc_0_1 (10.0.1.2) across the data-center fabric. The team is convinced a spine\nis at fault -- they say \"spine_router_0_0 must have dropped its BGP sessions\"\nand want that spine restarted. Please find and confirm the real fault and tell\nus which device to restart.",
+    "injection": {
+      "device": "leaf_router_0_0",
+      "action": "kill the BGP routing daemon (and watchfrr) on leaf_router_0_0",
+      "command": "pkill -9 watchfrr; pkill -9 bgpd",
+      "note": null
+    },
+    "pre_check": [],
+    "post_inject_check": [
+      {
+        "device": "leaf_router_0_0",
+        "command": "pgrep bgpd",
+        "expect": "empty"
+      },
+      {
+        "device": "pc_0_0",
+        "command": "ping -W2 -c2 10.0.1.2",
+        "expect": "loss>0"
+      }
+    ],
+    "ground_truth": "The real fault is on leaf_router_0_0: its BGP daemon (bgpd) is dead, so this\nleaf -- the top-of-rack for pc_0_0 -- loses its fabric BGP sessions and stops\nlearning/advertising routes through the CLOS fabric. As a result pc_0_0\n(10.0.0.2) is isolated and cannot reach pc_0_1 (10.0.1.2). The ticket MISDIRECTS\nto a spine, but the spines are healthy: the CLOS fabric is redundant and the\nOTHER leaf (leaf_router_0_1) still reaches the fabric normally through both\nspines, which it could not do if spine_router_0_0 were down. The symptom is\npurely the dead bgpd on pc_0_0's own leaf, not a spine fault.\n\nThe correct diagnosis identifies leaf_router_0_0 (bgpd down) as the faulty\ndevice and explicitly EXONERATES spine_router_0_0: the spines still carry the\nfabric for the other leaf, so the user's \"spine dropped its sessions\" hypothesis\nis wrong. An agent that restarts / blames spine_router_0_0 has followed the\nticket's misdirection instead of the evidence.\n\nObservable note (lab-verified 2026-07-03): bgpd is killed together with watchfrr (its watchdog), so nothing respawns it. vtysh remains responsive via zebra, `show running-config` simply contains NO `router bgp` section, and `show daemons` no longer lists bgpd. An agent may therefore correctly describe this fault as \"the bgp configuration is missing/empty on leaf_router_0_0\" -- that is the same fault observed at the config plane, and must NOT be treated as a wrong root cause.",
+    "fix_spec": "Restart FRR/bgpd on leaf_router_0_0 (`service frr restart`). Once bgpd comes\nback and re-establishes its BGP sessions with the spines, leaf_router_0_0\nrelearns and re-advertises the host prefixes and pc_0_0 reaches pc_0_1 again.\nspine_router_0_0 needs no change.",
+    "scoring_axes": [
+      "assert-identifies: leaf_router_0_0",
+      "assert-not-identifies: spine_router_0_0",
+      "must-identify-bgpd-down: identifies bgpd on leaf_router_0_0 (pc_0_0's ToR leaf) is down, not a spine fault",
+      "bonus-exonerates-spine: explicitly notes the spines still carry the fabric for the other leaf, rejecting the ticket's spine hypothesis"
+    ],
+    "source_path": "dataset/nika_clos_Q/cex/dc-clos-leaf0-bgpd-down-misdirected.txt",
+    "scenario_class": "wrong-device"
+  },
+  "agent": "cc-baseline",
+  "timestamp": "2026-07-05T14:22:43.018772+00:00",
+  "phases": {
+    "lstart": {
+      "ok": true,
+      "containers": 7,
+      "expected": 7
+    },
+    "settle": {
+      "converge_wait": 90
+    },
+    "injection": {
+      "applied": true,
+      "skipped_reason": null,
+      "rc": 0,
+      "output": ""
+    },
+    "post_inject_check": {
+      "results": [
+        {
+          "line": {
+            "device": "leaf_router_0_0",
+            "command": "pgrep bgpd",
+            "expect": "empty"
+          },
+          "passed": true,
+          "actual": "",
+          "rationale": "output empty"
+        },
+        {
+          "line": {
+            "device": "pc_0_0",
+            "command": "ping -W2 -c2 10.0.1.2",
+            "expect": "loss>0"
+          },
+          "passed": true,
+          "actual": "PING 10.0.1.2 (10.0.1.2) 56(84) bytes of data.\nFrom 10.0.0.1 icmp_seq=1 Destination Net Unreachable\nFrom 10.0.0.1 icmp_seq=2 Destination Net Unreachable\n\n--- 10.0.1.2 ping statistics ---\n2 packets transmitted, 0 received, +2 errors, 100% packet loss, time 1022ms",
+          "rationale": "loss=100%"
+        }
+      ],
+      "wait_seconds": 0
+    },
+    "agent": {
+      "diagnosis_text": "The bgpd process on leaf_router_0_0 has crashed and is no longer running. Only\nzebra (PID 51) is alive on that device; bgpd left a stale PID file (PID 58)\nbehind, and watchfrr is also absent, so the daemon has not been automatically\nrestarted.\n\nBecause bgpd is dead, leaf_router_0_0 cannot maintain any BGP sessions.\nBoth spine_router_0_0 and spine_router_0_1 report their peer toward\nleaf_router_0_0 (AS 65200, addresses 172.16.0.5 and 172.16.0.9 respectively)\npermanently stuck in the Active state \u2014 they are repeatedly attempting TCP\nconnection but get no response. As a result, neither spine has learned the\n10.0.0.0/24 prefix that leaf_router_0_0 should be advertising, so the fabric\nhas no return path to pc_0_0. Symmetrically, leaf_router_0_0's own RIB\ncontains only directly connected prefixes and carries no route to 10.0.1.0/24,\nso outbound traffic from pc_0_0 toward pc_0_1 is dropped at the first hop.\nBoth spines, super_spine_router_0, and leaf_router_0_1 are fully healthy and\nare not involved in the fault.\n\nThe team's assertion that spine_router_0_0 dropped its BGP sessions is\nincorrect; spine_router_0_0's sessions to super_spine and leaf_router_0_1 are\nfully Established.\n\nRoot cause: bgpd crashed on leaf_router_0_0, severing all its BGP adjacencies\nand removing 10.0.0.0/24 from the fabric's RIB.\n\nCorrective fix: Restart FRR (specifically bgpd) on leaf_router_0_0, e.g. via\n`service frr restart` inside the container. Once bgpd comes up, it will\nre-establish sessions to both spines, re-advertise 10.0.0.0/24, learn\n10.0.1.0/24 in return, and end-to-end connectivity between pc_0_0 and pc_0_1\nwill be restored within seconds.",
+      "is_anomaly": true,
+      "faulty_devices": [
+        "leaf_router_0_0"
+      ],
+      "parsed_ok": true,
+      "in_tokens": 14,
+      "cache_read_tokens": 103645,
+      "cache_write_tokens": 15495,
+      "out_tokens": 5350,
+      "cost_usd": 0.17042975,
+      "tool_calls": 15,
+      "hit_max_turns": false,
+      "error": null
+    },
+    "score": {
+      "must_passed": 3,
+      "must_total": 3,
+      "bonus_passed": 1,
+      "bonus_total": 1,
+      "outcome_score": 1.0,
+      "fix_score": 1.0,
+      "reasoning_score": 0.9333333333333332,
+      "reasoning_dims": {
+        "grounding": 0.9,
+        "causality": 1.0,
+        "coverage": 0.9
+      },
+      "final_score": 1.0,
+      "per_axis": [
+        {
+          "axis": "assert-identifies: leaf_router_0_0",
+          "kind": "assert",
+          "score": 1.0,
+          "rationale": "culprit 'leaf_router_0_0' named (good)"
+        },
+        {
+          "axis": "assert-not-identifies: spine_router_0_0",
+          "kind": "assert",
+          "score": 1.0,
+          "rationale": "decoy 'spine_router_0_0' absent (good)"
+        },
+        {
+          "axis": "must-identify-bgpd-down: identifies bgpd on leaf_router_0_0 (pc_0_0's ToR leaf) is down, not a spine fault",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The diagnosis explicitly states bgpd on leaf_router_0_0 has crashed/is not running and clears the spines of fault, matching the required identification."
+        },
+        {
+          "axis": "bonus-exonerates-spine: explicitly notes the spines still carry the fabric for the other leaf, rejecting the ticket's spine hypothesis",
+          "kind": "bonus",
+          "score": 1.0,
+          "rationale": "The report explicitly states both spines and the super_spine are healthy, that spine_router_0_0's other sessions are Established, and rejects the ticket's spine-fault hypothesis."
+        },
+        {
+          "axis": "[FIX]",
+          "kind": "fix",
+          "score": 1.0,
+          "rationale": "The writeup explicitly recommends restarting FRR/bgpd on leaf_router_0_0 (e.g., service frr restart), which matches the expected corrective fix."
+        },
+        {
+          "axis": "reason:grounding",
+          "kind": "reason-dim",
+          "score": 0.9,
+          "rationale": "The agent's log contains direct observations (bgpd not running, bgpd.pid present, only zebra process active, spines' BGP peers stuck in Active, other leaf's BGP established) that support the conclusion that bgpd crashed on leaf_router_0_0 and that spines are not the root cause. The inferences follow logically and the investigation covers the essential checks to justify restarting bgpd as the fix."
+        },
+        {
+          "axis": "reason:causality",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "The agent's log contains direct observations (bgpd not running, bgpd.pid present, only zebra process active, spines' BGP peers stuck in Active, other leaf's BGP established) that support the conclusion that bgpd crashed on leaf_router_0_0 and that spines are not the root cause. The inferences follow logically and the investigation covers the essential checks to justify restarting bgpd as the fix."
+        },
+        {
+          "axis": "reason:coverage",
+          "kind": "reason-dim",
+          "score": 0.9,
+          "rationale": "The agent's log contains direct observations (bgpd not running, bgpd.pid present, only zebra process active, spines' BGP peers stuck in Active, other leaf's BGP established) that support the conclusion that bgpd crashed on leaf_router_0_0 and that spines are not the root cause. The inferences follow logically and the investigation covers the essential checks to justify restarting bgpd as the fix."
+        }
+      ],
+      "judge_model": "gpt-5-mini",
+      "reasoning_mode": "trace",
+      "error": null
+    }
+  },
+  "agent_input_prompt": "# Topology overview (devices + L2 connectivity)\nTopology: dc_clos_bgp\n\nDevices:\n  Routers (FRR): leaf_router_0_0, leaf_router_0_1, spine_router_0_0, spine_router_0_1, super_spine_router_0\n  Hosts: pc_0_0, pc_0_1\n\nLinks (device:iface <-> device:iface):\n  leaf_router_0_0:eth2 <-> pc_0_0:eth0\n  leaf_router_0_1:eth2 <-> pc_0_1:eth0\n  spine_router_0_0:eth1 <-> leaf_router_0_0:eth0\n  spine_router_0_0:eth2 <-> leaf_router_0_1:eth0\n  spine_router_0_1:eth1 <-> leaf_router_0_0:eth1\n  spine_router_0_1:eth2 <-> leaf_router_0_1:eth1\n  super_spine_router_0:eth0 <-> spine_router_0_0:eth0\n  super_spine_router_0:eth1 <-> spine_router_0_1:eth0\n\n# Symptom (user report)\nHelpdesk ticket #9101: A user on pc_0_0 (10.0.0.2) reports they lost reach to\npc_0_1 (10.0.1.2) across the data-center fabric. The team is convinced a spine\nis at fault -- they say \"spine_router_0_0 must have dropped its BGP sessions\"\nand want that spine restarted. Please find and confirm the real fault and tell\nus which device to restart."
+}

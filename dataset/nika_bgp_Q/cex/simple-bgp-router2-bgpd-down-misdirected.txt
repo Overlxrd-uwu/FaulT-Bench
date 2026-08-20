@@ -1,0 +1,66 @@
+==================================================
+Scenario: simple-bgp-router2-bgpd-down-misdirected
+Topology: simple_bgp
+Fault family: routing daemon down (misdirected ticket)
+==================================================
+
+[PROMPT-TO-AGENT]
+Helpdesk ticket #9104: A user on pc1 (195.11.14.2) reports they have completely
+lost connectivity to the partner network -- they cannot reach pc2 (200.1.1.2) in
+the peer AS since this morning. The team is convinced their own edge router,
+router1, has fallen over and want router1 restarted. Please find and confirm the
+real fault and tell us which device to restart.
+
+[INJECTION]
+device: router2
+action: kill the BGP routing daemon (and its watchdog) on router2
+cmd: pkill -9 watchfrr; pkill -9 bgpd
+
+[POST-INJECT-CHECK]
+router2   pgrep bgpd                         => expect empty
+pc1       ping -W2 -c2 200.1.1.2             => expect loss>0
+router2   ip -br link show eth0 | grep -c UP => expect 1
+
+[GROUND-TRUTH]
+The real fault is on router2: its BGP routing daemon (bgpd) has been killed, so
+the eBGP session between router1 and router2 drops and the inter-AS prefixes are
+no longer exchanged. With no route to the peer AS, pc1 (195.11.14.2) cannot reach
+pc2 (200.1.1.2). The ticket MISDIRECTS to router1 (the user's own edge router),
+but the fault is on the PEER side: router2 is the eBGP speaker whose daemon is
+dead. router1 is healthy -- its bgpd is still running and its inter-AS interface
+is up; it simply has no session because router2 stopped speaking BGP.
+
+The correct diagnosis identifies router2 (bgpd down) as the faulty device and
+explicitly EXONERATES router1: router1's BGP daemon and interfaces are fine, so
+the user's "router1 has fallen over" hypothesis is wrong. An agent that restarts
+/ blames router1 has followed the ticket's misdirection instead of the evidence.
+
+Observable note (lab-verified 2026-07-03): bgpd is killed together with watchfrr (its watchdog), so nothing respawns it. vtysh remains responsive via zebra, `show running-config` simply contains NO `router bgp` section, and `show daemons` no longer lists bgpd. An agent may therefore correctly describe this fault as "the bgp configuration is missing/empty on router2" -- that is the same fault observed at the config plane, and must NOT be treated as a wrong root cause.
+
+[FIX]
+Restart FRR/bgpd on router2 (`service frr restart`). Once bgpd is running again,
+the eBGP session to router1 re-establishes, router2 re-learns and re-advertises
+the inter-AS prefixes, and pc1 reaches pc2 normally. router1 needs no change.
+
+[DIAGNOSTIC-PROCESS]
+1. Reproduce on the real path: from pc1, ping pc2 (200.1.1.2) -- it fails (no
+   route to the peer AS).
+2. Check the eBGP session from both ends: on router2 the session to router1 is
+   down and bgpd is not running (pgrep bgpd is empty); router1's bgpd is up but
+   reports the peer (router2) as down.
+3. Localize to the PEER speaker: the dead daemon on router2 fully explains the
+   withdrawn inter-AS routes and the loss of reachability.
+4. Localize to router2 (bgpd down), not router1: exonerate router1, whose daemon
+   and inter-AS interface are healthy.
+
+[SCORING-AXES]
+assert-identifies: router2
+assert-not-identifies: router1
+must-identify-bgpd-down: identifies bgpd on router2 is down (the peer eBGP speaker), not a fault on router1
+bonus-exonerates-router1: notes router1's bgpd is up and its inter-AS interface is healthy, rejecting the ticket's "router1 fell over" hypothesis
+
+[NIKA-LABEL]
+nika_label: frr_service_down
+nika_category: NETWORK_NODE_ERROR
+in_taxonomy: true
+note: NIKA-substrate misdirected counter-example (clean simple_bgp topology; real bgpd-down fault on router2; ticket blames router1)

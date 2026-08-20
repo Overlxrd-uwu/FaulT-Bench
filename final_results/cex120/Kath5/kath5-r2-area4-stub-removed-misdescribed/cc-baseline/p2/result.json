@@ -1,0 +1,159 @@
+{
+  "scenario": {
+    "scenario_id": "kath5-r2-area4-stub-removed-misdescribed",
+    "topology": "Kath5",
+    "fault_family": "OSPF area stub config removed (misdescribed cause)",
+    "prompt_to_agent": "Ticket #9078: After a config change on R2, R10 (which is in area 4) dropped its\nOSPF adjacency to R2 and lost every route beyond area 4 -- hosts behind R10 can\nno longer reach the backbone. The team believes R2's ospfd crashed with corrupt\nstate and that the daemon needs to be killed and restarted to bring the\nadjacency back. Please confirm the R2 ospfd crash and restart it.",
+    "injection": {
+      "device": "r2",
+      "action": "remove `area 4 stub` from OSPF config",
+      "command": "vtysh -c \"configure terminal\" \\\n        -c \"router ospf\" \\\n        -c \"no area 4 stub\" \\\n        -c \"exit\" -c \"exit\"",
+      "note": null
+    },
+    "pre_check": [],
+    "post_inject_check": [
+      {
+        "device": "r2",
+        "command": "vtysh -c \"show running-config\" | grep -c \"area 4 stub\"",
+        "expect": "0"
+      },
+      {
+        "device": "r10",
+        "command": "vtysh -c \"show ip ospf neighbor\" | grep -c Full",
+        "expect": "0"
+      }
+    ],
+    "ground_truth": "The root cause is IDENTICAL to kath5-r2-area4-stub-removed: `area 4 stub` was\nremoved from R2's OSPF process. Area 4 was originally a stub on BOTH R2 (the ABR)\nand R10 (internal). Stub areas block external (E1/E2) routes from flooding in --\ninternal routers use a default route instead, keeping RIB size and SPF cost low.\nWith `area 4 stub` dropped on R2 while R10 keeps it, the Hello stub-flag (E-bit)\nMISMATCHES: R10 rejects R2's Hellos and the r2<->r10 adjacency drops after the\ndead interval (~40 s). R2 is R10's only OSPF neighbor, so area 4 is isolated --\nR10's OSPF RIB collapses to intra-area entries (lab-verified 2026-07-12:\n61 -> 13 route lines, empty neighbor table, zero external LSAs) -- exactly the\nreported adjacency loss and route collapse.\n\nThe TWIST: the ticket asserts the wrong CAUSE -- a crashed ospfd on R2. The daemon\nis actually RUNNING and healthy: `pgrep ospfd` on R2 is non-empty, its uptime shows\nno recent restart, and its OTHER adjacencies (areas 0/1/2/3) are still Full -- only\nthe area-4 adjacency to R10 is down, and it fails for a CONFIG reason (the\nstub-flag mismatch), not a process reason. Killing and restarting the daemon would\nNOT help -- the running-config no longer contains `area 4 stub`, so a restart\nreloads the same mismatched config and the adjacency stays down. The symptom\n(adjacency loss, route collapse) is real, but the narrated cause (a daemon crash)\nis a red herring -- a specific configuration line was removed, the process did not\ncrash.\n\nCorrect diagnosis: is_anomaly=true, faulty_devices = r2 (missing `area 4 stub`).\nThe agent must verify ospfd is alive on R2, then inspect the OSPF config to find\n`area 4 stub` missing, and explicitly reject the \"ospfd crashed\" narrative. A\ndecisive tell: ospfd is up, R2's other adjacencies are Full, and ONLY the area-4\nadjacency is down with a Hello/stub mismatch -- a config change, not a process\ncrash; a restart would not restore the stub. An\nagent that \"confirms the ospfd crash and restarts it\" has followed the ticket's\nframing instead of the evidence. Fix: re-add `area 4 stub` to R2's OSPF block.",
+    "fix_spec": "`vtysh -c \"router ospf\" -c \"area 4 stub\"` on r2",
+    "scoring_axes": [
+      "assert-identifies: r2",
+      "must-identify-stub-config: OSPF area 4 stub flag",
+      "bonus-rules-out-ospfd-down: rules out the ticket's ospfd-crash story by any valid evidence (daemon alive via pgrep/uptime, R2's non-area-4 adjacencies still Full, or explicitly stating a restart cannot restore a removed config line)"
+    ],
+    "source_path": "dataset/kath5_Q/cex/kath5-r2-area4-stub-removed-misdescribed.txt",
+    "scenario_class": "wrong-cause",
+    "ticket_style": "standard"
+  },
+  "agent": "cc-baseline",
+  "timestamp": "2026-07-30T17:10:08.864099+00:00",
+  "phases": {
+    "lstart": {
+      "ok": true,
+      "containers": 15,
+      "expected": 15
+    },
+    "settle": {
+      "converge_wait": 90
+    },
+    "injection": {
+      "applied": true,
+      "skipped_reason": null,
+      "rc": 0,
+      "output": ""
+    },
+    "post_inject_check": {
+      "results": [
+        {
+          "line": {
+            "device": "r2",
+            "command": "vtysh -c \"show running-config\" | grep -c \"area 4 stub\"",
+            "expect": "0"
+          },
+          "passed": true,
+          "actual": "0",
+          "rationale": "got 0, expected 0"
+        },
+        {
+          "line": {
+            "device": "r10",
+            "command": "vtysh -c \"show ip ospf neighbor\" | grep -c Full",
+            "expect": "0"
+          },
+          "passed": true,
+          "actual": "0",
+          "rationale": "got 0, expected 0"
+        }
+      ],
+      "wait_seconds": 40
+    },
+    "agent": {
+      "diagnosis_text": "**Affected component:** OSPF area-type configuration on R2's ospfd, specifically the missing `area 4 stub` statement for Area 0.0.0.4.\n\n**Mechanism:** OSPF RFC 2328 encodes whether an area is a stub using the E-bit in Hello packets. When a router is configured with `area X stub`, it sets E-bit=0 in its Hellos; a normal (non-stub) area router sets E-bit=1. RFC 2328 \u00a710.5 mandates that routers with mismatched E-bits MUST silently discard each other's Hellos \u2014 adjacency formation is completely blocked. No adjacency means R10 receives zero inter-area Summary-LSAs from R2, leaving its routing table with only directly connected routes and no path to the backbone.\n\n**Localization:** R10 (eth0, 21.1.1.2/8) has `area 4 stub` in its running config and sends E-bit=0. R2 (eth2, 21.1.1.1/8) has **no** `area 4 stub` statement \u2014 it treats Area 4 as a normal area and sends E-bit=1. The mismatch is confirmed by `show ip ospf interface` (R10 shows `Area 0.0.0.4 [Stub]`, R2 does not) and `show running-config` on both devices.\n\n**Root cause:** R2's OSPF configuration is missing `area 4 stub`, creating an E-bit mismatch with R10 that permanently prevents the R2\u2013R10 adjacency from forming.\n\n**R2's ospfd process is fully healthy** (verified via `ps aux`); killing and restarting it would accomplish nothing.\n\n**Corrective fix:** On R2, enter vtysh and add:\n```\nconfigure terminal\nrouter ospf\n area 4 stub\nend\nwrite memory\n```\nThis aligns R2's E-bit with R10's, allowing Hellos to be accepted and the Full adjacency to re-establish within one dead interval (~40 s), after which R10 will receive inter-area Summary-LSAs and restore its routes to the backbone.",
+      "is_anomaly": true,
+      "faulty_devices": [
+        "r2"
+      ],
+      "parsed_ok": true,
+      "in_tokens": 11,
+      "cache_read_tokens": 93186,
+      "cache_write_tokens": 17413,
+      "out_tokens": 3694,
+      "cost_usd": 0.15002854999999998,
+      "tool_calls": 12,
+      "hit_max_turns": false,
+      "error": null
+    },
+    "score": {
+      "must_passed": 2,
+      "must_total": 2,
+      "bonus_passed": 1,
+      "bonus_total": 1,
+      "outcome_score": 1.0,
+      "fix_score": 1.0,
+      "reasoning_score": 0.8666666666666667,
+      "reasoning_dims": {
+        "grounding": 0.8,
+        "causality": 0.9,
+        "coverage": 0.9
+      },
+      "final_score": 1.0,
+      "per_axis": [
+        {
+          "axis": "assert-identifies: r2",
+          "kind": "assert",
+          "score": 1.0,
+          "rationale": "culprit 'r2' named (good)"
+        },
+        {
+          "axis": "must-identify-stub-config: OSPF area 4 stub flag",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The agent explicitly identifies that R2 is missing the `area 4 stub` statement, explains the E-bit (stub flag) mismatch with R10, and recommends re-adding `area 4 stub` on R2."
+        },
+        {
+          "axis": "bonus-rules-out-ospfd-down: rules out the ticket's ospfd-crash story by any valid evidence (daemon alive via pgrep/uptime, R2's non-area-4 adjacencies still Full, or explicitly stating a restart cannot restore a removed config line)",
+          "kind": "bonus",
+          "score": 1.0,
+          "rationale": "Agent explicitly verified R2's ospfd process is running via ps aux and stated that restarting would not help because the `area 4 stub` config is missing, thereby ruling out the daemon-crash story."
+        },
+        {
+          "axis": "[FIX]",
+          "kind": "fix",
+          "score": 1.0,
+          "rationale": "It instructs adding 'area 4 stub' under router ospf on R2 via vtysh (and saving), which matches the expected fix and will restore the adjacency."
+        },
+        {
+          "axis": "reason:grounding",
+          "kind": "reason-dim",
+          "score": 0.8,
+          "rationale": "The agent ran the right commands and captured key observations: ospfd is running on R2 (ps output), R10 has no OSPF neighbors (empty neighbor table), and interface/config outputs show an area-type mismatch (one side [Stub], the other not). The inference that a missing `area 4 stub` on R2 (config mismatch/E-bit mismatch) \u2014 not a crashed daemon \u2014 explains the lone adjacency loss and route collapse follows logically and the proposed fix addresses it."
+        },
+        {
+          "axis": "reason:causality",
+          "kind": "reason-dim",
+          "score": 0.9,
+          "rationale": "The agent ran the right commands and captured key observations: ospfd is running on R2 (ps output), R10 has no OSPF neighbors (empty neighbor table), and interface/config outputs show an area-type mismatch (one side [Stub], the other not). The inference that a missing `area 4 stub` on R2 (config mismatch/E-bit mismatch) \u2014 not a crashed daemon \u2014 explains the lone adjacency loss and route collapse follows logically and the proposed fix addresses it."
+        },
+        {
+          "axis": "reason:coverage",
+          "kind": "reason-dim",
+          "score": 0.9,
+          "rationale": "The agent ran the right commands and captured key observations: ospfd is running on R2 (ps output), R10 has no OSPF neighbors (empty neighbor table), and interface/config outputs show an area-type mismatch (one side [Stub], the other not). The inference that a missing `area 4 stub` on R2 (config mismatch/E-bit mismatch) \u2014 not a crashed daemon \u2014 explains the lone adjacency loss and route collapse follows logically and the proposed fix addresses it."
+        }
+      ],
+      "judge_model": "gpt-5-mini",
+      "reasoning_mode": "trace",
+      "error": null
+    }
+  },
+  "agent_input_prompt": "# Topology overview (devices + L2 connectivity)\nTopology: Kath5\n\nDevices:\n  pc0: eth0='E'\n  pc12: eth0=GG\n  r1: eth0=A, eth1=B, eth2=C, eth3=D, eth4=E, eth5=F\n  r10: eth0=I, eth1=DD\n  r11: eth0=EE, eth1=B, eth2=FF\n  r12: eth0=EE, eth1=GG\n  r13: eth0=FF\n  r2: eth0=A, eth1=H, eth2=I\n  r3: eth0=J, eth1=H, eth2=C, eth3=M, eth4=N, eth5=O, eth6=P\n  r4: eth0=M, eth1=R, eth2=S, eth3=T\n  r5: eth0=R, eth1=V, eth2=W, eth3=X\n  r6: eth0=S, eth1=V, eth2=Y, eth3=Z\n  r7: eth0=Y, eth1=AA\n  r8: eth0=W, eth1=BB\n  r9: eth0=J, eth1=CC\n\nCollision domains (shared L2 segments):\n  'E': pc0.eth0\n  A: r1.eth0, r2.eth0\n  AA: r7.eth1\n  B: r1.eth1, r11.eth1\n  BB: r8.eth1\n  C: r1.eth2, r3.eth2\n  CC: r9.eth1\n  D: r1.eth3\n  DD: r10.eth1\n  E: r1.eth4\n  EE: r11.eth0, r12.eth0\n  F: r1.eth5\n  FF: r11.eth2, r13.eth0\n  GG: pc12.eth0, r12.eth1\n  H: r2.eth1, r3.eth1\n  I: r10.eth0, r2.eth2\n  J: r3.eth0, r9.eth0\n  M: r3.eth3, r4.eth0\n  N: r3.eth4\n  O: r3.eth5\n  P: r3.eth6\n  R: r4.eth1, r5.eth0\n  S: r4.eth2, r6.eth0\n  T: r4.eth3\n  V: r5.eth1, r6.eth1\n  W: r5.eth2, r8.eth0\n  X: r5.eth3\n  Y: r6.eth2, r7.eth0\n  Z: r6.eth3\n\n# Symptom (user report)\nTicket #9078: After a config change on R2, R10 (which is in area 4) dropped its\nOSPF adjacency to R2 and lost every route beyond area 4 -- hosts behind R10 can\nno longer reach the backbone. The team believes R2's ospfd crashed with corrupt\nstate and that the daemon needs to be killed and restarted to bring the\nadjacency back. Please confirm the R2 ospfd crash and restart it."
+}

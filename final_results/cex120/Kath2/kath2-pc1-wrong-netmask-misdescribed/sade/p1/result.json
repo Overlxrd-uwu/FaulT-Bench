@@ -1,0 +1,158 @@
+{
+  "scenario": {
+    "scenario_id": "kath2-pc1-wrong-netmask-misdescribed",
+    "topology": "Kath2",
+    "fault_family": "host misconfig (misdescribed cause)",
+    "prompt_to_agent": "Ticket #4560: pc1 in the Server Room (1.0.0.5) cannot reach its gateway 1.0.0.1\nor anything beyond it. pc1 was fine until a maintenance task last night. The\nteam believes the Server Room gateway router2 was misconfigured during the\nmaintenance and is now rejecting pc1's traffic. Please confirm the router2\ngateway misconfiguration and identify what changed on router2.",
+    "injection": {
+      "device": "pc1",
+      "action": "replace /8 mask with /30 (too narrow \u2014 gateway 1.0.0.1 falls",
+      "command": "ip addr flush dev eth0\n  ip addr add 1.0.0.5/30 dev eth0\n  ip route add default via 1.0.0.1 2>/dev/null || true",
+      "note": null
+    },
+    "pre_check": [],
+    "post_inject_check": [
+      {
+        "device": "pc1",
+        "command": "ip -4 -br addr show eth0 | grep -c \"1.0.0.5/30\"",
+        "expect": "1"
+      },
+      {
+        "device": "pc1",
+        "command": "ping -c 2 -W 2 1.0.0.1 >/dev/null 2>&1; echo $?",
+        "expect": "2"
+      }
+    ],
+    "ground_truth": "The root cause is IDENTICAL to kath2-pc1-wrong-netmask: pc1's own interface\nnetmask is wrong. The Server Room subnet is 1.0.0.0/8 (router2's eth0 is\n1.0.0.1/8), but pc1 was reconfigured with 1.0.0.5/30. The /30 puts pc1 in\n1.0.0.4/30 (hosts .5-.6 only), which does NOT contain the gateway 1.0.0.1:\nthe kernel rejects `default via 1.0.0.1` (nexthop unreachable), pc1 has no\nroute beyond 1.0.0.4/30, and it cannot even ARP the gateway. The fault lives\nentirely in pc1's host configuration.\n\nThe TWIST: the ticket asserts the wrong CAUSE -- a misconfigured gateway\nrouter2. router2 is FINE -- its eth0 still carries the correct 1.0.0.1/8, ripd\nis running, it advertises 1.0.0.0/8 normally, and it has no per-host filter\nagainst pc1. Nothing changed on router2; the change was made on pc1's own\ninterface. The symptom (pc1 isolated) is real, but the narrated cause points at\nthe gateway when the misconfiguration is host-side. Because pc1 is the only\ndevice that lost connectivity while everything else in the topology is healthy,\nthe evidence localises to pc1, not to a shared gateway.\n\nCorrect diagnosis: is_anomaly=true, faulty_devices = pc1 (interface netmask set\nto /30 instead of /8). The agent must inspect pc1's addressing, compare it\nagainst the /8 subnet, confirm router2's interface is correct, and explicitly\nreject the \"gateway router2 misconfigured\" narrative. An agent that \"confirms\nthe router2 misconfiguration\" has followed the ticket's framing instead of the\nevidence. Fix: restore pc1's address and default route --\n`ip addr flush dev eth0 && ip addr add 1.0.0.5/8 dev eth0 && ip route add\ndefault via 1.0.0.1`.",
+    "fix_spec": "restore pc1's mask and default route \u2014 `ip addr flush dev eth0 && ip addr add 1.0.0.5/8 dev eth0 && ip route add default via 1.0.0.1`",
+    "scoring_axes": [
+      "assert-identifies: pc1",
+      "must-identify-host-netmask: pc1's own interface netmask set to /30 instead of /8 (host-side misconfig; gateway outside the /30 so no default route)",
+      "bonus-rules-out-gateway: notes router2's eth0 still has the correct 1.0.0.1/8 and is healthy, ruling out a gateway misconfiguration"
+    ],
+    "source_path": "dataset/kath2_Q/cex/kath2-pc1-wrong-netmask-misdescribed.txt",
+    "scenario_class": "wrong-cause"
+  },
+  "agent": "sade",
+  "timestamp": "2026-07-12T11:37:24.089715+00:00",
+  "phases": {
+    "lstart": {
+      "ok": true,
+      "containers": 30,
+      "expected": 30
+    },
+    "settle": {
+      "converge_wait": 90
+    },
+    "injection": {
+      "applied": true,
+      "skipped_reason": null,
+      "rc": 0,
+      "output": ""
+    },
+    "post_inject_check": {
+      "results": [
+        {
+          "line": {
+            "device": "pc1",
+            "command": "ip -4 -br addr show eth0 | grep -c \"1.0.0.5/30\"",
+            "expect": "1"
+          },
+          "passed": true,
+          "actual": "1",
+          "rationale": "got 1, expected 1"
+        },
+        {
+          "line": {
+            "device": "pc1",
+            "command": "ping -c 2 -W 2 1.0.0.1 >/dev/null 2>&1; echo $?",
+            "expect": "2"
+          },
+          "passed": true,
+          "actual": "2",
+          "rationale": "got 2, expected 2"
+        }
+      ],
+      "wait_seconds": 0
+    },
+    "agent": {
+      "diagnosis_text": "**Affected component:** pc1's eth0 interface addressing \u2014 the subnet mask and default gateway route.\n\n**Mechanism:** pc1's startup script (`/hostlab/pc1.startup`) specifies the intended configuration as `ip addr add 1.0.0.5/8 dev eth0` with `ip route add default via 1.0.0.1`. However, the live running state shows `1.0.0.5/30` on eth0 and no default gateway route whatsoever. With a `/30` mask, the kernel installs only the connected route `1.0.0.4/30` (covering addresses 1.0.0.4\u20131.0.0.7). The stated gateway `1.0.0.1` falls entirely outside that range, so any attempt by pc1 to contact 1.0.0.1 \u2014 or any off-subnet destination \u2014 immediately returns `Network is unreachable` at the kernel routing layer, before a single packet is sent.\n\n**Localization:** The misconfiguration is entirely on **pc1** (eth0). Router2's eth0 is correctly configured as `1.0.0.1/8` and matches its startup script; it is not the source of the fault. The team's attribution to router2 is incorrect.\n\n**Root cause:** During last night's maintenance, pc1's eth0 address was manually changed from the intended `1.0.0.5/8` to `1.0.0.5/30`, and the default gateway route `via 1.0.0.1` was removed. This made the gateway address unreachable from pc1's kernel routing perspective.\n\n**Fix:** On pc1, restore the correct addressing: `ip addr del 1.0.0.5/30 dev eth0`, `ip addr add 1.0.0.5/8 dev eth0`, `ip route add default via 1.0.0.1`. Persistent fix requires updating the startup script to match the intended `/8` mask and default route.",
+      "is_anomaly": true,
+      "faulty_devices": [
+        "pc1"
+      ],
+      "parsed_ok": true,
+      "in_tokens": 27,
+      "cache_read_tokens": 312874,
+      "cache_write_tokens": 33711,
+      "out_tokens": 18231,
+      "cost_usd": 0.49538345000000006,
+      "tool_calls": 22,
+      "hit_max_turns": false,
+      "error": null
+    },
+    "score": {
+      "must_passed": 2,
+      "must_total": 2,
+      "bonus_passed": 1,
+      "bonus_total": 1,
+      "outcome_score": 1.0,
+      "fix_score": 1.0,
+      "reasoning_score": 0.9666666666666667,
+      "reasoning_dims": {
+        "grounding": 0.9,
+        "causality": 1.0,
+        "coverage": 1.0
+      },
+      "final_score": 1.0,
+      "per_axis": [
+        {
+          "axis": "assert-identifies: pc1",
+          "kind": "assert",
+          "score": 1.0,
+          "rationale": "culprit 'pc1' named (good)"
+        },
+        {
+          "axis": "must-identify-host-netmask: pc1's own interface netmask set to /30 instead of /8 (host-side misconfig; gateway outside the /30 so no default route)",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The agent explicitly identifies pc1's eth0 as 1.0.0.5/30 (should be /8), explains that the gateway 1.0.0.1 is outside the /30 so no default route is installed, and attributes the fault to the host configuration."
+        },
+        {
+          "axis": "bonus-rules-out-gateway: notes router2's eth0 still has the correct 1.0.0.1/8 and is healthy, ruling out a gateway misconfiguration",
+          "kind": "bonus",
+          "score": 1.0,
+          "rationale": "The report explicitly states router2's eth0 is correctly configured as 1.0.0.1/8 and not the source of the fault, thereby ruling out a gateway misconfiguration."
+        },
+        {
+          "axis": "[FIX]",
+          "kind": "fix",
+          "score": 1.0,
+          "rationale": "The proposed commands restore the correct /8 address and add the default route (and update the startup script), which matches the expected fix."
+        },
+        {
+          "axis": "reason:grounding",
+          "kind": "reason-dim",
+          "score": 0.9,
+          "rationale": "The investigation log contains direct observations that pc1 cannot reach the gateway (ping: Network is unreachable), infra_sweep shows pc1 lacks a default route, pc1's startup file intends /8 while router2's startup and live config show 1.0.0.1/8 \u2014 and the agent captured pc1's live addressing as /30. These pieces together solidly ground the conclusion that pc1's netmask (and missing default route) is the fault, not router2."
+        },
+        {
+          "axis": "reason:causality",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "The investigation log contains direct observations that pc1 cannot reach the gateway (ping: Network is unreachable), infra_sweep shows pc1 lacks a default route, pc1's startup file intends /8 while router2's startup and live config show 1.0.0.1/8 \u2014 and the agent captured pc1's live addressing as /30. These pieces together solidly ground the conclusion that pc1's netmask (and missing default route) is the fault, not router2."
+        },
+        {
+          "axis": "reason:coverage",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "The investigation log contains direct observations that pc1 cannot reach the gateway (ping: Network is unreachable), infra_sweep shows pc1 lacks a default route, pc1's startup file intends /8 while router2's startup and live config show 1.0.0.1/8 \u2014 and the agent captured pc1's live addressing as /30. These pieces together solidly ground the conclusion that pc1's netmask (and missing default route) is the fault, not router2."
+        }
+      ],
+      "judge_model": "gpt-5-mini",
+      "reasoning_mode": "trace",
+      "error": null
+    }
+  },
+  "agent_input_prompt": "# Topology overview (devices + L2 connectivity)\nTopology: Kath2\n\nDevices:\n  cs_hod: eth0=lan_cs\n  cs_lab1: eth0=lan_cs\n  cs_lab2: eth0=lan_cs\n  cs_lab3: eth0=lan_cs\n  cs_lab4: eth0=lan_cs\n  enquiry: eth0=lan_office\n  exam_cell: eth0=lan_office\n  it_hod: eth0=lan_it\n  it_lab1: eth0=lan_it\n  it_lab2: eth0=lan_it\n  it_lab3: eth0=lan_it\n  it_lab4: eth0=lan_it\n  laptop0: eth0=lan_principle\n  office_pc: eth0=lan_office\n  pc0: eth0=lan_principle\n  pc1: eth0=lan_servers\n  pc2: eth0=lan_internet\n  pc3: eth0=lan_internet\n  pc4: eth0=lan_internet\n  pc5: eth0=lan_internet\n  router0: eth0=link_r0_sw0, eth1=link_r0_sw1, eth2=wan_r0_r1\n  router1: eth0=link_r1_sw2, eth1=link_r1_sw3, eth2=wan_r0_r1, eth3=wan_r1_r2\n  router2: eth0=link_r2_sw4, eth1=link_r2_sw5, eth2=wan_r1_r2\n  switch0: eth0=link_r0_sw0, eth1=lan_it\n  switch1: eth0=link_r0_sw1, eth1=lan_cs\n  switch2: eth0=link_r1_sw2, eth1=lan_office\n  switch3: eth0=link_r1_sw3, eth1=lan_principle\n  switch4: eth0=link_r2_sw4, eth1=lan_servers\n  switch5: eth0=link_r2_sw5, eth1=lan_internet\n  tpo: eth0=lan_office\n\nCollision domains (shared L2 segments):\n  lan_cs: cs_hod.eth0, cs_lab1.eth0, cs_lab2.eth0, cs_lab3.eth0, cs_lab4.eth0, switch1.eth1\n  lan_internet: pc2.eth0, pc3.eth0, pc4.eth0, pc5.eth0, switch5.eth1\n  lan_it: it_hod.eth0, it_lab1.eth0, it_lab2.eth0, it_lab3.eth0, it_lab4.eth0, switch0.eth1\n  lan_office: enquiry.eth0, exam_cell.eth0, office_pc.eth0, switch2.eth1, tpo.eth0\n  lan_principle: laptop0.eth0, pc0.eth0, switch3.eth1\n  lan_servers: pc1.eth0, switch4.eth1\n  link_r0_sw0: router0.eth0, switch0.eth0\n  link_r0_sw1: router0.eth1, switch1.eth0\n  link_r1_sw2: router1.eth0, switch2.eth0\n  link_r1_sw3: router1.eth1, switch3.eth0\n  link_r2_sw4: router2.eth0, switch4.eth0\n  link_r2_sw5: router2.eth1, switch5.eth0\n  wan_r0_r1: router0.eth2, router1.eth2\n  wan_r1_r2: router1.eth3, router2.eth2\n\n# Symptom (user report)\nTicket #4560: pc1 in the Server Room (1.0.0.5) cannot reach its gateway 1.0.0.1\nor anything beyond it. pc1 was fine until a maintenance task last night. The\nteam believes the Server Room gateway router2 was misconfigured during the\nmaintenance and is now rejecting pc1's traffic. Please confirm the router2\ngateway misconfiguration and identify what changed on router2."
+}

@@ -1,0 +1,61 @@
+[AGENT] sade starts on lab=Kath5
+[TOOL] ToolSearch({'query': 'select:mcp__kathara_base_mcp_server__get_reachability'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_base_mcp_server__get_reachability'}]
+[TOOL] mcp__kathara_base_mcp_server__get_reachability({})
+[RESULT] {"result":"{\"hosts\":{\"pc0\":\"20.1.1.10\",\"pc12\":\"120.1.1.10\"},\"results\":[{\"src\":\"pc0\",\"dst\":\"pc12\",\"dst_ip\":\"120.1.1.10\",\"tx\":2,\"rx\":2,\"loss_percent\":0.0,\"time_ms\":1088.0,\"rtt_avg_ms\":0.963,\"rtt_min_ms\":0.729,\"rtt_max_ms\":1.197,\"rtt_mdev_ms\":0.234,\"status\":\"ok\"},{\"src\":\"pc12\",\"dst\":\"pc0\",\"dst_ip\":\"20.1.1.10\",\"tx\":2,\"rx\":2,\"loss_percent\":0
+[TEXT] **Phase 1 result:** pc0 ↔ pc12 show 0 % loss. No raw host-level blackout visible. However, the user's report is concrete: r10 lost its OSPF adjacency to r2, area 4 stub config is gone from r2, and r10's RIB collapsed. These are specific routing-state symptoms (missing adjacency, missing routes) — a real symptom in the OSPF control plane.
+
+**Phase 2 → Phase 3.** Active lead: r10–r2 OSPF adjacency on segment I is broken after a config change on r2; r2 no longer advertises/configures area 4 as a stub. This maps directly to **`ospf-fault-skill`** (`ospf_area_misconfiguration`).
+[TOOL] Skill({'skill': 'ospf-fault-skill'})
+[RESULT] Launching skill: ospf-fault-skill
+[TEXT] The skill confirms `ospf_area_misconfiguration` as a strong candidate given the symptom. The one-pass helper is `ospf_snapshot.py`. Let me run it now.
+[TOOL] ToolSearch({'query': 'select:mcp__helper_server__run_helper'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__helper_server__run_helper'}]
+[TOOL] mcp__helper_server__run_helper({'script_name': 'ospf_snapshot'})
+[RESULT] {"result":"=== OSPF SNAPSHOT ===\nLab: Kath5\nRouters scanned: 13\nFlags:\n  - r10: zero OSPF neighbors\n  - r10: area 0.0.0.4 has 0 full adjacencies across 6 active interface(s) — peer mismatch suspected\n  - r12: no OSPF network statements\n  - r12: non-Full neighbors present: {'is': 1}\n  - r13: FRR control sockets missing (ospfd_vty) — daemon likely down\n  - r13: no OSPF network statements\n 
+[TEXT] The snapshot confirms the active lead: both r2 and r10 show **area 0.0.0.4 with 0 adjacencies** on the 21.0.0.0/8 shared segment. They see each other at L3 but no OSPF adjacency forms. The user mentioned "area 4 stub configuration no longer active on r2." I need direct config evidence — the stub mismatch fingerprint — on both sides.
+[TOOL] ToolSearch({'query': 'select:mcp__kathara_frr_mcp_server__frr_show_running_config'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_frr_mcp_server__frr_show_running_config'}]
+[TOOL] mcp__kathara_frr_mcp_server__frr_show_running_config({'router_name': 'r2'})
+[TOOL] mcp__kathara_frr_mcp_server__frr_show_running_config({'router_name': 'r10'})
+[RESULT] {"result":"Building configuration...\n\nCurrent configuration:\n!\nfrr version 9.1.3\nfrr defaults traditional\nhostname r2\ndomainname localdomain\nlog file /var/log/frr/frr.log\nno ipv6 forwarding\nno service integrated-vtysh-config\n!\npassword zebra\nenable password zebra\n!\nrouter ospf\n network 1.0.0.0/8 area 0\n network 21.0.0.0/8 area 4\n network 23.0.0.0/8 area 0\nexit\n!\nend"}
+[RESULT] {"result":"Building configuration...\n\nCurrent configuration:\n!\nfrr version 9.1.3\nfrr defaults traditional\nhostname r10\ndomainname localdomain\nlog file /var/log/frr/frr.log\nno ipv6 forwarding\nno service integrated-vtysh-config\n!\npassword zebra\nenable password zebra\n!\nrouter ospf\n network 21.0.0.0/8 area 4\n network 100.0.0.0/8 area 4\n network 110.0.0.0/8 area 4\n area 4 stub\nexit\
+[TEXT] **Confirmed.** The smoking gun is clear from direct config comparison:
+
+| Router | Area 4 config | Stub declaration |
+|--------|--------------|-----------------|
+| **r10** | `network 21.0.0.0/8 area 4` | ✅ `area 4 stub` present |
+| **r2**  | `network 21.0.0.0/8 area 4` | ❌ **`area 4 stub` absent** |
+
+r10 still declares area 4 as a stub; r2 had the `area 4 stub` statement removed during the config change. OSPF Hello packets carry an **E-bit** (External-LSA flag) in their Options field — 0 for stub areas, 1 for regular areas. When the two routers exchange Hellos on the 21.0.0.0/8 segment, the bits don't match and the adjacency is refused by both sides. This is the `ospf_area_misconfiguration` fingerprint.
+
+=== DIAGNOSIS ===
+is_anomaly: true
+faulty_devices: r2
+diagnosis_text:
+**Affected compo
+[FINAL] stop=end_turn tool_calls=8
+[SUBMITTED] parsed_ok=True is_anomaly=True faulty_devices=['r2']
+[FINAL-TEXT] **Confirmed.** The smoking gun is clear from direct config comparison:
+
+| Router | Area 4 config | Stub declaration |
+|--------|--------------|-----------------|
+| **r10** | `network 21.0.0.0/8 area 4` | ✅ `area 4 stub` present |
+| **r2**  | `network 21.0.0.0/8 area 4` | ❌ **`area 4 stub` absent** |
+
+r10 still declares area 4 as a stub; r2 had the `area 4 stub` statement removed during the config change. OSPF Hello packets carry an **E-bit** (External-LSA flag) in their Options field — 0 for stub areas, 1 for regular areas. When the two routers exchange Hellos on the 21.0.0.0/8 segment, the bits don't match and the adjacency is refused by both sides. This is the `ospf_area_misconfiguration` fingerprint.
+
+=== DIAGNOSIS ===
+is_anomaly: true
+faulty_devices: r2
+diagnosis_text:
+**Affected component:** OSPF area 4 stub-area configuration on r2's `router ospf` block.
+
+**Mechanism:** OSPF Hello packets carry an E-bit (External-LSA flag) in the Options field: it is cleared (0) when a router participates in a stub area and set (1) for normal areas. OSPF mandates that both neighbors on a shared segment agree on this bit; a mismatch causes both routers to silently drop each other's Hellos, so no adjacency can form — not even an INIT/2WAY state. With no adjacency on segment I (21.0.0.0/8), r10 receives no Type-3 Summary LSAs from the backbone, its RIB retains only intra-area area-4 routes, and every destination outside area 4 vanishes.
+
+**Localization:** r2, `router ospf` stanza. The shared segment is eth2 (21.1.1.1/8, collision domain I, connecting r2 and r10). r10's config retains `area 4 stub`; r2's config has the statement absent — confirmed by `show running-config` on both routers and corroborated by the `ospf_snapshot` flag showing area 0.0.0.4 with 0 full adjacencies on both sides.
+
+**Root cause:** A config change on r2 removed the `area 4 stub` declaration, creating an OSPF stub-area E-bit mismatch that prevents adjacency formation with r10 on their shared segment.
+
+**Fix:** Re-add `area 4 stub` under `router ospf` on r2 (`vtysh -c "conf t" -c "router ospf" -c "area 4 stub"`). This restores E-bit agreement, allows the Hello exchange to complete, and re-establishes the Full adjacency so r10 receives Summary LSAs and rebuilds its full RIB.
+=== END ===

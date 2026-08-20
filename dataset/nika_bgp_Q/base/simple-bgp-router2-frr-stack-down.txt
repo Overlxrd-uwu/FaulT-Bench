@@ -1,0 +1,75 @@
+==================================================
+Scenario: simple-bgp-router2-frr-stack-down
+Topology: simple_bgp
+Fault family: routing stack crash (zebra + bgpd)
+==================================================
+
+[PROMPT-TO-AGENT]
+pc2 (200.1.1.2) lost all connectivity to the partner network, and
+the partner reports pc1 (195.11.14.2) cannot reach pc2 either.
+Our NOC tried to inspect router2 but vtysh commands on it error
+out entirely -- they cannot even display the routing table. pc2
+can still ping router2's address 200.1.1.1. Find what broke.
+
+[INJECTION]
+device: router2
+action: kill the entire FRR stack (watchdog, zebra and bgpd) on router2
+cmd: pkill -9 watchfrr; pkill -9 zebra; pkill -9 bgpd
+
+[POST-INJECT-CHECK]
+router2   pgrep zebra              => expect empty
+router2   pgrep bgpd               => expect empty
+pc1       ping -W2 -c2 200.1.1.2   => expect loss>0
+
+[GROUND-TRUTH]
+Affected component: router2 FRR routing stack (zebra + bgpd,
+  watchfrr included)
+Mechanism: the whole FRR service on router2 is dead -- not just
+  one daemon. With bgpd gone the eBGP session's TCP connection
+  closes, so router1 immediately drops the session and withdraws
+  200.1.1.0/24; pc1's traffic toward pc2 then dies at router1 with
+  no route, and pc2's replies/pings toward 195.11.14.0/24 have no
+  usable end-to-end path either. With zebra ALSO dead, vtysh has
+  no daemon left to attach to, so it fails outright -- unlike a
+  bgpd-only crash, where vtysh stays responsive via zebra. (A
+  stale kernel route to 195.11.14.0/24 may linger on router2,
+  since zebra died without cleaning up; end-to-end traffic still
+  fails because router1 has withdrawn 200.1.1.0/24.) router2's
+  kernel itself is alive: it still answers on its connected
+  addresses, e.g. pc2 -> 200.1.1.1.
+Localization: router2
+Root cause: FRR routing stack (zebra and bgpd) not running on
+  router2
+Fix: restart FRR on router2 (`service frr restart`)
+
+[FIX]
+Restart the FRR service on router2 (`service frr restart`). This brings back
+watchfrr, zebra and bgpd from /etc/frr/frr.conf; the eBGP session to router1
+re-establishes, the inter-AS prefixes are re-exchanged, and pc1 reaches pc2
+normally. router1 needs no change.
+
+[DIAGNOSTIC-PROCESS]
+1. Reproduce on the real path: from pc1, ping pc2 (200.1.1.2) -- it fails;
+   pc2 still reaches 200.1.1.1, so router2's kernel/data plane is alive.
+2. Try the control plane on router2: vtysh cannot connect to any daemon;
+   `pgrep zebra` and `pgrep bgpd` are both empty -- the entire FRR stack is
+   down, not a single daemon.
+3. Check the peer's view: router1's bgpd is up and shows the session to
+   193.10.11.2 down; router1 has withdrawn 200.1.1.0/24.
+4. Rule out lower layers: router2's interfaces (eth0/eth1) are UP with
+   carrier; no link was cut and no config was changed.
+5. Localize to router2's dead FRR stack: distinguish from a bgpd-only crash
+   (vtysh would still respond via zebra) and exonerate router1.
+
+[SCORING-AXES]
+assert-identifies: router2
+must-identify-device: router2
+must-identify-component: FRR routing stack (zebra and bgpd) not running on router2
+must-distinguish-scope: recognizes the whole FRR service is down (vtysh unreachable), not just a single daemon, a link failure, or a config change
+bonus-notes-kernel-alive: notes router2 still answers on its connected addresses (kernel/data plane alive); only the routing control plane died
+
+[NIKA-LABEL]
+nika_label: frr_service_down
+nika_category: NETWORK_NODE_ERROR
+in_taxonomy: true
+note: entire FRR stack (zebra + bgpd + watchfrr) killed, not only bgpd

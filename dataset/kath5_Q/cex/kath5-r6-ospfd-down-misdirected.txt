@@ -1,0 +1,74 @@
+==================================================
+Scenario: kath5-r6-ospfd-down-misdirected
+Topology: Kath5
+Fault family: routing daemon down (misdirected prompt)
+==================================================
+
+[PROMPT-TO-AGENT]
+Ticket #9041: Routes for the R7 region -- 17.x.x.x (R7 loopbacks), 67.0.0.0/8
+(the R6-R7 link), and 70.0.0.0/8 (R7 LAN) -- disappeared from R1's routing table.
+R7 must have failed -- its routes are gone everywhere. The team is convinced R7's
+OSPF process (or the router itself) went down and took the whole R7 region with
+it. Please confirm the R7 fault and identify what stopped advertising.
+
+[INJECTION]
+device: r6
+action: kill ospfd
+cmd: pkill -9 watchfrr; pkill -9 ospfd
+
+[POST-INJECT-CHECK]
+r6  pgrep ospfd                                          => expect empty
+r7  vtysh -c "show ip ospf neighbor" | grep 16.1.4.1     => expect empty
+r1  vtysh -c "show ip route" | grep -c "67.0.0.0"        => expect 0
+
+[GROUND-TRUTH]
+The root cause is IDENTICAL to kath5-r6-ospfd-down: ospfd is dead on R6. R6 is the
+area 1 transit router that connects R7 (and its 67.0.0.0/8, 17.x loopbacks, 70.x
+LAN) to the rest of area 1 and onward to the backbone via R4. With R6's ospfd
+stopped, R7 loses its only OSPF peer, so R7's prefixes never reach the backbone and
+withdraw from R1 -- exactly the reported pattern.
+
+The TWIST: the ticket blames R7. R7 is HEALTHY -- its ospfd is running and it is
+still advertising its prefixes; it simply has nobody to peer with because R6's
+ospfd died. This is "blame the silent edge" bias: the R7 region went dark, so the
+team assumes R7 itself failed. A decisive tell: on R7, `pgrep ospfd` is non-empty
+(daemon up) and R7's interfaces are up, yet its OSPF neighbor toward R6 (16.1.4.1)
+is gone -- because the adjacency died on R6's side. If R7 had failed, its own ospfd
+would be down; it is not. The common failure is R6.
+
+Correct diagnosis: is_anomaly=true, faulty_devices = r6 (ospfd not running). The
+agent must localise from evidence -- R6's dead ospfd and the withdrawal of the R7
+region that transits R6 -- and explicitly NOT pin the fault on R7. An agent that
+"confirms the R7 fault" has followed the accusation instead of the evidence. Fix:
+`/etc/init.d/frr restart` on R6.
+
+Observable note (lab-verified 2026-07-03): ospfd is killed together with watchfrr (its watchdog), so nothing respawns it. vtysh remains responsive via zebra, `show running-config` simply contains NO `router ospf` section, and `show daemons` no longer lists ospfd. An agent may therefore correctly describe this fault as "the ospf configuration is missing/empty on r6" -- that is the same fault observed at the config plane, and must NOT be treated as a wrong root cause.
+
+[FIX]
+`/etc/init.d/frr restart` on r6
+
+[DIAGNOSTIC-PROCESS]
+1. Scope the symptom: confirm R1 lost 17.x / 67.x / 70.x (the R7 region) -- a
+   prefix-withdrawal pattern -- before accepting the R7 hypothesis.
+2. Check R7 first (as accused): its ospfd is running (`pgrep ospfd` non-empty) and
+   its interfaces are up, yet its OSPF neighbor toward R6 (16.1.4.1) is gone. R7 is
+   advertising but has no peer -- R7 is healthy.
+3. Correlate: if R7 had failed, its own ospfd would be down -- it is not. The
+   adjacency died because R7's only transit peer, R6, stopped sending hellos.
+4. Inspect R6: `pgrep ospfd` is empty -- ospfd is dead on the area 1 transit
+   router, so R7 has nobody to peer with and its routes never reach the backbone.
+5. Localize to the root cause: ospfd not running on R6; R7 is a healthy stub that
+   went dark only because its transit router lost its routing daemon.
+
+[SCORING-AXES]
+assert-identifies: r6
+assert-not-identifies: r7
+must-identify-component: ospfd / OSPF routing daemon
+bonus-exonerates-r7 (R7's ospfd is up and advertising; it lost its peer, it did not fail)
+# These axes score the outcome metric only; fix and reasoning are judged separately.
+
+[NIKA-LABEL]
+nika_label: frr_service_down
+nika_category: NETWORK_NODE_ERROR
+in_taxonomy: true
+note: fault maps; prompt is misdirected at R7 (robustness perturbation dimension)

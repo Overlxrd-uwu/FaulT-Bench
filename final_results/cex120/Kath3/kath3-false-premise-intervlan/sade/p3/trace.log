@@ -1,0 +1,131 @@
+[AGENT] sade starts on lab=Kath3
+[TOOL] ToolSearch({'query': 'select:mcp__kathara_base_mcp_server__get_reachability'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_base_mcp_server__get_reachability'}]
+[TOOL] mcp__kathara_base_mcp_server__get_reachability({})
+[RESULT] {"result":"{\"hosts\":{\"pc11\":\"192.168.200.11\",\"pc12\":\"192.168.200.12\",\"pc13\":\"192.168.200.13\",\"pc14\":\"192.168.200.14\",\"pc15\":\"172.18.51.15\",\"pc16\":\"172.18.51.16\",\"pc17\":\"172.18.51.17\",\"pc18\":\"172.18.51.18\",\"pc4\":\"172.16.10.4\",\"pc5\":\"172.16.10.5\"},\"results\":[{\"src\":\"pc11\",\"dst\":\"pc5\",\"dst_ip\":\"172.16.10.5\",\"tx\":2,\"rx\":2,\"loss_percent\":0.0
+[TEXT] **Phase 1 complete.** I see multiple `status="unknown"` (null tx/rx/loss) rows across different src→dst pairs. Per the rules, these are unconfirmed until retested with direct-IP probes. Let me do those confirmations now.
+[TOOL] ToolSearch({'query': 'select:mcp__kathara_base_mcp_server__exec_shell'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_base_mcp_server__exec_shell'}]
+[TEXT] Running direct-IP probes in parallel to confirm whether the "unknown" rows are path failures or name-resolution misses:
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'pc4', 'command': 'ping -c2 172.18.51.16'})
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'pc15', 'command': 'ping -c2 172.16.10.5'})
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'pc11', 'command': 'ping -c2 172.18.51.16'})
+[RESULT] {"result":"[TIMEOUT] Command 'ping -c2 172.18.51.16' on 'pc4' exceeded 10s."}
+[RESULT] {"result":"[TIMEOUT] Command 'ping -c2 172.16.10.5' on 'pc15' exceeded 10s."}
+[RESULT] {"result":"[TIMEOUT] Command 'ping -c2 172.18.51.16' on 'pc11' exceeded 10s."}
+[TEXT] **Phase 2 → Phase 3:** Direct-IP probes all timed out (tx=null, hard path failure). Real symptom confirmed.
+
+**Active lead:** A cross-subnet blackhole is affecting ALL traffic to/from 172.18.51.x (switch10, mswitch2, router6 area). The exact pattern — pc4→pc16 broken, pc15→pc5 broken, but pc11→pc5 (not involving router6) is fine — points to a routing-path fault on the router6 side, not just a local VLAN issue on router0.
+
+Mapping to fault family: reachability failure along routing paths → `ospf-fault-skill`.
+[TOOL] Skill({'skill': 'ospf-fault-skill'})
+[RESULT] Launching skill: ospf-fault-skill
+[TEXT] The skill recommends `ospf_snapshot.py` for one-pass coverage. Let me load the helper tool and run it.
+[TOOL] ToolSearch({'query': 'select:mcp__helper_server__run_helper'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__helper_server__run_helper'}]
+[TOOL] mcp__helper_server__run_helper({'script_name': 'ospf_snapshot'})
+[RESULT] {"result":"=== OSPF SNAPSHOT ===\nLab: Kath3\nRouters scanned: 9\nFlags:\n  - mswitch1: vtysh probe failed (FRR control plane unreachable)\n  - mswitch1: FRR control sockets missing (zebra_vty, ospfd_vty) — daemon likely down\n  - mswitch1: no OSPF network statements\n  - mswitch1: non-Full neighbors present: {'to': 1}\n  - mswitch2: vtysh probe failed (FRR control plane unreachable)\n  - mswitch2
+[TEXT] The snapshot reveals `ospfd_vty=no` on every router — but zebra IS running on router0–6, meaning this is a **static-route topology** (no OSPF daemon anywhere). More importantly, mswitch1 and mswitch2 both show `vtysh=dead` — the entire FRR stack is down on both multilayer switches. This is a key divergence. Let me now check router0's interfaces and routing table, and also look at what laptop0's address is.
+[TOOL] ToolSearch({'query': 'select:mcp__kathara_frr_mcp_server__frr_show_ip_route,mcp__kathara_base_mcp_server__get_host_net_config'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_frr_mcp_server__frr_show_ip_route'}, {'type': 'tool_reference', 'tool_name': 'mcp__kathara_base_mcp_server__get_host_net_config'}]
+[TOOL] mcp__kathara_frr_mcp_server__frr_show_ip_route({'router_name': 'router0'})
+[TOOL] mcp__kathara_base_mcp_server__get_host_net_config({'host_name': 'laptop0'})
+[TOOL] mcp__kathara_base_mcp_server__get_host_net_config({'host_name': 'pc4'})
+[RESULT] {"result":"Codes: K - kernel route, C - connected, S - static, R - RIP,\n       O - OSPF, I - IS-IS, B - BGP, E - EIGRP, N - NHRP,\n       T - Table, v - VNC, V - VNC-Direct, A - Babel, F - PBR,\n       f - OpenFabric,\n       > - selected route, * - FIB route, q - queued, r - rejected, b - backup\n       t - trapped, o - offload failure\n\nC>* 10.16.1.0/24 is directly connected, eth2, 00:06:12\nR
+[RESULT] [{'type': 'text', 'text': '{\n  "host_name": "laptop0",\n  "ifconfig": "eth0: flags=4163<UP,BROADCAST,RUNNING,MULTICAST>  mtu 1500\\n        inet 172.16.20.10  netmask 255.255.255.0  broadcast 0.0.0.0\\n        ether b6:85:85:f2:73:a6  txqueuelen 1000  (Ethernet)\\n        RX packets 15  bytes 3138 (3.0 KiB)\\n        RX errors 0  dropped 0  overruns 0  frame 0\\n        TX packets 0  bytes 0 (0.0
+[RESULT] [{'type': 'text', 'text': '{\n  "host_name": "pc4",\n  "ifconfig": "eth0: flags=4163<UP,BROADCAST,RUNNING,MULTICAST>  mtu 1500\\n        inet 172.16.10.4  netmask 255.255.255.0  broadcast 0.0.0.0\\n        ether 76:75:00:1b:d5:4d  txqueuelen 1000  (Ethernet)\\n        RX packets 21  bytes 3574 (3.4 KiB)\\n        RX errors 0  dropped 0  overruns 0  frame 0\\n        TX packets 10  bytes 756 (756.0
+[TEXT] Key findings so far: router0 has **both** `eth0.10` (172.16.10.0/24) and `eth0.20` (172.16.20.0/24) present in its route table. The routing table itself looks correct for inter-VLAN. Now I need to verify the actual interface addresses and whether the gateways are reachable from pc4 and laptop0.
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'pc4', 'command': 'ping -c2 172.16.10.1 && ping -c2 172.16.20.10'})
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'router0', 'command': 'ip addr show eth0; ip addr show eth0.10; ip addr show eth0.20'})
+[TOOL] mcp__kathara_base_mcp_server__get_host_net_config({'host_name': 'mswitch1'})
+[RESULT] {"result":"PING 172.16.10.1 (172.16.10.1) 56(84) bytes of data.\n64 bytes from 172.16.10.1: icmp_seq=1 ttl=64 time=0.836 ms\n64 bytes from 172.16.10.1: icmp_seq=2 ttl=64 time=0.982 ms\n\n--- 172.16.10.1 ping statistics ---\n2 packets transmitted, 2 received, 0% packet loss, time 1085ms\nrtt min/avg/max/mdev = 0.836/0.909/0.982/0.073 ms\nPING 172.16.20.10 (172.16.20.10) 56(84) bytes of data.\n64 by
+[RESULT] {"result":"40687: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UP group default qlen 1000\n    link/ether 8a:4d:b6:e2:b6:ed brd ff:ff:ff:ff:ff:ff\n    inet 192.168.1.1/24 scope global eth0\n       valid_lft forever preferred_lft forever\n2: eth0.10@eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue state UP group default qlen 1000\n    link/ether 8a:4d:b6:e2:b6
+[RESULT] [{'type': 'text', 'text': '{\n  "host_name": "mswitch1",\n  "ifconfig": "br_vlan1: flags=4163<UP,BROADCAST,RUNNING,MULTICAST>  mtu 1500\\n        ether 12:44:1a:4b:7c:01  txqueuelen 1000  (Ethernet)\\n        RX packets 15  bytes 3300 (3.2 KiB)\\n        RX errors 0  dropped 0  overruns 0  frame 0\\n        TX packets 1  bytes 54 (54.0 B)\\n        TX errors 0  dropped 0 overruns 0  carrier 0  col
+[TEXT] Critical finding: **pc4 → laptop0 (172.16.20.10) SUCCEEDS with 0% loss** — the user's reported inter-VLAN fault is NOT reproduced in current state. The actual confirmed failures all involve 172.18.51.x (switch10/mswitch2 area). 
+
+mswitch1 shows a proper VLAN bridge setup (br_vlan10/br_vlan20 with 802.1Q sub-interfaces). Now I need to trace the 172.18.51.x isolation — checking router6's routing table and mswitch2's config.
+[TOOL] mcp__kathara_frr_mcp_server__frr_show_ip_route({'router_name': 'router6'})
+[TOOL] mcp__kathara_base_mcp_server__get_host_net_config({'host_name': 'mswitch2'})
+[TOOL] mcp__kathara_base_mcp_server__get_host_net_config({'host_name': 'pc15'})
+[RESULT] {"result":"Codes: K - kernel route, C - connected, S - static, R - RIP,\n       O - OSPF, I - IS-IS, B - BGP, E - EIGRP, N - NHRP,\n       T - Table, v - VNC, V - VNC-Direct, A - Babel, F - PBR,\n       f - OpenFabric,\n       > - selected route, * - FIB route, q - queued, r - rejected, b - backup\n       t - trapped, o - offload failure\n\nK>* 0.0.0.0/0 [0/150] via 10.50.1.1, eth2, 00:08:30\nR>* 
+[RESULT] [{'type': 'text', 'text': '{\n  "host_name": "mswitch2",\n  "ifconfig": "br_vlan1: flags=4163<UP,BROADCAST,RUNNING,MULTICAST>  mtu 1500\\n        ether 02:23:32:71:43:3d  txqueuelen 1000  (Ethernet)\\n        RX packets 0  bytes 0 (0.0 B)\\n        RX errors 0  dropped 0  overruns 0  frame 0\\n        TX packets 2  bytes 108 (108.0 B)\\n        TX errors 0  dropped 0 overruns 0  carrier 0  collisi
+[RESULT] [{'type': 'text', 'text': '{\n  "host_name": "pc15",\n  "ifconfig": "eth0: flags=4163<UP,BROADCAST,RUNNING,MULTICAST>  mtu 1500\\n        inet 172.18.51.15  netmask 255.255.255.0  broadcast 0.0.0.0\\n        ether 2a:b5:68:40:41:9b  txqueuelen 1000  (Ethernet)\\n        RX packets 11  bytes 736 (736.0 B)\\n        RX errors 0  dropped 0  overruns 0  frame 0\\n        TX packets 10  bytes 756 (756.
+[TEXT] Highly revealing! **Router6 has `172.18.51.0/24` directly connected on `eth1` and has full RIP routes back to all other subnets** — its routing table looks correct. But pc15's default gateway is **172.18.51.254**. I need to verify: (a) what IP router6.eth1 actually has, and (b) whether pc15 can reach its own gateway.
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'router6', 'command': 'ip addr show eth1; ip addr show eth0'})
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'pc15', 'command': 'ping -c2 172.18.51.254'})
+[RESULT] {"result":"40710: eth1: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UP group default qlen 1000\n    link/ether c6:17:48:07:c3:25 brd ff:ff:ff:ff:ff:ff\n    inet 172.18.51.254/24 scope global eth1\n       valid_lft forever preferred_lft forever\n40688: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UP group default qlen 1000\n    link/ether 82:68:bc:82:e8:
+[RESULT] {"result":"PING 172.18.51.254 (172.18.51.254) 56(84) bytes of data.\n64 bytes from 172.18.51.254: icmp_seq=1 ttl=64 time=0.935 ms\n64 bytes from 172.18.51.254: icmp_seq=2 ttl=64 time=0.698 ms\n\n--- 172.18.51.254 ping statistics ---\n2 packets transmitted, 2 received, 0% packet loss, time 1082ms\nrtt min/avg/max/mdev = 0.698/0.816/0.935/0.118 ms"}
+[TEXT] **router6.eth1 = 172.18.51.254** — exactly pc15's gateway, and **pc15 can reach it** (0% loss). So pc15's L2 path to its gateway is fine. The failure must lie in the routing path *beyond* router6. Let me trace where the path breaks with traceroute and check router1's routing table (since router0's kernel route for 172.18.51.x goes via router1).
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'pc15', 'command': 'traceroute -n -w2 -q1 172.16.10.5'})
+[TOOL] mcp__kathara_frr_mcp_server__frr_show_ip_route({'router_name': 'router1'})
+[TOOL] mcp__kathara_frr_mcp_server__frr_show_ip_route({'router_name': 'router3'})
+[RESULT] {"result":"traceroute to 172.16.10.5 (172.16.10.5), 30 hops max, 60 byte packets\n 1  172.18.51.254  1.133 ms\n 2  *\n 3  *\n 4  *\n 5  *\n 6  *\n 7  *\n 8  *\n 9  *\n10  *\n11  *\n12  *\n13  *\n14  *\n15  *\n16  *\n17  *\n18  *\n19  *\n20  *\n21  *\n22  *\n23  *\n24  *\n25  *\n26  *\n27  *\n28  *\n29  *\n30  *"}
+[RESULT] {"result":"Codes: K - kernel route, C - connected, S - static, R - RIP,\n       O - OSPF, I - IS-IS, B - BGP, E - EIGRP, N - NHRP,\n       T - Table, v - VNC, V - VNC-Direct, A - Babel, F - PBR,\n       f - OpenFabric,\n       > - selected route, * - FIB route, q - queued, r - rejected, b - backup\n       t - trapped, o - offload failure\n\nC>* 10.16.1.0/24 is directly connected, eth2, 00:10:16\nC
+[RESULT] {"result":"Codes: K - kernel route, C - connected, S - static, R - RIP,\n       O - OSPF, I - IS-IS, B - BGP, E - EIGRP, N - NHRP,\n       T - Table, v - VNC, V - VNC-Direct, A - Babel, F - PBR,\n       f - OpenFabric,\n       > - selected route, * - FIB route, q - queued, r - rejected, b - backup\n       t - trapped, o - offload failure\n\nR>* 10.16.1.0/24 [120/3] via 192.168.100.1, eth4, weight 
+[TEXT] **Traceroute: packet leaves pc15 (hop 1 = router6 = 172.18.51.254) but all subsequent hops are `*`.** Router1 and router3 both have kernel routes for 172.18.51.x pointing correctly (router1 → router2, router3 → router6). Let me now test from inside the path: can router6 reach pc5 (forward path), and can router0 reach 172.18.51.x (reverse path)?
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'router6', 'command': 'ping -c2 172.16.10.5'})
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'router0', 'command': 'ping -c2 172.18.51.15'})
+[TOOL] mcp__kathara_frr_mcp_server__frr_show_ip_route({'router_name': 'router2'})
+[RESULT] {"result":"PING 172.16.10.5 (172.16.10.5) 56(84) bytes of data.\n64 bytes from 172.16.10.5: icmp_seq=1 ttl=60 time=1.61 ms\n64 bytes from 172.16.10.5: icmp_seq=2 ttl=60 time=1.35 ms\n\n--- 172.16.10.5 ping statistics ---\n2 packets transmitted, 2 received, 0% packet loss, time 1075ms\nrtt min/avg/max/mdev = 1.347/1.479/1.611/0.132 ms"}
+[RESULT] {"result":"[TIMEOUT] Command 'ping -c2 172.18.51.15' on 'router0' exceeded 10s."}
+[RESULT] {"result":"Codes: K - kernel route, C - connected, S - static, R - RIP,\n       O - OSPF, I - IS-IS, B - BGP, E - EIGRP, N - NHRP,\n       T - Table, v - VNC, V - VNC-Direct, A - Babel, F - PBR,\n       f - OpenFabric,\n       > - selected route, * - FIB route, q - queued, r - rejected, b - backup\n       t - trapped, o - offload failure\n\nR>* 10.16.1.0/24 [120/2] via 10.20.1.1, eth2, weight 1, 0
+[TEXT] **Key asymmetry confirmed:** router6 can reach pc5 (TTL=60, works), but router0 CANNOT reach 172.18.51.x (timeout). The difference must be in the path used. router0's kernel route for 172.18.51.x goes `→router1→router2→router3→router6`, while router6's outbound traffic uses the direct `r6_r3→router3→router4→router5→router0` RIP-learned path. Let me isolate exactly where the router0→router1→router2→router3 chain breaks for 172.18.51.x traffic, and also test from router6 with source 172.18.51.254 to confirm the return path is the issue.
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'router6', 'command': 'ping -c2 -I eth1 172.16.10.5'})
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'router3', 'command': 'ping -c2 172.18.51.15'})
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'router0', 'command': 'ip route show; ping -c2 10.16.1.2'})
+[RESULT] {"result":"PING 172.16.10.5 (172.16.10.5) from 172.18.51.254 eth1: 56(84) bytes of data.\nFrom 172.18.51.254 icmp_seq=1 Destination Host Unreachable\nFrom 172.18.51.254 icmp_seq=2 Destination Host Unreachable\n\n--- 172.16.10.5 ping statistics ---\n2 packets transmitted, 0 received, +2 errors, 100% packet loss, time 1076ms\npipe 2"}
+[RESULT] {"result":"[TIMEOUT] Command 'ping -c2 172.18.51.15' on 'router3' exceeded 10s."}
+[RESULT] {"result":"10.16.1.0/24 dev eth2 proto kernel scope link src 10.16.1.1 \n10.20.1.0/24 nhid 14 via 10.16.1.2 dev eth2 proto rip metric 20 \n10.50.1.0/24 nhid 16 via 172.20.1.2 dev eth4 proto rip metric 20 \n172.16.10.0/24 dev eth0.10 proto kernel scope link src 172.16.10.1 \n172.16.20.0/24 dev eth0.20 proto kernel scope link src 172.16.20.1 \n172.18.50.0/24 via 10.16.1.2 dev eth2 \n172.18.51.0/24 v
+[TEXT] **The asymmetry is now pinpointed!** 
+
+- `ping -I eth1 172.16.10.5` from router6 → **Destination Host Unreachable** (kernel rejects it locally when source=172.18.51.254, but routing without eth1 works fine)
+- **router3 pings 172.18.51.15 → TIMEOUT** — even though router3 is directly adjacent to router6 on r6_r3 (10.50.1.0/24)
+
+The r6_r3 link carries RIP updates (router6 learns routes from router3 via 10.50.1.1), so the link is up. But forwarded ICMP/data traffic is being dropped at router6. This strongly suggests router6's **IP forwarding / FORWARD firewall chain** is blocking transit traffic. Let me confirm.
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'router6', 'command': 'cat /proc/sys/net/ipv4/ip_forward; nft list ruleset 2>/dev/null; iptables -L FORWARD -n -v 2>/dev/null'})
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'router3', 'command': 'ping -c2 10.50.1.2'})
+[RESULT] {"result":"1\ntable ip nat {\n\tchain DOCKER_OUTPUT {\n\t\tip daddr 127.0.0.11 tcp dport 53 counter packets 0 bytes 0 dnat to 127.0.0.11:39905\n\t\tip daddr 127.0.0.11 udp dport 53 counter packets 0 bytes 0 dnat to 127.0.0.11:33107\n\t}\n\n\tchain OUTPUT {\n\t\ttype nat hook output priority -100; policy accept;\n\t\tip daddr 127.0.0.11 counter packets 0 bytes 0 jump DOCKER_OUTPUT\n\t}\n\n\tchain D
+[RESULT] {"result":"PING 10.50.1.2 (10.50.1.2) 56(84) bytes of data.\n64 bytes from 10.50.1.2: icmp_seq=1 ttl=64 time=0.583 ms\n64 bytes from 10.50.1.2: icmp_seq=2 ttl=64 time=0.255 ms\n\n--- 10.50.1.2 ping statistics ---\n2 packets transmitted, 2 received, 0% packet loss, time 1076ms\nrtt min/avg/max/mdev = 0.255/0.419/0.583/0.164 ms"}
+[TEXT] **Root cause found.** The nftables FORWARD chain on **router6** has explicit DROP rules:
+
+```
+iifname "eth2" meta l4proto tcp  → DROP  (all TCP entering from eth2)
+iifname "eth2" meta l4proto udp  → DROP  (all UDP entering from eth2)
+iifname "eth2"                   → DROP  (all other traffic entering from eth2) ← 59 pkts/5072B already counted
+```
+
+eth2 is the **r6_r3 backbone link**. Every packet arriving from the backbone (router3/router2/router1/router0 side) and destined for the 172.18.51.x or 172.18.50.x hosts is dropped in the FORWARD chain. The only exception is TCP port 80 from 172.16.10.0/24 to 172.18.51.1. ip_forward is 1, so the issue is purely the ACL. And router3 can ping router6.eth2 (10.50.1.2) with 0% loss — the link itself is fine.
+
+=== DIAGNOSIS ===
+is_anomaly: true
+fault
+[FINAL] stop=end_turn tool_calls=32
+[SUBMITTED] parsed_ok=True is_anomaly=True faulty_devices=['router6']
+[FINAL-TEXT] **Root cause found.** The nftables FORWARD chain on **router6** has explicit DROP rules:
+
+```
+iifname "eth2" meta l4proto tcp  → DROP  (all TCP entering from eth2)
+iifname "eth2" meta l4proto udp  → DROP  (all UDP entering from eth2)
+iifname "eth2"                   → DROP  (all other traffic entering from eth2) ← 59 pkts/5072B already counted
+```
+
+eth2 is the **r6_r3 backbone link**. Every packet arriving from the backbone (router3/router2/router1/router0 side) and destined for the 172.18.51.x or 172.18.50.x hosts is dropped in the FORWARD chain. The only exception is TCP port 80 from 172.16.10.0/24 to 172.18.51.1. ip_forward is 1, so the issue is purely the ACL. And router3 can ping router6.eth2 (10.50.1.2) with 0% loss — the link itself is fine.
+
+=== DIAGNOSIS ===
+is_anomaly: true
+faulty_devices: router6
+diagnosis_text:
+**Affected component:** The nftables/iptables FORWARD chain on router6, specifically rules applied to traffic arriving on `eth2` (the `r6_r3` backbone link to router3).
+
+**Mechanism:** ip_forward is enabled on router6 (value = 1), so the kernel is willing to route. However, the FORWARD chain contains three DROP rules that fire on all forwarded traffic entering from `eth2`: one drops TCP, one drops UDP, and a final catch-all drops everything else (59 packets/5072 bytes already silenced). Only a narrow exception exists — TCP port 80 from `172.16.10.0/24` destined to `172.18.51.1`. Because ALL inbound-from-backbone traffic is dropped before it reaches the 172.18.51.0/24 or 172.18.50.0/24 segments, no external host can send packets into those subnets. The reverse direction (172.18.51.x hosts sending outbound via router6.eth2) is unaffected — that traffic is FORWARD-chain accepted or uses the OUTPUT/local path — explaining why router6 itself can ping external hosts and pc15 can reach its gateway, yet the path is asymmetrically blocked for transit.
+
+**Localization:** router6, iptables FORWARD chain, three DROP rules matching `iifname "eth2"`. The `r6_r3` link (router6.eth2 ↔ router3.eth2) is physically up and carries RIP updates normally.
+
+**Root cause:** An ACL injected into router6's iptables FORWARD chain drops all forwarded traffic arriving from the backbone interface eth2, blackholing the entire 172.18.51.0/24 subnet from the perspective of any source outside that segment.
+
+**Fix:** Delete the three DROP rules from router6's FORWARD chain:
+`iptables -D FORWARD -i eth2 -p tcp -j DROP`
+`iptables -D FORWARD -i eth2 -p udp -j DROP`
+`iptables -D FORWARD -i eth2 -j DROP`
+(and their nftables equivalents in `table ip filter chain FORWARD`).
+=== END ===

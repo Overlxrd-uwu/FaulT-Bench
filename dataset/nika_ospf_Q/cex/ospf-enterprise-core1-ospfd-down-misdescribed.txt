@@ -1,0 +1,65 @@
+==================================================
+Scenario: ospf-enterprise-core1-ospfd-down-misdescribed
+Topology: ospf_enterprise_static
+Fault family: routing daemon down (misdescribed ticket)
+==================================================
+
+[PROMPT-TO-AGENT]
+Helpdesk ticket #8852: host_1_1_1_1 has lost access to the server farm -- it can
+no longer reach the internal servers on 10.200.0.0/24. The networking team insists
+this is a physical problem: they believe a core link / cabling between the routers
+is physically down and want the cable re-run on the core router. Please find and
+confirm the real fault and tell us which device to fix.
+
+[INJECTION]
+device: router_core_1
+action: kill the OSPF daemon (ospfd) on router_core_1 and stop watchfrr from respawning it
+cmd: pkill -9 watchfrr; pkill -9 ospfd
+
+[POST-INJECT-CHECK]
+router_core_1  pgrep ospfd                        => expect empty
+host_1_1_1_1   ping -W2 -c2 10.200.0.2            => expect loss>0
+router_core_1  ip -br link show eth1 | grep -c UP => expect 1
+
+[GROUND-TRUTH]
+The real fault is on router_core_1: its ospfd (the OSPF routing daemon) has been
+killed, so router_core_1 withdraws the OSPF routes it normally advertises and
+host_1_1_1_1 loses its path to the server farm (ping to 10.200.0.2 fails). The
+ticket MISDESCRIBES the cause as a physical link / cabling failure, but the
+interfaces are UP -- router_core_1's eth1 still shows UP at the link layer. There
+is no cabling problem; the adjacency and routes dropped because the daemon died,
+not because a cable is unplugged.
+
+The correct diagnosis identifies router_core_1 (ospfd down) as the faulty device
+and explicitly distinguishes a daemon crash from the ticket's "cable down" cause:
+the link is physically UP, so re-cabling would change nothing. An agent that
+recommends re-running cables has accepted the ticket's misdescription instead of
+the evidence.
+
+Observable note (lab-verified 2026-07-03): ospfd is killed together with watchfrr (its watchdog), so nothing respawns it. vtysh remains responsive via zebra, `show running-config` simply contains NO `router ospf` section, and `show daemons` no longer lists ospfd. An agent may therefore correctly describe this fault as "the ospf configuration is missing/empty on router_core_1" -- that is the same fault observed at the config plane, and must NOT be treated as a wrong root cause.
+
+[FIX]
+Restart FRR / the OSPF daemon on router_core_1 (`service frr restart`). Once ospfd
+is running again, OSPF re-converges, router_core_1 re-advertises its routes, and
+host_1_1_1_1 reaches the server farm. No cabling change is needed.
+
+[DIAGNOSTIC-PROCESS]
+1. Reproduce: from host_1_1_1_1, ping 10.200.0.2 (server farm) fails -> the path
+   to the server farm is broken.
+2. Check the physical layer first (the ticket's claim): router_core_1's eth1 shows
+   UP -- the link is not physically down, so the "cabling" premise is false.
+3. Check routing/OSPF on router_core_1: ospfd is not running (pgrep ospfd empty),
+   so OSPF routes via core1 are withdrawn -> the data plane loses the route.
+4. Localize to router_core_1 (ospfd / daemon crash), not a cable: the dead OSPF
+   daemon fully explains the lost route while interfaces stay UP.
+
+[SCORING-AXES]
+assert-identifies: router_core_1
+must-identify-ospfd-down: identifies ospfd (the OSPF daemon) on router_core_1 is down, not a physical link/cabling failure
+bonus-rules-out-link: notes router_core_1's interfaces are UP, distinguishing a daemon crash from the ticket's "cable down" cause
+
+[NIKA-LABEL]
+nika_label: frr_service_down
+nika_category: NETWORK_NODE_ERROR
+in_taxonomy: true
+note: NIKA-substrate misdescribed counter-example (clean ospf_enterprise topology; real ospfd-down fault on router_core_1; ticket misdescribes it as a physical cable/link failure)

@@ -1,0 +1,71 @@
+==================================================
+Scenario: simple-bgp-router2-interas-link-down
+Topology: simple_bgp
+Fault family: link cut (inter-AS)
+==================================================
+
+[PROMPT-TO-AGENT]
+Both user LANs lost cross-AS connectivity this morning: pc1
+(195.11.14.2) cannot reach pc2 (200.1.1.2) and pc2 cannot reach
+pc1. Each PC still reaches its own gateway fine. Our NOC checked
+router1: its inter-AS interface eth0 shows UP and its config is
+unchanged. The partner operator (AS 2) says router2's logs show
+the eBGP session dropping. Find what broke.
+
+[INJECTION]
+device: router2
+action: administratively down the inter-AS interface (eth0) on router2
+cmd: ip link set eth0 down
+
+[POST-INJECT-CHECK]
+router2   ip -br link show eth0 | grep -c UP  => expect 0
+pc1       ping -W2 -c2 200.1.1.2             => expect loss>0
+
+[GROUND-TRUTH]
+Affected component: router2 eth0 (193.10.11.2/24, the inter-AS
+  interface toward router1)
+Mechanism: router2's eth0 is DOWN, so the physical/L2 path between
+  the two ASes is broken at router2's side. router2 immediately
+  loses its 193.10.11.0/24 connected route and its BGP route to
+  195.11.14.0/24 (nexthop interface gone), and its side of the
+  eBGP session drops. Traffic from pc1 toward 200.1.1.0/24 is
+  blackholed on the inter-AS segment (nothing listens at
+  193.10.11.2 any more), so pc1<->pc2 fails in both directions.
+  Note: router1's eth0 still shows UP (the far side of the virtual
+  link keeps carrier), and router1 may briefly keep showing the
+  session as Established until its hold timer expires -- the
+  definitive evidence is router2's eth0 being DOWN.
+Localization: router2
+Root cause: inter-AS link down at router2 (eth0 administratively
+  down)
+Fix: `ip link set eth0 up` on router2
+
+[FIX]
+Bring the inter-AS link back up: on router2 run `ip link set eth0 up`. The
+eBGP session re-establishes, the inter-AS prefixes are re-exchanged, and pc1
+reaches pc2 normally. router1 needs no change -- it was healthy the whole time.
+
+[DIAGNOSTIC-PROCESS]
+1. Reproduce on the real path: from pc1, ping pc2 (200.1.1.2) -- it fails;
+   each PC still reaches its local gateway, so both LAN legs are fine.
+2. Check the inter-AS link from both ends: router1's eth0 shows UP, but on
+   router2 `ip -br link show eth0` shows DOWN -- the link is broken at
+   router2's side.
+3. Correlate with the control plane: router2's session to 193.10.11.1 is down
+   and its routes over eth0 (193.10.11.0/24, 195.11.14.0/24) are gone; the BGP
+   loss is a CONSEQUENCE of the interface being down.
+4. Localize to router2 eth0 down: rule out a daemon crash (bgpd runs on both
+   routers) and a config change (both BGP configs unchanged); exonerate
+   router1, whose interface and config are healthy.
+
+[SCORING-AXES]
+assert-identifies: router2
+must-identify-device: router2
+must-identify-component: inter-AS interface eth0 on router2 is down
+must-identify-mechanism: the L2 path between the ASes is broken at router2's side, with the BGP session/route loss as a consequence
+bonus-notes-far-side-up: notes router1's eth0 still shows UP (far side of the virtual link), so checking router1 alone would miss the fault
+
+[NIKA-LABEL]
+nika_label: link_down
+nika_category: LINK_FAILURE
+in_taxonomy: true

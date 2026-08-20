@@ -1,0 +1,41 @@
+[AGENT] cc-baseline starts on lab=ospf_enterprise_static
+[TEXT] DNS amnesia. Start with the DNS server itself and host reachability in parallel.
+[TOOL] ToolSearch({'query': 'select:mcp__kathara_base_mcp_server__exec_command,mcp__kathara_frr_mcp_server__get_running_config'})
+[RESULT] No matching deferred tools found
+[TOOL] ToolSearch({'query': 'kathara exec command'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_base_mcp_server__exec_shell'}, {'type': 'tool_reference', 'tool_name': 'mcp__kathara_base_mcp_server__exec_shell_dual'}, {'type': 'tool_reference', 'tool_name': 'mcp__kathara_frr_mcp_server__frr_exec'}, {'type': 'tool_reference', 'tool_name': 'mcp__kathara_base_mcp_server__curl_web_test'}, {'type': 'tool_reference', 'tool_name': 'mcp__kathara_
+[TOOL] mcp__kathara_base_mcp_server__exec_shell_dual({'host1': 'dns_server', 'cmd1': "systemctl status bind9 2>/dev/null || systemctl status named 2>/dev/null || ps aux | grep -E 'named|bind'", 'host2': 'host_1_1_1_1', 'cmd2': 'cat /etc/resolv.conf && nslookup web_server_0 2>&1 || dig web_server_0 2>&1'})
+[RESULT] {"result":{"host1":["bind9.service - BIND Domain Name Server\n    Loaded: loaded (/etc/systemd/system/bind9.service, disabled)\n    Active: inactive (dead)\nnamed.service - BIND Domain Name Server\n    Loaded: loaded (/usr/lib/systemd/system/named.service, enabled)\n    Active: active (running)"],"host2":["nameserver 10.200.0.2\n;; Got recursion not available from 10.200.0.2\nServer:\t\t10.200.0.2
+[TEXT] DNS is running but returning REFUSED. "Recursion not available" — BIND config issue. Check named config now.
+[TOOL] mcp__kathara_base_mcp_server__exec_shell_dual({'host1': 'dns_server', 'cmd1': "cat /etc/bind/named.conf.options 2>/dev/null || cat /etc/named.conf 2>/dev/null || find /etc -name 'named.conf*' 2>/dev/null | xargs cat", 'host2': 'dns_server', 'cmd2': 'ip addr show && cat /etc/bind/named.conf 2>/dev/null; cat /etc/bind/named.conf.local 2>/dev/null)
+[RESULT] {"result":{"host1":["options {\n\tdirectory \"/var/cache/bind\";\n\n\t// If there is a firewall between you and nameservers you want\n\t// to talk to, you may need to fix the firewall to allow multiple\n\t// ports to talk.  See http://www.kb.cert.org/vuls/id/800113\n\n\t// If your ISP provided one or more IP addresses for stable \n\t// nameservers, you probably want to use them as forwarders.  \n\
+[TEXT] Found it. `recursion no;` in named.conf. Let me verify the zone file still exists (ticket says "wiped").
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'dns_server', 'command': 'cat /etc/bind/db.local'})
+[RESULT] {"result":"$TTL 1H\n@   IN  SOA ns1.local. admin.local. (\n        2025111101 ; Serial\n        1H         ; Refresh\n        15M        ; Retry\n        1W         ; Expire\n        1D )       ; Minimum\n\n    IN  NS  ns1.local.\nns1 IN  A   10.200.0.2\nweb0 IN  A  10.200.0.3\nweb1 IN  A  10.200.0.4\nweb2 IN  A  10.200.0.5\nweb3 IN  A  10.200.0.6"}
+[TEXT] Zone data intact. Root cause confirmed: `recursion no;` in named.conf.
+
+=== DIAGNOSIS ===
+is_anomaly: true
+faulty_devices: dns_server
+diagnosis_text:
+The BIND9 DNS server (`dns_server`, IP 10.200.0.2) is running but has `recursion no;` set in its options block in `/etc/bind/named.conf`. This single directive is the sole cause of the outage.
+
+**Mechanism:** Client resolvers (e.g., `host_1_1_1_1` using `nameserver 10.200.0.2`) send standard recursive queries with the RD (Recursion Desired) flag set. When BIND receives a query with RD=1 and recursion is disabled, it returns `REFUSED` rather than answering — confirmed directly by `dig` returning `status: REFUSED` with `recursion requested but not available`. The zone file itself (`/etc/bind/db.local`) is completely intact with all `A` records 
+[FINAL] stop=end_turn tool_calls=5
+[SUBMITTED] parsed_ok=True is_anomaly=True faulty_devices=['dns_server']
+[FINAL-TEXT] Zone data intact. Root cause confirmed: `recursion no;` in named.conf.
+
+=== DIAGNOSIS ===
+is_anomaly: true
+faulty_devices: dns_server
+diagnosis_text:
+The BIND9 DNS server (`dns_server`, IP 10.200.0.2) is running but has `recursion no;` set in its options block in `/etc/bind/named.conf`. This single directive is the sole cause of the outage.
+
+**Mechanism:** Client resolvers (e.g., `host_1_1_1_1` using `nameserver 10.200.0.2`) send standard recursive queries with the RD (Recursion Desired) flag set. When BIND receives a query with RD=1 and recursion is disabled, it returns `REFUSED` rather than answering — confirmed directly by `dig` returning `status: REFUSED` with `recursion requested but not available`. The zone file itself (`/etc/bind/db.local`) is completely intact with all `A` records for web0–web3 and ns1 under the `.local` zone.
+
+**Localization:** Fault is entirely on `dns_server`, inside `/etc/bind/named.conf`, in the `options {}` block: `recursion no;`.
+
+**Root cause:** Someone changed `recursion yes` (or removed the default) to `recursion no` in the BIND options, stripping all recursive resolution capability from the name server.
+
+**Corrective fix:** On `dns_server`, edit `/etc/bind/named.conf`, change `recursion no;` to `recursion yes;`, and reload BIND (`systemctl reload named`). Optionally scope with `allow-recursion { 10.0.0.0/8; };` to restrict recursion to internal clients only.
+=== END ===

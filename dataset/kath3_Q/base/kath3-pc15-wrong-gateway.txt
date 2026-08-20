@@ -1,0 +1,73 @@
+==================================================
+Scenario: kath3-pc15-wrong-gateway
+Topology: Kath3
+Fault family: host misconfig (default gateway)
+==================================================
+
+[PROMPT-TO-AGENT]
+PC15 (172.18.51.15) in Location B's wired VLAN 51 reports it cannot
+reach the wireless segment (172.18.50.x) where Laptop4 lives, even
+though other VLAN 51 hosts (PC16, PC17, PC18) can reach Laptop4
+without trouble. PC15 can still ping its neighbors on its own subnet.
+What is wrong with PC15?
+
+[INJECTION]
+device: pc15
+action: replace default route with a non-existent next-hop
+cmd: |
+  ip route del default
+  ip route add default via 172.18.51.250
+
+[POST-INJECT-CHECK]
+pc15  ip route show default | grep -c 172.18.51.250   => expect 1
+pc15  ping -W2 -c2 172.18.51.18                  => expect 0% loss   (intra-VLAN still works)
+pc15  ping -W2 -c2 172.18.50.14                  => expect loss>0     (cross-VLAN broken)
+
+[GROUND-TRUTH]
+Affected component: pc15 default route / default gateway
+Mechanism: pc15's default route points to 172.18.51.250, which
+  is not a configured device on the segment. ARP for that
+  address fails, so any packet PC15 tries to send off-subnet
+  (e.g., to Laptop4 in VLAN 50) has no working next hop. Local
+  L2 reachability within 172.18.51.0/24 still works because
+  no routing decision is needed for same-subnet traffic.
+  Note: router6's WAN-side ACL blocks Location B -> Location A
+  by design, so off-Location reachability cannot be used as a
+  symptom signal; the diagnostic target is the wired-to-wireless
+  hop within Location B (VLAN 51 -> VLAN 50 via router6).
+Localization: pc15 (host-side, not infrastructure)
+Root cause: pc15 default gateway points at a non-existent IP
+  (172.18.51.250) instead of the real router6 SVI 172.18.51.254
+Fix: on pc15, `ip route del default && ip route add default
+  via 172.18.51.254`
+
+[FIX]
+on pc15, `ip route del default && ip route add default
+  via 172.18.51.254`
+
+[DIAGNOSTIC-PROCESS]
+1. Scope to the one affected host: confirm PC16/PC17/PC18 reach 172.18.50.x (VLAN 50)
+   without trouble while only PC15 fails -- the fault is host-specific, not
+   infrastructure-wide.
+2. Confirm intra-subnet reachability: verify PC15 can ping other VLAN 51 hosts (same
+   subnet) -- ARP and L2 within 172.18.51.0/24 work, so the NIC and switch are fine.
+3. Inspect PC15's default gateway: check `ip route show default` on pc15 -- the next-hop
+   is 172.18.51.250, which is not a configured device on the segment.
+4. Confirm the ARP for the wrong gateway fails: verify ARP for 172.18.51.250 gets no
+   reply, meaning PC15 has no working next-hop for off-subnet traffic.
+5. Localize to the host: the real gateway is router6's VLAN 51 SVI at 172.18.51.254;
+   rule out an infrastructure fault (router6 and mswitch2 are healthy for all other
+   VLAN 51 hosts). Note: Location B -> Location A cross-location pings are blocked by
+   router6's ACL by design and cannot be used as a symptom signal here.
+
+[SCORING-AXES]
+assert-identifies: pc15
+must-identify-device: pc15 (host, NOT infrastructure)
+must-identify-component: default route / default gateway
+must-distinguish-symptom-scope: only PC15 affected, not other VLAN-51 hosts
+# These axes score the outcome metric only; fix and reasoning are judged separately.
+
+[NIKA-LABEL]
+nika_label: host_incorrect_gateway
+nika_category: END_HOST_FAILURE
+in_taxonomy: true

@@ -1,0 +1,91 @@
+[AGENT] sade starts on lab=ospf_enterprise_static
+[TOOL] ToolSearch({'query': 'select:mcp__kathara_base_mcp_server__get_reachability'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_base_mcp_server__get_reachability'}]
+[TOOL] mcp__kathara_base_mcp_server__get_reachability({})
+[RESULT] {"result":"{\"hosts\":{\"host_1_1_1_1\":\"10.1.1.2\",\"host_2_1_1_1\":\"10.2.1.2\",\"web_server_0\":\"10.200.0.3\",\"web_server_1\":\"10.200.0.4\",\"web_server_2\":\"10.200.0.5\",\"web_server_3\":\"10.200.0.6\",\"dns_server\":\"10.200.0.2\"},\"results\":[{\"src\":\"dns_server\",\"dst\":\"web_server_1\",\"dst_ip\":\"10.200.0.4\",\"tx\":2,\"rx\":2,\"loss_percent\":0.0,\"time_ms\":1077.0,\"rtt_avg_ms
+[TEXT] ## Phase 1 complete — Phase 2 Branch
+
+**Observation:** Both `host_1_1_1_1` and `host_2_1_1_1` show `status="unknown"` (null tx/rx/loss) for `web_server_1` (10.200.0.4), while `dns_server`, `web_server_0`, `web_server_2`, and `web_server_3` all reach `web_server_1` with 0% loss.
+
+Per the rules, `status="unknown"` with null fields is **unconfirmed** — it could be a name-resolution failure before the ping, not a path failure. I must re-test with direct-IP probes before branching.
+[TOOL] ToolSearch({'query': 'select:mcp__kathara_base_mcp_server__exec_shell'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_base_mcp_server__exec_shell'}]
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'host_1_1_1_1', 'command': 'ping -c2 10.200.0.4'})
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'host_2_1_1_1', 'command': 'ping -c2 10.200.0.4'})
+[RESULT] {"result":"[TIMEOUT] Command 'ping -c2 10.200.0.4' on 'host_1_1_1_1' exceeded 10s."}
+[RESULT] {"result":"[TIMEOUT] Command 'ping -c2 10.200.0.4' on 'host_2_1_1_1' exceeded 10s."}
+[TEXT] ## Phase 2 → Phase 3: Real Symptom Confirmed
+
+Both direct-IP pings **timed out** — this is a genuine path failure, not a name-resolution artifact. The symptom is clear:
+- `host_1_1_1_1` → `10.200.0.4` (web_server_1): **TIMEOUT**
+- `host_2_1_1_1` → `10.200.0.4` (web_server_1): **TIMEOUT**
+- `dns_server` → `10.200.0.4`: **OK** (0% loss)
+- `web_server_0/2/3` → `10.200.0.4`: **OK** (0% loss)
+
+**Active lead:** Both host pods cannot reach `web_server_1` (10.200.0.4) via direct IP, while same-server-farm nodes can reach it fine. The issue is isolated to `web_server_1` when the source is outside the server subnet.
+
+The "same-subnet sources succeed, cross-subnet sources fail" pattern is the fingerprint of a **wrong or missing default gateway** on `web_server_1` — replies to external IPs would be un
+[TOOL] Skill({'skill': 'host-ip-skill'})
+[RESULT] Launching skill: host-ip-skill
+[TEXT] The skill confirms the approach. Now I'll run the `host_path_snapshot` helper — the specialist for routing/gateway state on a specific host — targeting `web_server_1` to check its default gateway and return-path routing.
+[TOOL] ToolSearch({'query': 'select:mcp__helper_server__run_helper'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__helper_server__run_helper'}]
+[TOOL] mcp__helper_server__run_helper({'script_name': 'host_path_snapshot', 'args': ['--host', 'web_server_1', '--target', '10.1.1.2']})
+[RESULT] {"result":"[helper exited rc=2]\nusage: host_path_snapshot.py [-h] [--lab LAB] [--device DEVICES]\n                             [--group {hosts,routers,switches,servers,bmv2_switches,ovs_switches,sdn_controllers,all}]\n                             [--target-ip TARGET_IP]\n                             [--target-device TARGET_DEVICE] [--json]\n                             [device_args ...]\nhost_pat
+[TOOL] mcp__helper_server__run_helper({'script_name': 'host_path_snapshot', 'args': ['--device', 'web_server_1', '--target-ip', '10.1.1.2']})
+[RESULT] {"result":"=== HOST PATH SNAPSHOT ===\nLab: ospf_enterprise_static\nTarget: 10.1.1.2\n\nweb_server_1\n  L3 context: ipv4=yes default_route=no resolvers=0\n  Route to 10.1.1.2: via=(direct) dev=? src=?\n    raw: RTNETLINK answers: Network is unreachable\n  Flags: no_default_route\n"}
+[TEXT] **Found it.** `web_server_1` has **no default route** — `default_route=no`, flag `no_default_route`, and `ip route get 10.1.1.2` returns `RTNETLINK answers: Network is unreachable`.
+
+Let me verify this against a healthy peer (`web_server_0`) to confirm distinctiveness, and check web_server_1's actual interface/gateway config:
+[TOOL] mcp__helper_server__run_helper({'script_name': 'host_path_snapshot', 'args': ['--device', 'web_server_0', '--target-ip', '10.1.1.2']})
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'web_server_1', 'command': 'ip route show; echo "---"; ip addr show eth0'})
+[RESULT] {"result":"=== HOST PATH SNAPSHOT ===\nLab: ospf_enterprise_static\nTarget: 10.1.1.2\n\nweb_server_0\n  L3 context: ipv4=yes default_route=yes resolvers=0\n  Route to 10.1.1.2: via=10.200.0.1 dev=eth0 src=10.200.0.3\n    raw: 10.1.1.2 via 10.200.0.1 dev eth0 src 10.200.0.3 uid 0\n  Next-hop neighbor: lladdr=36:58:2b:41:37:a1 state=STALE\n  Flags: none\n"}
+[RESULT] {"result":"10.200.0.0/24 dev eth0 proto kernel scope link src 10.200.0.4 \n\"---\"\n2985: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UP group default qlen 1000\n    link/ether c2:a5:cd:6f:5c:59 brd ff:ff:ff:ff:ff:ff\n    inet 10.200.0.4/24 scope global eth0\n       valid_lft forever preferred_lft forever"}
+[TEXT] **Differential is conclusive.** 
+
+| Device | Default route | Route to 10.1.1.2 |
+|---|---|---|
+| `web_server_0` (healthy) | **yes** | `via 10.200.0.1 dev eth0` |
+| `web_server_1` (faulty) | **no** | `RTNETLINK: Network is unreachable` |
+
+`web_server_1`'s routing table contains only the directly-connected kernel route (`10.200.0.0/24 dev eth0`). There is no default gateway (`0.0.0.0/0`) entry. The gateway IP `10.200.0.1` is missing entirely.
+
+**Mechanism confirmed:**
+- Pings from `host_1_1_1_1` (10.1.1.2) and `host_2_1_1_1` (10.2.1.2) arrive at `web_server_1` via the OSPF-routed path through the core.
+- `web_server_1` needs to route the ICMP reply (and TCP SYN-ACK for HTTP) back to 10.1.x.x / 10.2.x.x via the gateway (10.200.0.1).
+- Without a default route, the kernel returns "Network is un
+[FINAL] stop=end_turn tool_calls=11
+[SUBMITTED] parsed_ok=True is_anomaly=True faulty_devices=['web_server_1']
+[FINAL-TEXT] **Differential is conclusive.** 
+
+| Device | Default route | Route to 10.1.1.2 |
+|---|---|---|
+| `web_server_0` (healthy) | **yes** | `via 10.200.0.1 dev eth0` |
+| `web_server_1` (faulty) | **no** | `RTNETLINK: Network is unreachable` |
+
+`web_server_1`'s routing table contains only the directly-connected kernel route (`10.200.0.0/24 dev eth0`). There is no default gateway (`0.0.0.0/0`) entry. The gateway IP `10.200.0.1` is missing entirely.
+
+**Mechanism confirmed:**
+- Pings from `host_1_1_1_1` (10.1.1.2) and `host_2_1_1_1` (10.2.1.2) arrive at `web_server_1` via the OSPF-routed path through the core.
+- `web_server_1` needs to route the ICMP reply (and TCP SYN-ACK for HTTP) back to 10.1.x.x / 10.2.x.x via the gateway (10.200.0.1).
+- Without a default route, the kernel returns "Network is unreachable" and drops the reply — the host sees a timeout.
+- Same-farm hosts (10.200.0.x subnet) communicate via L2/ARP directly — no gateway needed — so those pings succeed.
+
+---
+
+=== DIAGNOSIS ===
+is_anomaly: true
+faulty_devices: web_server_1
+diagnosis_text:
+**Affected component:** Default gateway (default route) missing from `web_server_1`'s routing table.
+
+**Mechanism:** `web_server_1` (10.200.0.4) has only one route: the locally-attached kernel route `10.200.0.0/24 dev eth0`. There is no `default via 10.200.0.1` entry. When user hosts in pod 1 (10.1.1.x) or pod 2 (10.2.1.x) send an ICMP echo request or TCP SYN to 10.200.0.4, the packets arrive correctly via the OSPF-routed core. However, when `web_server_1` attempts to send the reply back to a non-local subnet (e.g., 10.1.1.2), the kernel finds no matching route and returns "RTNETLINK answers: Network is unreachable" — silently discarding the outbound packet. From the user's perspective, pings and HTTP connections time out with no response.
+
+**Why same-farm hosts work:** `dns_server` (10.200.0.2), `web_server_0/2/3` (10.200.0.3/5/6) all share the `10.200.0.0/24` subnet. Replies to them are delivered via L2/ARP directly on the same segment — no gateway is consulted — so those exchanges complete normally. This perfectly explains the asymmetry reported: "dns_server can ping 10.200.0.4" while user-pod hosts cannot.
+
+**Localization:** `web_server_1`, interface `eth0`. Its healthy peer `web_server_0` carries `default via 10.200.0.1 dev eth0`; `web_server_1` carries nothing beyond the kernel-attached route.
+
+**Root cause:** The default gateway (`10.200.0.1`) is absent from `web_server_1`'s routing table, preventing it from replying to any traffic originating outside the 10.200.0.0/24 server subnet.
+
+**Fix:** On `web_server_1`, run `ip route add default via 10.200.0.1`. To make it persistent, add `gateway 10.200.0.1` (or equivalent) to the interface's static configuration file.
+=== END ===

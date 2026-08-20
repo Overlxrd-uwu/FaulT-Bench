@@ -1,0 +1,151 @@
+{
+  "scenario": {
+    "scenario_id": "kath1-dswa1-vlan10-svi-down-misdirected",
+    "topology": "Kath1",
+    "fault_family": "SVI down (misdirected prompt)",
+    "prompt_to_agent": "Ticket #5091: PC1 (10.1.0.100) and the other VLAN 10 hosts in Office A report\ntheir default gateway (10.1.0.1) is intermittently unreachable -- it eventually\nresponds but latency is high. VLAN 40 (Laptop1) and VLAN 99 are unaffected.\nThe on-site tech swapped the patch cable and is now convinced the access switch\naswa2 has failed and is dropping frames intermittently; they want approval to\nreplace aswa2. Please confirm the aswa2 hardware failure and identify the port.",
+    "injection": {
+      "device": "dswa1",
+      "action": "bring down the VLAN 10 SVI (br0.10)",
+      "command": "ip link set br0.10 down",
+      "note": null
+    },
+    "pre_check": [],
+    "post_inject_check": [
+      {
+        "device": "dswa1",
+        "command": "ip -br link show br0.10 | grep -c UP",
+        "expect": "0"
+      }
+    ],
+    "ground_truth": "The root cause is IDENTICAL to kath1-dswa1-vlan10-svi-down: the VLAN 10 SVI\n(br10, 10.1.0.2/24) on dswa1 is administratively down. dswa1 is the VRRP MASTER\nfor the VLAN 10 VIP 10.1.0.1 (priority 105); when its br10 SVI goes down,\nkeepalived on dswa1 stops sending VRRP advertisements and dswa2 (BACKUP,\npriority 1) eventually takes over the VIP. That failover handoff -- not a flaky\ncable -- produces the intermittent-then-restored, higher-latency reachability\npattern the users observe (once dswa2 is MASTER, PC1 reaches the gateway again\nbut via an extra L2 hop).\n\nThe TWIST: the ticket blames aswa2 and asks to replace it. aswa2 is HEALTHY --\nit is a pure L2 access switch that merely forwards frames for VLAN 10; it does\nnot own the gateway VIP and cannot cause a VRRP failover. The \"intermittent\ngateway\" symptom looks like a flaky access port to a first-responder, but the\nintermittency is the VRRP MASTER->BACKUP handoff at L3, which originates on the\ndistribution switch, not the access switch. A decisive tell: ALL VLAN 10 hosts\n(across every access switch) see the same gateway intermittency simultaneously\n-- a single failing aswa2 port could only affect the hosts behind that one\nswitch, not the whole VLAN. VLAN 40/99, which dswa1 still serves normally, are\nunaffected, which further localizes the fault to the VLAN 10 SVI specifically.\n\nCorrect diagnosis: is_anomaly=true, faulty_devices = dswa1 (VLAN 10 SVI / br10\ndown). The agent must localize from the VRRP/SVI evidence and explicitly NOT\npin the fault on aswa2 or approve a hardware swap. An agent that \"confirms the\naswa2 failure\" has followed the accusation instead of the evidence. Fix:\n`ip link set br10 up` on dswa1.",
+    "fix_spec": "`ip link set br10 up` on dswa1",
+    "scoring_axes": [
+      "assert-identifies: dswa1",
+      "assert-not-identifies: aswa2",
+      "must-identify-svi-gateway-down: VLAN 10 SVI / br10 down causing VRRP MASTER->BACKUP failover",
+      "bonus-exonerates-aswa2: notes aswa2 is a healthy L2 access switch and does not own the gateway VIP"
+    ],
+    "source_path": "dataset/kath1_Q/cex/kath1-dswa1-vlan10-svi-down-misdirected.txt",
+    "scenario_class": "wrong-device",
+    "ticket_style": "standard"
+  },
+  "agent": "cc-baseline",
+  "timestamp": "2026-07-29T16:52:34.853604+00:00",
+  "phases": {
+    "lstart": {
+      "ok": true,
+      "containers": 20,
+      "expected": 20
+    },
+    "settle": {
+      "converge_wait": 90
+    },
+    "injection": {
+      "applied": true,
+      "skipped_reason": null,
+      "rc": 0,
+      "output": ""
+    },
+    "post_inject_check": {
+      "results": [
+        {
+          "line": {
+            "device": "dswa1",
+            "command": "ip -br link show br0.10 | grep -c UP",
+            "expect": "0"
+          },
+          "passed": true,
+          "actual": "0",
+          "rationale": "got 0, expected 0"
+        }
+      ],
+      "wait_seconds": 0
+    },
+    "agent": {
+      "diagnosis_text": "The fault is on dswa1: its VLAN 10 SVI (`br0.10`) has been administratively\nbrought DOWN post-startup. The device's own startup script explicitly executes\n`ip link set br0.10 up`, yet `ip link show br0.10` confirms the interface is\ncurrently in state DOWN with no UP/LOWER_UP flags. Every other SVI on dswa1\n(br0.20, br0.40, br0.99) is UP and healthy \u2014 the suppression is specific to\nVLAN 10.\n\ndswa1 is the VRRP MASTER (priority 105, virtual_router_id 10) for the VLAN 10\ngateway VIP 10.1.0.1, bound to interface br0.10. With br0.10 down, dswa1 could\nnot send VRRP advertisements. dswa2 (BACKUP, priority 1) timed out waiting for\nthose advertisements and promoted itself to MASTER, acquiring 10.1.0.1/32 on\nits own br0.10 \u2014 confirmed live on dswa2. Both keepalived processes have since\nexited, leaving the VIP stranded on dswa2.\n\nThe intermittent high-latency symptom arises because all VLAN 10 traffic from\nPC1 now takes an indirect L2 path: aswa2 \u2192 dswa1 (STP forwarding port, since\ndswa1 is the STP root with bridge priority 4096) \u2192 dswa1's bridge peer link\n(bond0) \u2192 dswa2, which holds the only active gateway. The direct path\naswa2.eth2 \u2192 dswa2 is STP-blocked. During the VRRP failover dead-interval\n(advert_int 4 s \u00d7 ~3 = ~12 s), the VIP was absent entirely \u2014 explaining the\n\"intermittent unreachability\" phase. VLANs 40 and 99 are unaffected because\ndswa1's br0.40 and br0.99 remain UP.\n\naswa2 is fully healthy: no interface errors, correct VLAN membership, and\nnormal STP port states. The on-site tech's hardware-failure hypothesis is\nincorrect.\n\nRoot cause: dswa1's VLAN 10 SVI (br0.10) was administratively shut down,\ncollapsing the VRRP MASTER role and eliminating the direct L3 gateway for all\nOffice-A VLAN 10 hosts.\n\nCorrective fix: On dswa1, run `ip link set br0.10 up` to restore the SVI, then\n`systemctl start keepalived` on both dswa1 and dswa2 so dswa1 re-wins the VRRP\nelection (priority 105 beats dswa2's priority 1) and reclaims 10.1.0.1 as\nMASTER, restoring optimal forwarding.",
+      "is_anomaly": true,
+      "faulty_devices": [
+        "dswa1"
+      ],
+      "parsed_ok": true,
+      "in_tokens": 11,
+      "cache_read_tokens": 140893,
+      "cache_write_tokens": 39123,
+      "out_tokens": 14709,
+      "cost_usd": 0.41237314999999997,
+      "tool_calls": 17,
+      "hit_max_turns": false,
+      "error": null
+    },
+    "score": {
+      "must_passed": 3,
+      "must_total": 3,
+      "bonus_passed": 1,
+      "bonus_total": 1,
+      "outcome_score": 1.0,
+      "fix_score": 1.0,
+      "reasoning_score": 0.8333333333333334,
+      "reasoning_dims": {
+        "grounding": 0.8,
+        "causality": 0.8,
+        "coverage": 0.9
+      },
+      "final_score": 1.0,
+      "per_axis": [
+        {
+          "axis": "assert-identifies: dswa1",
+          "kind": "assert",
+          "score": 1.0,
+          "rationale": "culprit 'dswa1' named (good)"
+        },
+        {
+          "axis": "assert-not-identifies: aswa2",
+          "kind": "assert",
+          "score": 1.0,
+          "rationale": "decoy 'aswa2' absent (good)"
+        },
+        {
+          "axis": "must-identify-svi-gateway-down: VLAN 10 SVI / br10 down causing VRRP MASTER->BACKUP failover",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "Agent correctly identifies dswa1's VLAN 10 SVI (br0.10) as administratively down, causing the VRRP MASTER\u2192BACKUP failover rather than a failure of aswa2."
+        },
+        {
+          "axis": "bonus-exonerates-aswa2: notes aswa2 is a healthy L2 access switch and does not own the gateway VIP",
+          "kind": "bonus",
+          "score": 1.0,
+          "rationale": "The agent explicitly states aswa2 is healthy (no interface errors, correct VLANs, normal STP) and clarifies the gateway VIP is owned by the distribution devices (dswa1/dswa2), exonerating aswa2."
+        },
+        {
+          "axis": "[FIX]",
+          "kind": "fix",
+          "score": 1.0,
+          "rationale": "It directs bringing the VLAN 10 SVI back up on dswa1 (ip link set br0.10 up) and restarting keepalived so dswa1 reclaims the VRRP VIP, which will restore correct operation."
+        },
+        {
+          "axis": "reason:grounding",
+          "kind": "reason-dim",
+          "score": 0.8,
+          "rationale": "Investigation log shows dswa1's br0.10 is DOWN while dswa2's br0.10 is UP and the agent validated keepalived/VRRP roles and aswa2 port health; the conclusions follow logically though a few specific assertions (exact priority numbers, STP block location, 'all hosts' observation) are only partially evidenced in the log."
+        },
+        {
+          "axis": "reason:causality",
+          "kind": "reason-dim",
+          "score": 0.8,
+          "rationale": "Investigation log shows dswa1's br0.10 is DOWN while dswa2's br0.10 is UP and the agent validated keepalived/VRRP roles and aswa2 port health; the conclusions follow logically though a few specific assertions (exact priority numbers, STP block location, 'all hosts' observation) are only partially evidenced in the log."
+        },
+        {
+          "axis": "reason:coverage",
+          "kind": "reason-dim",
+          "score": 0.9,
+          "rationale": "Investigation log shows dswa1's br0.10 is DOWN while dswa2's br0.10 is UP and the agent validated keepalived/VRRP roles and aswa2 port health; the conclusions follow logically though a few specific assertions (exact priority numbers, STP block location, 'all hosts' observation) are only partially evidenced in the log."
+        }
+      ],
+      "judge_model": "gpt-5-mini",
+      "reasoning_mode": "trace",
+      "error": null
+    }
+  },
+  "agent_input_prompt": "# Topology overview (devices + L2 connectivity)\nTopology: Kath1\n\nDevices:\n  aswa1: eth0=CD_CLIENT_A1, eth1=CD_LINK_A2, eth2=CD_DSW_1_A1, eth3=CD_DSW_2_A1\n  aswa2: eth0=link_a2_pc, eth1=CD_DSW_1_A2, eth2=CD_DSW_2_A2\n  aswa3: eth0=CD_CLIENT_A3, eth1=CD_DSW_1_A3, eth2=CD_DSW_2_A3\n  aswb1: eth0=CD_CLIENT_B1, eth1=CD_DSW_1_B1, eth2=CD_DSW_2_B1\n  aswb2: eth0=CD_CLIENT_B2, eth1=CD_DSW_1_B2, eth2=CD_DSW_2_B2\n  aswb3: eth0=CD_CLIENT_B3, eth1=CD_DSW_1_B3, eth2=CD_DSW_2_B3\n  csw1: eth0=CD_WAN_LINK_1, eth1=CD_CORE_PEER_1, eth2=CD_CORE_PEER_2, eth3=CD_CORE_1_DSW1, eth4=CD_CORE_1_DSW2, eth5=CD_CORE_1_DSWB1, eth6=CD_CORE_1_DSWB2\n  csw2: eth0=CD_WAN_LINK_2, eth1=CD_CORE_PEER_1, eth2=CD_CORE_PEER_2, eth3=CD_CORE_2_DSW1, eth4=CD_CORE_2_DSW2, eth5=CD_CORE_2_DSWB1, eth6=CD_CORE_2_DSWB2\n  dswa1: eth0=CD_DSW_1_A1, eth1=CD_DSW_1_A2, eth2=CD_DSW_1_A3, eth3=CD_DSW_PEER_1, eth4=CD_DSW_PEER_2, eth5=CD_CORE_1_DSW1, eth6=CD_CORE_2_DSW1\n  dswa2: eth0=CD_DSW_2_A1, eth1=CD_DSW_2_A2, eth2=CD_DSW_2_A3, eth3=CD_DSW_PEER_1, eth4=CD_DSW_PEER_2, eth5=CD_CORE_1_DSW2, eth6=CD_CORE_2_DSW2\n  dswb1: eth0=CD_DSW_1_B1, eth1=CD_DSW_1_B2, eth2=CD_DSW_1_B3, eth3=CD_DSW_PEER_B_1, eth4=CD_DSW_PEER_B_2, eth5=CD_CORE_1_DSWB1, eth6=CD_CORE_2_DSWB1\n  dswb2: eth0=CD_DSW_2_B1, eth1=CD_DSW_2_B2, eth2=CD_DSW_2_B3, eth3=CD_DSW_PEER_B_1, eth4=CD_DSW_PEER_B_2, eth5=CD_CORE_1_DSWB2, eth6=CD_CORE_2_DSWB2\n  ispa: eth0=CD_ISP_R1, eth1=CD_ISPA_ISPB\n  ispb: eth0=CD_ISPB_R1, eth1=CD_ISPA_ISPB\n  laptop1: eth0=CD_LINK_A2\n  pc1: eth0=link_a2_pc\n  pc2: eth0=CD_CLIENT_A3\n  pc3: eth0=CD_CLIENT_B2\n  r1: eth0=CD_WAN_LINK_1, eth1=CD_WAN_LINK_2, eth2=CD_ISP_R1, eth3=CD_ISPB_R1\n  srv1: eth0=CD_CLIENT_B3\n\nCollision domains (shared L2 segments):\n  CD_CLIENT_A1: aswa1.eth0\n  CD_CLIENT_A3: aswa3.eth0, pc2.eth0\n  CD_CLIENT_B1: aswb1.eth0\n  CD_CLIENT_B2: aswb2.eth0, pc3.eth0\n  CD_CLIENT_B3: aswb3.eth0, srv1.eth0\n  CD_CORE_1_DSW1: csw1.eth3, dswa1.eth5\n  CD_CORE_1_DSW2: csw1.eth4, dswa2.eth5\n  CD_CORE_1_DSWB1: csw1.eth5, dswb1.eth5\n  CD_CORE_1_DSWB2: csw1.eth6, dswb2.eth5\n  CD_CORE_2_DSW1: csw2.eth3, dswa1.eth6\n  CD_CORE_2_DSW2: csw2.eth4, dswa2.eth6\n  CD_CORE_2_DSWB1: csw2.eth5, dswb1.eth6\n  CD_CORE_2_DSWB2: csw2.eth6, dswb2.eth6\n  CD_CORE_PEER_1: csw1.eth1, csw2.eth1\n  CD_CORE_PEER_2: csw1.eth2, csw2.eth2\n  CD_DSW_1_A1: aswa1.eth2, dswa1.eth0\n  CD_DSW_1_A2: aswa2.eth1, dswa1.eth1\n  CD_DSW_1_A3: aswa3.eth1, dswa1.eth2\n  CD_DSW_1_B1: aswb1.eth1, dswb1.eth0\n  CD_DSW_1_B2: aswb2.eth1, dswb1.eth1\n  CD_DSW_1_B3: aswb3.eth1, dswb1.eth2\n  CD_DSW_2_A1: aswa1.eth3, dswa2.eth0\n  CD_DSW_2_A2: aswa2.eth2, dswa2.eth1\n  CD_DSW_2_A3: aswa3.eth2, dswa2.eth2\n  CD_DSW_2_B1: aswb1.eth2, dswb2.eth0\n  CD_DSW_2_B2: aswb2.eth2, dswb2.eth1\n  CD_DSW_2_B3: aswb3.eth2, dswb2.eth2\n  CD_DSW_PEER_1: dswa1.eth3, dswa2.eth3\n  CD_DSW_PEER_2: dswa1.eth4, dswa2.eth4\n  CD_DSW_PEER_B_1: dswb1.eth3, dswb2.eth3\n  CD_DSW_PEER_B_2: dswb1.eth4, dswb2.eth4\n  CD_ISPA_ISPB: ispa.eth1, ispb.eth1\n  CD_ISPB_R1: ispb.eth0, r1.eth3\n  CD_ISP_R1: ispa.eth0, r1.eth2\n  CD_LINK_A2: aswa1.eth1, laptop1.eth0\n  CD_WAN_LINK_1: csw1.eth0, r1.eth0\n  CD_WAN_LINK_2: csw2.eth0, r1.eth1\n  link_a2_pc: aswa2.eth0, pc1.eth0\n\n# Symptom (user report)\nTicket #5091: PC1 (10.1.0.100) and the other VLAN 10 hosts in Office A report\ntheir default gateway (10.1.0.1) is intermittently unreachable -- it eventually\nresponds but latency is high. VLAN 40 (Laptop1) and VLAN 99 are unaffected.\nThe on-site tech swapped the patch cable and is now convinced the access switch\naswa2 has failed and is dropping frames intermittently; they want approval to\nreplace aswa2. Please confirm the aswa2 hardware failure and identify the port."
+}

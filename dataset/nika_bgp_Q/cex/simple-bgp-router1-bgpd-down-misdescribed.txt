@@ -1,0 +1,65 @@
+==================================================
+Scenario: simple-bgp-router1-bgpd-down-misdescribed
+Topology: simple_bgp
+Fault family: routing daemon down (misdescribed ticket)
+==================================================
+
+[PROMPT-TO-AGENT]
+Helpdesk ticket #9106: A user on pc1 (195.11.14.2) reports they have completely
+lost connectivity to the partner network -- they cannot reach pc2 (200.1.1.2) in
+the peer AS since this morning. The team insists the inter-AS physical link
+between router1 and router2 is down and want it re-cabled. Please find and confirm
+the real fault and tell us which device to restart.
+
+[INJECTION]
+device: router1
+action: kill the BGP routing daemon (and its watchdog) on router1
+cmd: pkill -9 watchfrr; pkill -9 bgpd
+
+[POST-INJECT-CHECK]
+router1   pgrep bgpd               => expect empty
+pc1       ping -W2 -c2 200.1.1.2   => expect loss>0
+
+[GROUND-TRUTH]
+The real fault is on router1: its BGP routing daemon (bgpd) has been killed, so
+the eBGP session between router1 and router2 drops and router1 loses/withdraws
+the inter-AS routes. With no route to the peer AS, pc1 (195.11.14.2) cannot reach
+pc2 (200.1.1.2). The ticket MISDESCRIBES the cause as a physical link failure,
+but the inter-AS link is UP: router1's eth0 (the inter-AS interface to router2)
+is up and carrier is fine -- this is a dead daemon, not a cut cable.
+
+The correct diagnosis identifies router1 (bgpd down) as the faulty device and
+explicitly distinguishes a daemon crash from a link failure: the inter-AS
+interface (router1 eth0) is UP, so the user's "the physical link is down"
+hypothesis is wrong. An agent that asks for the link to be re-cabled has accepted
+the ticket's misdescription instead of testing it.
+
+Observable note (lab-verified 2026-07-03): bgpd is killed together with watchfrr (its watchdog), so nothing respawns it. vtysh remains responsive via zebra, `show running-config` simply contains NO `router bgp` section, and `show daemons` no longer lists bgpd. An agent may therefore correctly describe this fault as "the bgp configuration is missing/empty on router1" -- that is the same fault observed at the config plane, and must NOT be treated as a wrong root cause.
+
+[FIX]
+Restart FRR/bgpd on router1 (`service frr restart`). Once bgpd is running again,
+the eBGP session to router2 re-establishes, router1 re-learns and re-advertises
+the inter-AS prefixes, and pc1 reaches pc2 normally. No re-cabling is needed --
+the link was up the whole time.
+
+[DIAGNOSTIC-PROCESS]
+1. Reproduce on the real path: from pc1, ping pc2 (200.1.1.2) -- it fails (no
+   route to the peer AS).
+2. Check the physical layer first, per the ticket: on router1, the inter-AS
+   interface eth0 is UP with carrier -- the link is NOT down, so the ticket's
+   premise is false.
+3. Check the control plane: the router1<->router2 eBGP session is down and on
+   router1 bgpd is not running (pgrep bgpd is empty) -> the BGP daemon is dead.
+4. Localize to router1 (bgpd down), not a link failure: the dead daemon over a
+   healthy link fully explains the symptom.
+
+[SCORING-AXES]
+assert-identifies: router1
+must-identify-bgpd-down: identifies bgpd on router1 is down, not a physical link failure
+bonus-rules-out-link: notes router1's inter-AS interface (eth0) is UP, distinguishing a daemon crash from the ticket's "link down" cause
+
+[NIKA-LABEL]
+nika_label: frr_service_down
+nika_category: NETWORK_NODE_ERROR
+in_taxonomy: true
+note: NIKA-substrate misdescribed counter-example (clean simple_bgp topology; real bgpd-down fault on router1; ticket blames a physical link failure)

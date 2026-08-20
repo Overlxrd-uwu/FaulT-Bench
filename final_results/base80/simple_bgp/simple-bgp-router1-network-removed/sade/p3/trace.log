@@ -1,0 +1,79 @@
+[AGENT] sade starts on lab=simple_bgp
+[TOOL] ToolSearch({'query': 'select:mcp__kathara_base_mcp_server__get_reachability'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_base_mcp_server__get_reachability'}]
+[TOOL] mcp__kathara_base_mcp_server__get_reachability({})
+[RESULT] {"result":"{\"hosts\":{\"pc1\":\"195.11.14.2\",\"pc2\":\"200.1.1.2\"},\"results\":[{\"src\":\"pc1\",\"dst\":\"pc2\",\"dst_ip\":\"200.1.1.2\",\"tx\":null,\"rx\":null,\"loss_percent\":null,\"time_ms\":null,\"rtt_avg_ms\":null,\"rtt_min_ms\":null,\"rtt_max_ms\":null,\"rtt_mdev_ms\":null,\"status\":\"unknown\"},{\"src\":\"pc2\",\"dst\":\"pc1\",\"dst_ip\":\"195.11.14.2\",\"tx\":null,\"rx\":null,\"loss_
+[TEXT] Both rows show `status="unknown"` with null stats — this is unconfirmed per the rules. I must re-test with direct-IP probes before entering any fault-family skill.
+[TOOL] ToolSearch({'query': 'select:mcp__kathara_base_mcp_server__exec_shell'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_base_mcp_server__exec_shell'}]
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'pc1', 'command': 'ping -c3 200.1.1.2'})
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'pc2', 'command': 'ping -c3 195.11.14.2'})
+[RESULT] {"result":"[TIMEOUT] Command 'ping -c3 200.1.1.2' on 'pc1' exceeded 10s."}
+[RESULT] {"result":"PING 195.11.14.2 (195.11.14.2) 56(84) bytes of data.\nFrom 200.1.1.1 icmp_seq=1 Destination Net Unreachable\nFrom 200.1.1.1 icmp_seq=2 Destination Net Unreachable\nFrom 200.1.1.1 icmp_seq=3 Destination Net Unreachable\n\n--- 195.11.14.2 ping statistics ---\n3 packets transmitted, 0 received, +3 errors, 100% packet loss, time 2159ms"}
+[TEXT] Real symptoms confirmed:
+- **pc1 → pc2**: 100% packet loss (timeout — no ICMP unreachable, just silence)
+- **pc2 → pc1**: `Destination Net Unreachable` from `200.1.1.1` (router2's gateway) — router2 has no route to `195.11.14.x`
+
+This is a clear routing failure with asymmetric behavior pointing squarely at BGP route advertisement. BGP session is claimed Established but routes are missing. **Active lead: `bgp-fault-skill`.**
+
+**Phase 3 — Symptom-first diagnosis**
+[TOOL] Skill({'skill': 'bgp-fault-skill'})
+[RESULT] Launching skill: bgp-fault-skill
+[TEXT] Now I'll run the BGP snapshot helper to examine BGP state across both routers.
+[TOOL] ToolSearch({'query': 'select:mcp__helper_server__run_helper'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__helper_server__run_helper'}]
+[TOOL] mcp__helper_server__run_helper({'script_name': 'bgp_snapshot'})
+[RESULT] {"result":"=== BGP SNAPSHOT ===\nLab: simple_bgp\nRouters scanned: 2\nFlags: none\n\nrouter1\n  FRR: watchfrr=yes, zebra=yes, bgpd=yes\n  ASN: 1\n  Networks: (none)\n  Loopback IPv4: 127.0.0.1/8\n  Null routes: (none)\n  BGP neighbors: 1 (Established x1)\n  Command errors: none\n\nrouter2\n  FRR: watchfrr=yes, zebra=yes, bgpd=yes\n  ASN: 2\n  Networks: 200.1.1.0/24\n  Loopback IPv4: 127.0.0.1/8\n 
+[TEXT] The BGP snapshot is definitive. Found the fault immediately:
+
+- **router1** → `Networks: (none)` — no `network` statement in its `router bgp` block → it never advertises `195.11.14.0/24` to router2
+- **router2** → `Networks: 200.1.1.0/24` — correctly advertising pc2's subnet
+
+Let me do one quick confirmation — check router2's RIB to verify it truly has no route to `195.11.14.0/24`, and check router1's RIB to confirm it received `200.1.1.0/24` (explaining why pc1's outbound packets do reach pc2).
+[TOOL] ToolSearch({'query': 'select:mcp__kathara_frr_mcp_server__frr_show_ip_route'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_frr_mcp_server__frr_show_ip_route'}]
+[TOOL] mcp__kathara_frr_mcp_server__frr_show_ip_route({'router_name': 'router1'})
+[TOOL] mcp__kathara_frr_mcp_server__frr_show_ip_route({'router_name': 'router2'})
+[RESULT] {"result":"Codes: K - kernel route, C - connected, S - static, R - RIP,\n       O - OSPF, I - IS-IS, B - BGP, E - EIGRP, N - NHRP,\n       T - Table, v - VNC, V - VNC-Direct, A - Babel, F - PBR,\n       f - OpenFabric,\n       > - selected route, * - FIB route, q - queued, r - rejected, b - backup\n       t - trapped, o - offload failure\n\nC>* 193.10.11.0/24 is directly connected, eth0, 00:02:54\
+[RESULT] {"result":"Codes: K - kernel route, C - connected, S - static, R - RIP,\n       O - OSPF, I - IS-IS, B - BGP, E - EIGRP, N - NHRP,\n       T - Table, v - VNC, V - VNC-Direct, A - Babel, F - PBR,\n       f - OpenFabric,\n       > - selected route, * - FIB route, q - queued, r - rejected, b - backup\n       t - trapped, o - offload failure\n\nC>* 193.10.11.0/24 is directly connected, eth0, 00:02:54\
+[TEXT] The routing tables deliver the complete picture:
+
+**router1 RIB:** Has `B>* 200.1.1.0/24` via router2 (BGP learned) + directly-connected `195.11.14.0/24`. Outbound path pc1→pc2 is intact.
+
+**router2 RIB:** Only two directly-connected routes — `193.10.11.0/24` and `200.1.1.0/24`. **No entry whatsoever for `195.11.14.0/24`** — confirming it was never received via BGP.
+
+This closes the diagnosis. The fault is fully localized.
+
+=== DIAGNOSIS ===
+is_anomaly: true
+faulty_devices: router1
+diagnosis_text:
+**Affected component:** The `router bgp 1` configuration block on router1 is missing a `network 195.11.14.0/24` advertisement statement.
+
+**Mechanism:** eBGP between router1 (AS 1) and router2 (AS 2) is fully Established and functional. Router2 correctly advertises `200.1.1.0/24`, which router1 i
+[FINAL] stop=end_turn tool_calls=11
+[SUBMITTED] parsed_ok=True is_anomaly=True faulty_devices=['router1']
+[FINAL-TEXT] The routing tables deliver the complete picture:
+
+**router1 RIB:** Has `B>* 200.1.1.0/24` via router2 (BGP learned) + directly-connected `195.11.14.0/24`. Outbound path pc1→pc2 is intact.
+
+**router2 RIB:** Only two directly-connected routes — `193.10.11.0/24` and `200.1.1.0/24`. **No entry whatsoever for `195.11.14.0/24`** — confirming it was never received via BGP.
+
+This closes the diagnosis. The fault is fully localized.
+
+=== DIAGNOSIS ===
+is_anomaly: true
+faulty_devices: router1
+diagnosis_text:
+**Affected component:** The `router bgp 1` configuration block on router1 is missing a `network 195.11.14.0/24` advertisement statement.
+
+**Mechanism:** eBGP between router1 (AS 1) and router2 (AS 2) is fully Established and functional. Router2 correctly advertises `200.1.1.0/24`, which router1 installs as `B>* 200.1.1.0/24 via 193.10.11.2`. However, router1 has **no `network` statement** in its BGP block — the `bgp_snapshot` shows `Networks: (none)` — so it never originates `195.11.14.0/24` into BGP. Router2's RIB contains only its two directly-connected prefixes; `195.11.14.0/24` is entirely absent.
+
+**Localization:** router1 (AS 1), FRR `bgpd`, `router bgp 1` configuration block.
+
+**Why the symptoms look asymmetric:** pc1→pc2 times out silently because router1 *does* have the forward route to `200.1.1.0/24` (learned from router2), so packets reach pc2. But pc2's reply hits router2, which has no return route, generating an ICMP "Destination Net Unreachable" sent back toward pc2 — pc1 never sees it, hence a timeout. pc2→pc1 fails immediately with "Destination Net Unreachable" *from router2 itself* (200.1.1.1) because that is the very first hop that lacks the route.
+
+**Root cause:** router1 is missing `network 195.11.14.0/24` under `router bgp 1`, so pc1's subnet is never advertised to router2.
+
+**Fix:** On router1, enter `vtysh` and add `network 195.11.14.0/24` inside `router bgp 1`, then `write memory`. Router2 will receive the prefix via eBGP and install it, restoring bidirectional reachability.
+=== END ===

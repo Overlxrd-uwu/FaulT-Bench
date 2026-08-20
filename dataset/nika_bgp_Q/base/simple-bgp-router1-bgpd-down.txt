@@ -1,0 +1,64 @@
+==================================================
+Scenario: simple-bgp-router1-bgpd-down
+Topology: simple_bgp
+Fault family: routing daemon down
+==================================================
+
+[PROMPT-TO-AGENT]
+The user on pc1 (195.11.14.2) reports they suddenly cannot reach
+pc2 (200.1.1.2) or anything else in the partner AS. pc1 can still
+ping its own gateway 195.11.14.1 normally. The partner operator
+reports their side is healthy internally: pc2 still reaches its
+gateway 200.1.1.1 fine. Diagnose.
+
+[INJECTION]
+device: router1
+action: kill the BGP routing daemon (and its watchdog) on router1
+cmd: pkill -9 watchfrr; pkill -9 bgpd
+
+[POST-INJECT-CHECK]
+router1   pgrep bgpd               => expect empty
+pc1       ping -W2 -c2 200.1.1.2   => expect loss>0
+
+[GROUND-TRUTH]
+Affected component: router1 bgpd
+Mechanism: router1 (AS 1) is pc1's only gateway and the local eBGP
+  speaker toward router2 (AS 2) over the 193.10.11.0/24 inter-AS
+  link. With bgpd dead on router1, the eBGP session to router2
+  drops: router1 loses the learned route to 200.1.1.0/24 and stops
+  advertising 195.11.14.0/24, so router2 withdraws it too. Traffic
+  between pc1 and pc2 fails in both directions. Local segments are
+  unaffected (pc1<->195.11.14.1 and pc2<->200.1.1.1 still work).
+Localization: router1
+Root cause: bgpd not running on router1
+Fix: restart FRR on router1 (`service frr restart`)
+
+Observable note (lab-verified 2026-07-03): bgpd is killed together with watchfrr (its watchdog), so nothing respawns it. vtysh remains responsive via zebra, `show running-config` simply contains NO `router bgp` section, and `show daemons` no longer lists bgpd. An agent may therefore correctly describe this fault as "the bgp configuration is missing/empty on router1" -- that is the same fault observed at the config plane, and must NOT be treated as a wrong root cause.
+
+[FIX]
+Restart FRR/bgpd on router1 (`service frr restart`). Once bgpd is running again,
+the eBGP session to router2 re-establishes, router1 re-learns and re-advertises
+the inter-AS prefixes, and pc1 reaches pc2 normally. router2 needs no change.
+
+[DIAGNOSTIC-PROCESS]
+1. Reproduce on the real path: from pc1, ping pc2 (200.1.1.2) -- it fails, while
+   pc1 -> 195.11.14.1 (its gateway on router1) still works.
+2. Check the routing table on router1: the BGP route to 200.1.1.0/24 is absent.
+3. Check the eBGP session from both ends: on router1 bgpd is not running (pgrep
+   bgpd is empty, `show daemons` lists no bgpd); router2's bgpd is up but reports
+   the peer (router1) as down.
+4. Rule out lower layers: router1's inter-AS interface eth0 (193.10.11.1) is UP
+   with carrier -- this is a daemon failure, not a link cut.
+5. Localize to router1 (bgpd down): the dead daemon fully explains the withdrawn
+   inter-AS routes and the loss of pc1<->pc2 reachability.
+
+[SCORING-AXES]
+assert-identifies: router1
+must-identify-device: router1
+must-identify-component: bgpd / BGP daemon not running
+bonus-rules-out-link: notes the inter-AS link (router1 eth0) is UP, distinguishing a daemon failure from a link cut
+
+[NIKA-LABEL]
+nika_label: frr_service_down
+nika_category: NETWORK_NODE_ERROR
+in_taxonomy: true

@@ -1,0 +1,173 @@
+{
+  "scenario": {
+    "scenario_id": "dc-clos-leaf0-spine1-link-down",
+    "topology": "dc_clos_bgp",
+    "fault_family": "link cut (fabric tier, redundancy/ECMP degradation)",
+    "prompt_to_agent": "Monitoring flagged that leaf_router_0_0's BGP session toward\nspine_router_0_1 went down and has not recovered. A couple of users\nmentioned a brief blip around that time, but traffic between pc_0_0\n(10.0.0.2) and pc_0_1 (10.0.1.2) has been flowing since --\nleaf_router_0_0 is currently reaching the fabric through\nspine_router_0_0 only. The session toward spine_router_0_0 and all\nother fabric sessions are healthy. Find what broke and where.",
+    "injection": {
+      "device": "leaf_router_0_0",
+      "action": "bring down the uplink to spine_router_0_1",
+      "command": "ip link set eth1 down",
+      "note": null
+    },
+    "pre_check": [],
+    "post_inject_check": [
+      {
+        "device": "leaf_router_0_0",
+        "command": "ip -br link show eth1 | grep -c UP",
+        "expect": "0"
+      },
+      {
+        "device": "spine_router_0_1",
+        "command": "ping -W2 -c2 172.16.0.9",
+        "expect": "loss>0"
+      }
+    ],
+    "ground_truth": "Affected component: leaf_router_0_0 eth1, the 172.16.0.8/31 fabric\n  link between leaf_router_0_0 (172.16.0.9) and spine_router_0_1\n  (172.16.0.8)\nMechanism: leaf_router_0_0 normally has two spine paths -- eth0 to\n  spine_router_0_0 (172.16.0.4/31) and eth1 to spine_router_0_1\n  (172.16.0.8/31) -- and its BGP table holds the remote host prefix\n  via both spines (the FIB installs one best path; no maximum-paths is\n  configured on this minimal fabric). With eth1 down, the leaf's\n  session to spine_router_0_1 drops and its path set for 10.0.1.0/24\n  degrades from two spine paths to one; the fabric has lost its\n  redundancy for this leaf. Steady-state reachability is preserved via\n  spine_router_0_0 (a brief reroute transient is possible while the\n  spine side ages out the dead session, since the leaf's admin-down\n  does not drop carrier on the spine's side of the bridge-based link).\nLocalization: leaf_router_0_0 eth1 (or equivalently the\n  leaf_router_0_0 <-> spine_router_0_1 link, 172.16.0.8/31 -- the DOWN\n  interface is on the leaf side; spine_router_0_1's eth1 still shows UP)\nRoot cause: leaf_router_0_0's spine-facing interface eth1 is down\nFix: `ip link set eth1 up` on leaf_router_0_0; the BGP session to\n  spine_router_0_1 re-establishes on its own.",
+    "fix_spec": "`ip link set eth1 up` on leaf_router_0_0. Once the interface is UP the\n172.16.0.8/31 link carries the session to spine_router_0_1 again and\nthe leaf regains its second spine path.",
+    "scoring_axes": [
+      "assert-identifies: leaf_router_0_0",
+      "must-identify-affected-link: leaf_router_0_0 eth1 <-> spine_router_0_1 (172.16.0.8/31)",
+      "must-identify-component: fabric interface / link down (leaf side)",
+      "must-distinguish-symptom-pattern: single session down with traffic still flowing -- redundancy degraded from two spine paths to one, not an outage",
+      "bonus-notes-path-count: shows the leaf's path set for the remote prefix dropped to a single spine path (e.g. one path in `show bgp` instead of two)"
+    ],
+    "source_path": "dataset/nika_clos_Q/base/dc-clos-leaf0-spine1-link-down.txt",
+    "scenario_class": "base",
+    "ticket_style": "standard"
+  },
+  "agent": "react-full",
+  "timestamp": "2026-08-03T05:36:08.775120+00:00",
+  "phases": {
+    "lstart": {
+      "ok": true,
+      "containers": 7,
+      "expected": 7
+    },
+    "settle": {
+      "converge_wait": 90
+    },
+    "injection": {
+      "applied": true,
+      "skipped_reason": null,
+      "rc": 0,
+      "output": ""
+    },
+    "post_inject_check": {
+      "results": [
+        {
+          "line": {
+            "device": "leaf_router_0_0",
+            "command": "ip -br link show eth1 | grep -c UP",
+            "expect": "0"
+          },
+          "passed": true,
+          "actual": "0",
+          "rationale": "got 0, expected 0"
+        },
+        {
+          "line": {
+            "device": "spine_router_0_1",
+            "command": "ping -W2 -c2 172.16.0.9",
+            "expect": "loss>0"
+          },
+          "passed": true,
+          "actual": "PING 172.16.0.9 (172.16.0.9) 56(84) bytes of data.\n\n--- 172.16.0.9 ping statistics ---\n2 packets transmitted, 0 received, 100% packet loss, time 1088ms",
+          "rationale": "loss=100%"
+        }
+      ],
+      "wait_seconds": 0
+    },
+    "agent": {
+      "diagnosis_text": "The affected component is the physical/data-plane link from leaf_router_0_0 to spine_router_0_1, specifically interface eth1 on leaf_router_0_0 where the eBGP peering to 172.16.0.8 should run. FRR on leaf_router_0_0 shows the neighbor 172.16.0.8 in Active state (show ip bgp summary), indicating TCP cannot establish. On the same device, the OS reports the interface is not operational: ip addr shows eth1 in state DOWN and ethtool reports \u201cLink detected: no.\u201d In contrast, the remote side (spine_router_0_1) has eth1 up with carrier (ip addr state UP; ethtool \u201cLink detected: yes\u201d), so the failure localizes to the leaf side of the link.\n\nThis explains the symptom pattern: with the eth1 link down, the BGP session to spine_router_0_1 cannot form, so leaf_router_0_0 forwards via its remaining uplink to spine_router_0_0; end-to-end traffic between pc_0_0 and pc_0_1 continues, but redundancy is lost and monitoring flags the missing session.\n\nRoot cause: leaf_router_0_0\u2019s interface eth1 toward spine_router_0_1 was administratively shut or lost carrier, breaking the L2/L3 adjacency and the BGP session.\n\nCorrective fix: On leaf_router_0_0, bring the interface up (ip link set dev eth1 up) and verify carrier (ethtool eth1). Confirm the BGP session establishes (show ip bgp summary) and routes are exchanged. For persistence, ensure no startup script or config leaves eth1 down and that the interface addressing and neighbor statements match (172.16.0.9/31 \u2194 172.16.0.8/31).",
+      "is_anomaly": true,
+      "faulty_devices": [
+        "leaf_router_0_0"
+      ],
+      "parsed_ok": true,
+      "in_tokens": 11732,
+      "cache_read_tokens": 11136,
+      "cache_write_tokens": 0,
+      "out_tokens": 6578,
+      "cost_usd": 0.081837,
+      "tool_calls": 11,
+      "hit_max_turns": false,
+      "error": null
+    },
+    "score": {
+      "must_passed": 4,
+      "must_total": 4,
+      "bonus_passed": 0,
+      "bonus_total": 1,
+      "outcome_score": 0.7,
+      "fix_score": 1.0,
+      "reasoning_score": 0.8666666666666667,
+      "reasoning_dims": {
+        "grounding": 0.8,
+        "causality": 0.9,
+        "coverage": 0.9
+      },
+      "final_score": 0.7,
+      "per_axis": [
+        {
+          "axis": "assert-identifies: leaf_router_0_0",
+          "kind": "assert",
+          "score": 1.0,
+          "rationale": "culprit 'leaf_router_0_0' named (good)"
+        },
+        {
+          "axis": "must-identify-affected-link: leaf_router_0_0 eth1 <-> spine_router_0_1 (172.16.0.8/31)",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The agent explicitly identifies the leaf_router_0_0 eth1 link to spine_router_0_1 (172.16.0.8/31) as the affected link and describes it as down on the leaf side."
+        },
+        {
+          "axis": "must-identify-component: fabric interface / link down (leaf side)",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "Agent correctly identified the fabric interface/link down on the leaf side (leaf_router_0_0 eth1) as the affected component and localized the failure to the leaf."
+        },
+        {
+          "axis": "must-distinguish-symptom-pattern: single session down with traffic still flowing -- redundancy degraded from two spine paths to one, not an outage",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The submission explicitly identifies a single spine BGP session down with the alternate spine remaining active so traffic continues but redundancy is lost, matching the required symptom distinction."
+        },
+        {
+          "axis": "bonus-notes-path-count: shows the leaf's path set for the remote prefix dropped to a single spine path (e.g. one path in `show bgp` instead of two)",
+          "kind": "bonus",
+          "score": 0.0,
+          "rationale": "The writeup explains the downed BGP session and loss of redundancy but does not show or state the BGP path count dropping to a single spine path (no 'show bgp' path-count evidence)."
+        },
+        {
+          "axis": "[FIX]",
+          "kind": "fix",
+          "score": 1.0,
+          "rationale": "Proposes bringing eth1 up on leaf_router_0_0 (ip link set dev eth1 up) and verifying carrier/BGP, which matches the expected fix."
+        },
+        {
+          "axis": "reason:grounding",
+          "kind": "reason-dim",
+          "score": 0.8,
+          "rationale": "The agent ran appropriate checks (reachability, BGP summaries, interface configs, ethtool, direct pings) and their conclusions logically follow the observed failures; some specific evidence lines (e.g., explicit 'eth1 state DOWN' / 'Link detected: no') are truncated in the log but implied by the ethtool/ifconfig runs and ping timeouts. Overall the investigation justifies the diagnosis."
+        },
+        {
+          "axis": "reason:causality",
+          "kind": "reason-dim",
+          "score": 0.9,
+          "rationale": "The agent ran appropriate checks (reachability, BGP summaries, interface configs, ethtool, direct pings) and their conclusions logically follow the observed failures; some specific evidence lines (e.g., explicit 'eth1 state DOWN' / 'Link detected: no') are truncated in the log but implied by the ethtool/ifconfig runs and ping timeouts. Overall the investigation justifies the diagnosis."
+        },
+        {
+          "axis": "reason:coverage",
+          "kind": "reason-dim",
+          "score": 0.9,
+          "rationale": "The agent ran appropriate checks (reachability, BGP summaries, interface configs, ethtool, direct pings) and their conclusions logically follow the observed failures; some specific evidence lines (e.g., explicit 'eth1 state DOWN' / 'Link detected: no') are truncated in the log but implied by the ethtool/ifconfig runs and ping timeouts. Overall the investigation justifies the diagnosis."
+        }
+      ],
+      "judge_model": "gpt-5-mini",
+      "reasoning_mode": "trace",
+      "error": null
+    }
+  },
+  "agent_input_prompt": "# Topology overview (devices + L2 connectivity)\nTopology: dc_clos_bgp\n\nDevices:\n  Routers (FRR): leaf_router_0_0, leaf_router_0_1, spine_router_0_0, spine_router_0_1, super_spine_router_0\n  Hosts: pc_0_0, pc_0_1\n\nLinks (device:iface <-> device:iface):\n  leaf_router_0_0:eth2 <-> pc_0_0:eth0\n  leaf_router_0_1:eth2 <-> pc_0_1:eth0\n  spine_router_0_0:eth1 <-> leaf_router_0_0:eth0\n  spine_router_0_0:eth2 <-> leaf_router_0_1:eth0\n  spine_router_0_1:eth1 <-> leaf_router_0_0:eth1\n  spine_router_0_1:eth2 <-> leaf_router_0_1:eth1\n  super_spine_router_0:eth0 <-> spine_router_0_0:eth0\n  super_spine_router_0:eth1 <-> spine_router_0_1:eth0\n\n# Symptom (user report)\nMonitoring flagged that leaf_router_0_0's BGP session toward\nspine_router_0_1 went down and has not recovered. A couple of users\nmentioned a brief blip around that time, but traffic between pc_0_0\n(10.0.0.2) and pc_0_1 (10.0.1.2) has been flowing since --\nleaf_router_0_0 is currently reaching the fabric through\nspine_router_0_0 only. The session toward spine_router_0_0 and all\nother fabric sessions are healthy. Find what broke and where."
+}

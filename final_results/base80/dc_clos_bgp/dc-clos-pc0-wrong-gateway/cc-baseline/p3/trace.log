@@ -1,0 +1,74 @@
+[AGENT] cc-baseline starts on lab=dc_clos_bgp
+[TEXT] The symptom is very specific: pc_0_0 can reach its gateway (10.0.0.1 = leaf_router_0_0 eth2) but nothing beyond. The fabric is healthy. This points squarely at pc_0_0's own host configuration — routing table, default gateway, or IP config. Let me verify directly.
+[TOOL] ToolSearch({'query': 'select:mcp__kathara_base_mcp_server__exec_shell,mcp__kathara_base_mcp_server__ip_addr_statistics', 'max_results': 2})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_base_mcp_server__exec_shell'}, {'type': 'tool_reference', 'tool_name': 'mcp__kathara_base_mcp_server__ip_addr_statistics'}]
+[TOOL] mcp__kathara_base_mcp_server__ip_addr_statistics({'host_name': 'pc_0_0'})
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'pc_0_0', 'command': 'ip route show'})
+[RESULT] {"result":"1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN group default qlen 1000\n    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00\n    inet 127.0.0.1/8 scope host lo\n       valid_lft forever preferred_lft forever\n    RX:  bytes packets errors dropped  missed   mcast           \n           224       2      0       0       0       0 \n    TX:  bytes packets errors d
+[RESULT] {"result":"default via 10.0.0.254 dev eth0 \n10.0.0.0/24 dev eth0 proto kernel scope link src 10.0.0.2"}
+[TEXT] The default gateway is **10.0.0.254** — but the user confirmed pc_0_0 can only ping 10.0.0.1. Let me verify the actual gateway address on leaf_router_0_0 eth2 and confirm 10.0.0.254 is a ghost address.
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'leaf_router_0_0', 'command': 'ip addr show eth2'})
+[RESULT] {"result":"3473: eth2: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UP group default qlen 1000\n    link/ether 02:05:97:cb:bc:6e brd ff:ff:ff:ff:ff:ff\n    inet 10.0.0.1/24 scope global eth2\n       valid_lft forever preferred_lft forever"}
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'pc_0_0', 'command': 'ip neigh show; arp -n'})
+[RESULT] {"result":"10.0.0.1 dev eth0 lladdr 02:05:97:cb:bc:6e STALE \n10.0.0.254 dev eth0 FAILED \nAddress                  HWtype  HWaddress           Flags Mask            Iface\n10.0.0.1                 ether   02:05:97:cb:bc:6e   C                     eth0\n10.0.0.254                       (incomplete)                              eth0"}
+[TEXT] All the evidence is in. The root cause is confirmed.
+
+- `leaf_router_0_0 eth2` = **10.0.0.1/24** — the correct, reachable gateway
+- `pc_0_0` default route = **via 10.0.0.254** — a non-existent address
+- ARP for 10.0.0.254 = **FAILED / incomplete** — no device owns that IP in the subnet
+
+```
+=== DIAGNOSIS ===
+is_anomaly: true
+faulty_devices: pc_0_0
+diagnosis_text:
+The fault is a misconfigured default gateway on pc_0_0. The host has a
+statically (or incorrectly) configured default route pointing to
+10.0.0.254 (via eth0), but no device in the 10.0.0.0/24 subnet owns
+that address. The ARP table on pc_0_0 confirms this: 10.0.0.254 is in
+FAILED/incomplete state, meaning every ARP request for the next-hop has
+gone unanswered.
+
+The correct gateway is leaf_router_0_0 eth2, which is configured as
+10
+[FINAL] stop=end_turn tool_calls=5
+[SUBMITTED] parsed_ok=True is_anomaly=True faulty_devices=['pc_0_0']
+[FINAL-TEXT] All the evidence is in. The root cause is confirmed.
+
+- `leaf_router_0_0 eth2` = **10.0.0.1/24** — the correct, reachable gateway
+- `pc_0_0` default route = **via 10.0.0.254** — a non-existent address
+- ARP for 10.0.0.254 = **FAILED / incomplete** — no device owns that IP in the subnet
+
+```
+=== DIAGNOSIS ===
+is_anomaly: true
+faulty_devices: pc_0_0
+diagnosis_text:
+The fault is a misconfigured default gateway on pc_0_0. The host has a
+statically (or incorrectly) configured default route pointing to
+10.0.0.254 (via eth0), but no device in the 10.0.0.0/24 subnet owns
+that address. The ARP table on pc_0_0 confirms this: 10.0.0.254 is in
+FAILED/incomplete state, meaning every ARP request for the next-hop has
+gone unanswered.
+
+The correct gateway is leaf_router_0_0 eth2, which is configured as
+10.0.0.1/24. pc_0_0 can still ping 10.0.0.1 because that destination
+is on-link and ARP for it succeeds (the ARP cache shows 10.0.0.1 →
+02:05:97:cb:bc:6e, STALE but usable). Any packet destined outside the
+local /24, however, is handed to the broken default next-hop
+10.0.0.254, where ARP resolution permanently fails and the packet is
+silently dropped. The fabric itself — BGP sessions, spine/leaf
+forwarding, leaf_router_0_0 routing — is completely healthy.
+
+The "workstation maintenance task" almost certainly overwrote the
+network configuration on pc_0_0 with a wrong gateway value (10.0.0.254
+instead of 10.0.0.1).
+
+Corrective fix: on pc_0_0, delete the stale default route and install
+the correct one:
+  ip route del default
+  ip route add default via 10.0.0.1 dev eth0
+For persistence, update /etc/network/interfaces (or the equivalent
+startup script) to set the gateway to 10.0.0.1.
+=== END ===
+```

@@ -1,0 +1,159 @@
+{
+  "scenario": {
+    "scenario_id": "ospf-enterprise-dist1-ospfd-down-misdirected",
+    "topology": "ospf_enterprise_static",
+    "fault_family": "routing daemon down (misdirected ticket)",
+    "prompt_to_agent": "Helpdesk ticket #8863: host_1_1_1_1 cannot reach anything outside its own subnet\n-- the server farm and every other pod are unreachable. The team blames the access\nswitch that host_1_1_1_1 plugs into (switch_access_1_1_1) and wants that switch\nswapped out. Please find and confirm the real fault and tell us which device to\nreplace.",
+    "injection": {
+      "device": "switch_dist_1_1",
+      "action": "kill the OSPF daemon (ospfd) on switch_dist_1_1 and stop watchfrr from respawning it",
+      "command": "pkill -9 watchfrr; pkill -9 ospfd",
+      "note": null
+    },
+    "pre_check": [],
+    "post_inject_check": [
+      {
+        "device": "switch_dist_1_1",
+        "command": "pgrep ospfd",
+        "expect": "empty"
+      },
+      {
+        "device": "host_1_1_1_1",
+        "command": "ping -W2 -c2 10.200.0.2",
+        "expect": "loss>0"
+      }
+    ],
+    "ground_truth": "The real fault is on switch_dist_1_1 (the pod-1 distribution router): its ospfd\n(the OSPF routing daemon) has been killed, so the pod-1 routes it normally\nadvertises are withdrawn and host_1_1_1_1 is isolated from everything beyond its\nsubnet (ping to 10.200.0.2 fails). The ticket MISDIRECTS to the access switch, but\nswitch_access_1_1_1 is fine: host_1_1_1_1 still reaches its default gateway and its\nintra-subnet peers, so L2 access works -- the break is at L3 routing on the\ndistribution router, not at the access layer.\n\nThe correct diagnosis identifies switch_dist_1_1 (ospfd down) as the faulty device\nand explicitly EXONERATES switch_access_1_1_1: intra-subnet connectivity works, so\nthe user's \"the access switch is bad\" hypothesis is wrong. An agent that replaces /\nblames switch_access_1_1_1 has followed the ticket's misdirection instead of the\nevidence.\n\nObservable note (lab-verified 2026-07-03): ospfd is killed together with watchfrr (its watchdog), so nothing respawns it. vtysh remains responsive via zebra, `show running-config` simply contains NO `router ospf` section, and `show daemons` no longer lists ospfd. An agent may therefore correctly describe this fault as \"the ospf configuration is missing/empty on switch_dist_1_1\" -- that is the same fault observed at the config plane, and must NOT be treated as a wrong root cause.",
+    "fix_spec": "Restart FRR / the OSPF daemon on switch_dist_1_1 (`service frr restart`). Once\nospfd is running again, pod-1 re-advertises its routes, OSPF re-converges, and\nhost_1_1_1_1 reaches the server farm and the other pods. The access switch needs\nno change.",
+    "scoring_axes": [
+      "assert-identifies: switch_dist_1_1",
+      "assert-not-identifies: switch_access_1_1_1",
+      "must-identify-ospfd-down: identifies ospfd is down on switch_dist_1_1 (pod-1 distribution), the L3 cause, not the access switch"
+    ],
+    "source_path": "dataset/nika_ospf_Q/cex/ospf-enterprise-dist1-ospfd-down-misdirected.txt",
+    "scenario_class": "wrong-device",
+    "ticket_style": "standard"
+  },
+  "agent": "cc-baseline",
+  "timestamp": "2026-07-31T00:55:47.495277+00:00",
+  "phases": {
+    "lstart": {
+      "ok": true,
+      "containers": 15,
+      "expected": 15
+    },
+    "settle": {
+      "converge_wait": 90
+    },
+    "injection": {
+      "applied": true,
+      "skipped_reason": null,
+      "rc": 0,
+      "output": ""
+    },
+    "post_inject_check": {
+      "results": [
+        {
+          "line": {
+            "device": "switch_dist_1_1",
+            "command": "pgrep ospfd",
+            "expect": "empty"
+          },
+          "passed": true,
+          "actual": "",
+          "rationale": "output empty"
+        },
+        {
+          "line": {
+            "device": "host_1_1_1_1",
+            "command": "ping -W2 -c2 10.200.0.2",
+            "expect": "loss>0"
+          },
+          "passed": true,
+          "actual": "PING 10.200.0.2 (10.200.0.2) 56(84) bytes of data.\nFrom 10.1.1.1 icmp_seq=1 Destination Net Unreachable\nFrom 10.1.1.1 icmp_seq=2 Destination Net Unreachable\n\n--- 10.200.0.2 ping statistics ---\n2 packets transmitted, 0 received, +2 errors, 100% packet loss, time 1016ms",
+          "rationale": "loss=100%"
+        }
+      ],
+      "wait_seconds": 0
+    },
+    "agent": {
+      "diagnosis_text": "The fault is on **switch_dist_1_1**, the distribution/gateway router for host_1_1_1_1's subnet \u2014 not the access switch the team suspected.\n\n**Affected component:** The `ospfd` daemon (FRR's OSPF routing process) on switch_dist_1_1.\n\n**Mechanism:** switch_dist_1_1 acts as the Layer-3 default gateway for host_1_1_1_1 (10.1.1.1/24 on br0, uplink 172.16.0.7/31 toward router_core_1). Its `/etc/frr/frr.conf` and `/etc/frr/daemons` (ospfd=yes) are both correctly configured. ospfd started at boot, loaded its config, and briefly formed a Full OSPF adjacency with router_core_1 (neighbor 172.16.0.0). About 50 seconds later the FRR log recorded: *\"Client 'ospf' (session id 0) encountered an error and is shutting down\"* \u2014 zebra removed 9 OSPF routes from the RIB. The ospfd process terminated and never restarted. `watchfrr` is also not running on this device, so there is no crash-recovery supervisor to bring ospfd back up.\n\n**Localization:** switch_dist_1_1, ospfd process. The kernel routing table now contains only two directly-connected entries (10.1.1.0/24 and 172.16.0.6/31). Any packet arriving from host_1_1_1_1 destined outside the local /24 hits the gateway, which generates an ICMP *Destination Net Unreachable* \u2014 exactly the symptom reported. switch_access_1_1_1 is functioning normally as a pure L2 bridge; replacing it would have no effect.\n\n**Root cause:** ospfd on switch_dist_1_1 crashed after startup and was not restarted because watchfrr is absent.\n\n**Corrective fix:** Restart FRR on switch_dist_1_1 (`service frr restart` or `systemctl restart frr`) and investigate why ospfd crashed (check for a watchfrr-kill injection or ospfd core dump). Ensure watchfrr is running to guard against future daemon crashes.",
+      "is_anomaly": true,
+      "faulty_devices": [
+        "switch_dist_1_1"
+      ],
+      "parsed_ok": true,
+      "in_tokens": 16,
+      "cache_read_tokens": 161029,
+      "cache_write_tokens": 23635,
+      "out_tokens": 9095,
+      "cost_usd": 0.27458095,
+      "tool_calls": 23,
+      "hit_max_turns": false,
+      "error": null
+    },
+    "score": {
+      "must_passed": 3,
+      "must_total": 3,
+      "bonus_passed": 0,
+      "bonus_total": 0,
+      "outcome_score": 1.0,
+      "fix_score": 1.0,
+      "reasoning_score": 0.9666666666666667,
+      "reasoning_dims": {
+        "grounding": 0.9,
+        "causality": 1.0,
+        "coverage": 1.0
+      },
+      "final_score": 1.0,
+      "per_axis": [
+        {
+          "axis": "assert-identifies: switch_dist_1_1",
+          "kind": "assert",
+          "score": 1.0,
+          "rationale": "culprit 'switch_dist_1_1' named (good)"
+        },
+        {
+          "axis": "assert-not-identifies: switch_access_1_1_1",
+          "kind": "assert",
+          "score": 1.0,
+          "rationale": "decoy 'switch_access_1_1_1' absent (good)"
+        },
+        {
+          "axis": "must-identify-ospfd-down: identifies ospfd is down on switch_dist_1_1 (pod-1 distribution), the L3 cause, not the access switch",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The report explicitly pins the failure to ospfd on switch_dist_1_1 (crashed and not restarted) and exonerates the access switch, matching the required L3 diagnosis."
+        },
+        {
+          "axis": "[FIX]",
+          "kind": "fix",
+          "score": 1.0,
+          "rationale": "Recommends restarting FRR/ospfd on switch_dist_1_1 (service frr restart) and enabling watchfrr, which matches the expected remediation."
+        },
+        {
+          "axis": "reason:grounding",
+          "kind": "reason-dim",
+          "score": 0.9,
+          "rationale": "The agent's investigation log shows ospfd crashed and did not restart (frr log and frr_exec outputs), the FRR config exists, the kernel routes are only connected prefixes, and ping failures are sourced from the gateway \u2014 the writeup follows directly from these observations."
+        },
+        {
+          "axis": "reason:causality",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "The agent's investigation log shows ospfd crashed and did not restart (frr log and frr_exec outputs), the FRR config exists, the kernel routes are only connected prefixes, and ping failures are sourced from the gateway \u2014 the writeup follows directly from these observations."
+        },
+        {
+          "axis": "reason:coverage",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "The agent's investigation log shows ospfd crashed and did not restart (frr log and frr_exec outputs), the FRR config exists, the kernel routes are only connected prefixes, and ping failures are sourced from the gateway \u2014 the writeup follows directly from these observations."
+        }
+      ],
+      "judge_model": "gpt-5-mini",
+      "reasoning_mode": "trace",
+      "error": null
+    }
+  },
+  "agent_input_prompt": "# Topology overview (devices + L2 connectivity)\nTopology: ospf_enterprise_static\n\nDevices:\n  Routers (FRR): router_core_1, router_core_2, router_core_3, switch_dist_1_1, switch_dist_2_1, switch_server_access\n  Switches: switch_access_1_1_1, switch_access_2_1_1\n  Hosts: host_1_1_1_1, host_2_1_1_1\n  Dns servers: dns_server\n  Web servers: web_server_0, web_server_1, web_server_2, web_server_3\n\nLinks (device:iface <-> device:iface):\n  router_core_1:eth0 <-> router_core_2:eth0\n  router_core_1:eth1 <-> router_core_3:eth0\n  router_core_1:eth2 <-> switch_dist_1_1:eth0\n  router_core_2:eth1 <-> router_core_3:eth1\n  router_core_2:eth2 <-> switch_dist_2_1:eth0\n  router_core_3:eth2 <-> switch_server_access:eth5\n  switch_access_1_1_1:eth1 <-> host_1_1_1_1:eth0\n  switch_access_2_1_1:eth1 <-> host_2_1_1_1:eth0\n  switch_dist_1_1:eth1 <-> switch_access_1_1_1:eth0\n  switch_dist_2_1:eth1 <-> switch_access_2_1_1:eth0\n  dns_server:eth0 <-> switch_server_access:eth0\n  web_server_0:eth0 <-> switch_server_access:eth1\n  web_server_1:eth0 <-> switch_server_access:eth2\n  web_server_2:eth0 <-> switch_server_access:eth3\n  web_server_3:eth0 <-> switch_server_access:eth4\n\n# Symptom (user report)\nHelpdesk ticket #8863: host_1_1_1_1 cannot reach anything outside its own subnet\n-- the server farm and every other pod are unreachable. The team blames the access\nswitch that host_1_1_1_1 plugs into (switch_access_1_1_1) and wants that switch\nswapped out. Please find and confirm the real fault and tell us which device to\nreplace."
+}

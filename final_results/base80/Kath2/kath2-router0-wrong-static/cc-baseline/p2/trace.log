@@ -1,0 +1,46 @@
+[AGENT] cc-baseline starts on lab=Kath2
+[TOOL] ToolSearch({'query': 'kathara base mcp exec shell', 'max_results': 5})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_base_mcp_server__exec_shell'}, {'type': 'tool_reference', 'tool_name': 'mcp__kathara_base_mcp_server__exec_shell_dual'}, {'type': 'tool_reference', 'tool_name': 'mcp__kathara_base_mcp_server__cat_file'}, {'type': 'tool_reference', 'tool_name': 'mcp__kathara_base_mcp_server__curl_web_test'}, {'type': 'tool_reference', 'tool_name': 'mcp__kathara
+[TOOL] ToolSearch({'query': 'kathara frr routing table vtysh', 'max_results': 5})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_frr_mcp_server__frr_show_ip_route'}, {'type': 'tool_reference', 'tool_name': 'mcp__kathara_frr_mcp_server__frr_exec'}, {'type': 'tool_reference', 'tool_name': 'mcp__kathara_frr_mcp_server__frr_get_bgp_conf'}, {'type': 'tool_reference', 'tool_name': 'mcp__kathara_frr_mcp_server__frr_get_ospf_conf'}, {'type': 'tool_reference', 'tool_name': 'mcp_
+[TEXT] Good. Let me begin diagnosis. The symptom points to a bad route installed on router0 after an admin change. I'll pull router0's routing table and running config simultaneously to find the "temporary backup route".
+[TOOL] mcp__kathara_frr_mcp_server__frr_show_ip_route({'router_name': 'router0'})
+[TOOL] mcp__kathara_frr_mcp_server__frr_show_running_config({'router_name': 'router0'})
+[RESULT] {"result":"Codes: K - kernel route, C - connected, S - static, R - RIP,\n       O - OSPF, I - IS-IS, B - BGP, E - EIGRP, N - NHRP,\n       T - Table, v - VNC, V - VNC-Direct, A - Babel, F - PBR,\n       f - OpenFabric,\n       > - selected route, * - FIB route, q - queued, r - rejected, b - backup\n       t - trapped, o - offload failure\n\nK>* 1.0.0.0/8 [0/0] via 127.0.0.1, lo, 00:00:21\nR   1.0.
+[RESULT] {"result":"Building configuration...\n\nCurrent configuration:\n!\nfrr version 9.1.3\nfrr defaults traditional\nhostname router0\ndomainname localdomain\nno ipv6 forwarding\nno service integrated-vtysh-config\n!\nrouter rip\n network 192.168.1.0/24\n network 192.168.2.0/24\n network 10.0.0.0/8\n version 2\nexit\n!\nend"}
+[TEXT] Found the smoking gun. The routing table shows two entries for `1.0.0.0/8`:
+- `K>* 1.0.0.0/8 [0/0] via 127.0.0.1, lo` — a **kernel route with AD=0, currently selected**, pointing to loopback
+- `R   1.0.0.0/8 [120/3] via 10.10.0.2, eth2` — the legitimate RIP route, **NOT selected**
+
+The FRR running config has no static route — the kernel route was added at the OS level. Let me confirm with the kernel routing table directly.
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'router0', 'command': 'ip route show'})
+[RESULT] {"result":"1.0.0.0/8 via 127.0.0.1 dev lo \n10.0.0.0/8 dev eth2 proto kernel scope link src 10.10.0.1 \n20.0.0.0/8 nhid 8 via 10.10.0.2 dev eth2 proto rip metric 20 \n128.168.0.0/16 nhid 8 via 10.10.0.2 dev eth2 proto rip metric 20 \n192.168.1.0/24 dev eth0 proto kernel scope link src 192.168.1.1 \n192.168.2.0/24 dev eth1 proto kernel scope link src 192.168.2.1 \n192.168.3.0/24 nhid 8 via 10.10.0.
+[TEXT] That confirms everything I need. The OS kernel has `1.0.0.0/8 via 127.0.0.1 dev lo` — a manually injected route pointing to the loopback interface. This is the "temporary backup route" the admin added via `ip route add`. It has AD=0 so it wins over RIP's AD=120, and traffic to Server Room (1.0.0.x) is blackholed on router0's loopback instead of being forwarded toward router1. The `128.168.0.0/16` route has no competing kernel entry, so RIP continues to work for Internet Lab.
+
+=== DIAGNOSIS ===
+is_anomaly: true
+faulty_devices: router0
+diagnosis_text:
+An administrator added a host OS-level static route on router0 (`ip route add 1.0.0.0/8 via 127.0.0.1`) as a "temporary backup route" for the Server Room prefix. Because kernel/static routes carry an administrative distance of 0, this route win
+[FINAL] stop=end_turn tool_calls=5
+[SUBMITTED] parsed_ok=True is_anomaly=True faulty_devices=['router0']
+[FINAL-TEXT] That confirms everything I need. The OS kernel has `1.0.0.0/8 via 127.0.0.1 dev lo` — a manually injected route pointing to the loopback interface. This is the "temporary backup route" the admin added via `ip route add`. It has AD=0 so it wins over RIP's AD=120, and traffic to Server Room (1.0.0.x) is blackholed on router0's loopback instead of being forwarded toward router1. The `128.168.0.0/16` route has no competing kernel entry, so RIP continues to work for Internet Lab.
+
+=== DIAGNOSIS ===
+is_anomaly: true
+faulty_devices: router0
+diagnosis_text:
+An administrator added a host OS-level static route on router0 (`ip route add 1.0.0.0/8 via 127.0.0.1`) as a "temporary backup route" for the Server Room prefix. Because kernel/static routes carry an administrative distance of 0, this route wins unconditionally over the legitimate RIP-learned route for the same prefix (`R 1.0.0.0/8 [120/3] via 10.10.0.2, eth2`). The kernel route forwards all traffic destined for 1.0.0.x to the loopback interface (127.0.0.1 on lo), effectively blackholing it — packets never leave router0 toward router1 and router2 where the Server Room LAN resides.
+
+This explains the asymmetric symptom precisely: the Internet Lab prefix (128.168.0.0/16) has no competing kernel route, so its RIP entry remains the selected FIB entry and connectivity is intact. Only the Server Room prefix (1.0.0.0/8) is affected because the spurious kernel route shadows its RIP entry, which is still present in the RIB but marked as non-selected.
+
+The FRR running configuration on router0 contains no static route — the injection was done entirely at the OS level with `ip route`, outside of FRR's control, which is why it does not appear in `show running-config`.
+
+**Root cause:** A manually added OS-level static route (`1.0.0.0/8 via 127.0.0.1 dev lo`) on router0 blackholes all Server Room traffic by overriding the correct RIP route.
+
+**Corrective fix:** Remove the spurious kernel route on router0 with:
+```
+ip route del 1.0.0.0/8 via 127.0.0.1
+```
+This will immediately restore the RIP route as the selected FIB entry and re-establish IT/CS reachability to the Server Room.
+=== END ===

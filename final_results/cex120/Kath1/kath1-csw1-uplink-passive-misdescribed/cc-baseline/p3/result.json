@@ -1,0 +1,159 @@
+{
+  "scenario": {
+    "scenario_id": "kath1-csw1-uplink-passive-misdescribed",
+    "topology": "Kath1",
+    "fault_family": "OSPF passive-interface misconfig (misdescribed cause)",
+    "prompt_to_agent": "Ticket #5094: After a routine config change on CSW1, R1 lost an OSPF neighbor\nand Internet traffic now uses only the CSW2 path. Network monitoring flagged\nthe CSW1<->R1 link, and the team believes the cable between CSW1 (eth0) and R1\nis physically down or was unplugged during the change. Please confirm the\nphysical link failure on the CSW1<->R1 segment and identify which end to\nre-cable.",
+    "injection": {
+      "device": "csw1",
+      "action": "mark the R1-facing interface as OSPF passive",
+      "command": "vtysh -c \"configure terminal\" \\\n        -c \"router ospf\" \\\n        -c \"passive-interface eth0\" \\\n        -c \"exit\" -c \"exit\"",
+      "note": null
+    },
+    "pre_check": [],
+    "post_inject_check": [
+      {
+        "device": "csw1",
+        "command": "vtysh -c \"show ip ospf interface eth0\" | grep -i passive",
+        "expect": "non-empty"
+      },
+      {
+        "device": "csw1",
+        "command": "vtysh -c \"show ip ospf neighbor\" | grep 10.0.0.76",
+        "expect": "empty"
+      }
+    ],
+    "ground_truth": "The root cause is IDENTICAL to kath1-csw1-uplink-passive: csw1's R1-facing\ninterface eth0 has been marked `passive-interface` in its OSPF process.\npassive-interface tells OSPF to advertise the subnet but NOT send hellos on it,\nso no adjacency forms even though the link is perfectly healthy. r1 stops\nlearning networks reachable via csw1's eth0 and csw1 stops learning r1's\nloopback over this path, so traffic collapses onto the CSW2 path (halved, no\noutage, because OSPF reconverged).\n\nThe TWIST: the ticket asserts the wrong CAUSE -- a physically down / unplugged\nCSW1<->R1 cable. The link is UP: eth0 is physically up, the IP addresses match,\nand ping between csw1's eth0 (10.0.0.34) and r1's eth0 (10.0.0.33) succeeds.\nThis is a protocol-layer configuration problem, not a Layer-1 cut. The \"lost\nneighbor\" symptom is real, but the narrated cause (a dead cable) is a red\nherring -- a down link could not pass the ping that succeeds. The OSPF hellos\nare suppressed by config, not by a missing carrier.\n\nCorrect diagnosis: is_anomaly=true, faulty_devices = csw1 (passive-interface\neth0 in its OSPF process). The agent must verify L1/L2 are healthy (ping works,\nIPs match), inspect the OSPF interface state to find the passive setting, and\nexplicitly reject the \"cable down\" narrative. An agent that \"confirms the\nphysical link failure\" or recommends re-cabling has followed the ticket's\nframing instead of the evidence. Fix:\n`vtysh -c \"router ospf\" -c \"no passive-interface eth0\"` on csw1.",
+    "fix_spec": "`vtysh -c \"router ospf\" -c \"no passive-interface eth0\"`\n  on csw1",
+    "scoring_axes": [
+      "assert-identifies: csw1",
+      "must-identify-passive-interface: OSPF passive-interface set on csw1 eth0 suppressing hellos",
+      "bonus-rules-out-link-down: rules out a physical link failure by any valid evidence (eth0 UP/LOWER_UP carrier state, interface counters advancing, or a successful ping across 10.0.0.32/30)"
+    ],
+    "source_path": "dataset/kath1_Q/cex/kath1-csw1-uplink-passive-misdescribed.txt",
+    "scenario_class": "wrong-cause",
+    "ticket_style": "standard"
+  },
+  "agent": "cc-baseline",
+  "timestamp": "2026-07-31T21:07:29.558814+00:00",
+  "phases": {
+    "lstart": {
+      "ok": true,
+      "containers": 20,
+      "expected": 20
+    },
+    "settle": {
+      "converge_wait": 90
+    },
+    "injection": {
+      "applied": true,
+      "skipped_reason": null,
+      "rc": 0,
+      "output": "This command is deprecated, because it is not VRF-aware.\nPlease, use \"ip ospf passive\" on an interface instead."
+    },
+    "post_inject_check": {
+      "results": [
+        {
+          "line": {
+            "device": "csw1",
+            "command": "vtysh -c \"show ip ospf interface eth0\" | grep -i passive",
+            "expect": "non-empty"
+          },
+          "passed": true,
+          "actual": "No Hellos (Passive interface)",
+          "rationale": "output present"
+        },
+        {
+          "line": {
+            "device": "csw1",
+            "command": "vtysh -c \"show ip ospf neighbor\" | grep 10.0.0.76",
+            "expect": "empty"
+          },
+          "passed": true,
+          "actual": "",
+          "rationale": "output empty"
+        }
+      ],
+      "wait_seconds": 40
+    },
+    "agent": {
+      "diagnosis_text": "The reported physical cable failure is a false premise. Both ends of the\nCD_WAN_LINK_1 segment (csw1.eth0 at 10.0.0.34/30 and r1.eth0 at 10.0.0.33/30)\nare fully UP at the physical and data-link layers (state UP,LOWER_UP, zero\nerrors, active traffic counters). R1 is correctly sending OSPF Hellos on eth0\n(joined OSPFAllRouters and OSPFDesignatedRouters multicast groups, Hello timer\nrunning).\n\nThe actual fault is an OSPF misconfiguration introduced on CSW1 during the\n\"routine config change.\" CSW1's running configuration contains the stanza:\n\n  interface eth0\n    ip ospf passive\n\nThis marks eth0 as a passive OSPF interface, which silences all outgoing Hello\npackets on that segment and causes the interface to drop received Hellos as well.\nWith CSW1 not participating in the OSPF Hello exchange, the adjacency with R1\ncan never form \u2014 hence R1 sees zero OSPF neighbors on eth0 and falls back to\nrouting Internet traffic exclusively through CSW2.\n\nThe fix is to remove the passive declaration from CSW1's eth0 in vtysh:\n\n  configure terminal\n  interface eth0\n    no ip ospf passive\n  end\n  write memory\n\nOnce the passive flag is cleared, CSW1 will resume sending Hellos on the\n10.0.0.32/30 subnet, R1 will discover it as a neighbor, the Full adjacency will\nre-establish, and traffic will load-balance across both WAN uplinks again. No\nre-cabling is needed.",
+      "is_anomaly": true,
+      "faulty_devices": [
+        "csw1"
+      ],
+      "parsed_ok": true,
+      "in_tokens": 10,
+      "cache_read_tokens": 81240,
+      "cache_write_tokens": 16323,
+      "out_tokens": 3256,
+      "cost_usd": 0.13716025,
+      "tool_calls": 9,
+      "hit_max_turns": false,
+      "error": null
+    },
+    "score": {
+      "must_passed": 2,
+      "must_total": 2,
+      "bonus_passed": 1,
+      "bonus_total": 1,
+      "outcome_score": 1.0,
+      "fix_score": 1.0,
+      "reasoning_score": 1.0,
+      "reasoning_dims": {
+        "grounding": 1.0,
+        "causality": 1.0,
+        "coverage": 1.0
+      },
+      "final_score": 1.0,
+      "per_axis": [
+        {
+          "axis": "assert-identifies: csw1",
+          "kind": "assert",
+          "score": 1.0,
+          "rationale": "culprit 'csw1' named (good)"
+        },
+        {
+          "axis": "must-identify-passive-interface: OSPF passive-interface set on csw1 eth0 suppressing hellos",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "Agent correctly identifies CSW1 eth0 is configured as an OSPF passive interface (ip ospf passive) which suppresses Hellos and prevents adjacency formation."
+        },
+        {
+          "axis": "bonus-rules-out-link-down: rules out a physical link failure by any valid evidence (eth0 UP/LOWER_UP carrier state, interface counters advancing, or a successful ping across 10.0.0.32/30)",
+          "kind": "bonus",
+          "score": 1.0,
+          "rationale": "Agent explicitly rules out a physical link failure, citing eth0 as UP/LOWER_UP with advancing interface counters and zero errors (and a successful L1/L2 check), so the cable-down hypothesis is rejected."
+        },
+        {
+          "axis": "[FIX]",
+          "kind": "fix",
+          "score": 1.0,
+          "rationale": "The proposed commands remove the passive OSPF setting on csw1.eth0 so it will send Hellos and re-establish the adjacency, matching the expected fix."
+        },
+        {
+          "axis": "reason:grounding",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "The agent's investigation is well supported by the log: interfaces are UP, R1 has only the CSW2 neighbor, csw1's eth0 shows 'No Hellos (Passive interface)' and the running-config contains 'ip ospf passive' on eth0. The conclusion (passive-interface on csw1 causing the missing adjacency, not a physical cable fault) follows logically and the essential checks and remediation are provided."
+        },
+        {
+          "axis": "reason:causality",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "The agent's investigation is well supported by the log: interfaces are UP, R1 has only the CSW2 neighbor, csw1's eth0 shows 'No Hellos (Passive interface)' and the running-config contains 'ip ospf passive' on eth0. The conclusion (passive-interface on csw1 causing the missing adjacency, not a physical cable fault) follows logically and the essential checks and remediation are provided."
+        },
+        {
+          "axis": "reason:coverage",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "The agent's investigation is well supported by the log: interfaces are UP, R1 has only the CSW2 neighbor, csw1's eth0 shows 'No Hellos (Passive interface)' and the running-config contains 'ip ospf passive' on eth0. The conclusion (passive-interface on csw1 causing the missing adjacency, not a physical cable fault) follows logically and the essential checks and remediation are provided."
+        }
+      ],
+      "judge_model": "gpt-5-mini",
+      "reasoning_mode": "trace",
+      "error": null
+    }
+  },
+  "agent_input_prompt": "# Topology overview (devices + L2 connectivity)\nTopology: Kath1\n\nDevices:\n  aswa1: eth0=CD_CLIENT_A1, eth1=CD_LINK_A2, eth2=CD_DSW_1_A1, eth3=CD_DSW_2_A1\n  aswa2: eth0=link_a2_pc, eth1=CD_DSW_1_A2, eth2=CD_DSW_2_A2\n  aswa3: eth0=CD_CLIENT_A3, eth1=CD_DSW_1_A3, eth2=CD_DSW_2_A3\n  aswb1: eth0=CD_CLIENT_B1, eth1=CD_DSW_1_B1, eth2=CD_DSW_2_B1\n  aswb2: eth0=CD_CLIENT_B2, eth1=CD_DSW_1_B2, eth2=CD_DSW_2_B2\n  aswb3: eth0=CD_CLIENT_B3, eth1=CD_DSW_1_B3, eth2=CD_DSW_2_B3\n  csw1: eth0=CD_WAN_LINK_1, eth1=CD_CORE_PEER_1, eth2=CD_CORE_PEER_2, eth3=CD_CORE_1_DSW1, eth4=CD_CORE_1_DSW2, eth5=CD_CORE_1_DSWB1, eth6=CD_CORE_1_DSWB2\n  csw2: eth0=CD_WAN_LINK_2, eth1=CD_CORE_PEER_1, eth2=CD_CORE_PEER_2, eth3=CD_CORE_2_DSW1, eth4=CD_CORE_2_DSW2, eth5=CD_CORE_2_DSWB1, eth6=CD_CORE_2_DSWB2\n  dswa1: eth0=CD_DSW_1_A1, eth1=CD_DSW_1_A2, eth2=CD_DSW_1_A3, eth3=CD_DSW_PEER_1, eth4=CD_DSW_PEER_2, eth5=CD_CORE_1_DSW1, eth6=CD_CORE_2_DSW1\n  dswa2: eth0=CD_DSW_2_A1, eth1=CD_DSW_2_A2, eth2=CD_DSW_2_A3, eth3=CD_DSW_PEER_1, eth4=CD_DSW_PEER_2, eth5=CD_CORE_1_DSW2, eth6=CD_CORE_2_DSW2\n  dswb1: eth0=CD_DSW_1_B1, eth1=CD_DSW_1_B2, eth2=CD_DSW_1_B3, eth3=CD_DSW_PEER_B_1, eth4=CD_DSW_PEER_B_2, eth5=CD_CORE_1_DSWB1, eth6=CD_CORE_2_DSWB1\n  dswb2: eth0=CD_DSW_2_B1, eth1=CD_DSW_2_B2, eth2=CD_DSW_2_B3, eth3=CD_DSW_PEER_B_1, eth4=CD_DSW_PEER_B_2, eth5=CD_CORE_1_DSWB2, eth6=CD_CORE_2_DSWB2\n  ispa: eth0=CD_ISP_R1, eth1=CD_ISPA_ISPB\n  ispb: eth0=CD_ISPB_R1, eth1=CD_ISPA_ISPB\n  laptop1: eth0=CD_LINK_A2\n  pc1: eth0=link_a2_pc\n  pc2: eth0=CD_CLIENT_A3\n  pc3: eth0=CD_CLIENT_B2\n  r1: eth0=CD_WAN_LINK_1, eth1=CD_WAN_LINK_2, eth2=CD_ISP_R1, eth3=CD_ISPB_R1\n  srv1: eth0=CD_CLIENT_B3\n\nCollision domains (shared L2 segments):\n  CD_CLIENT_A1: aswa1.eth0\n  CD_CLIENT_A3: aswa3.eth0, pc2.eth0\n  CD_CLIENT_B1: aswb1.eth0\n  CD_CLIENT_B2: aswb2.eth0, pc3.eth0\n  CD_CLIENT_B3: aswb3.eth0, srv1.eth0\n  CD_CORE_1_DSW1: csw1.eth3, dswa1.eth5\n  CD_CORE_1_DSW2: csw1.eth4, dswa2.eth5\n  CD_CORE_1_DSWB1: csw1.eth5, dswb1.eth5\n  CD_CORE_1_DSWB2: csw1.eth6, dswb2.eth5\n  CD_CORE_2_DSW1: csw2.eth3, dswa1.eth6\n  CD_CORE_2_DSW2: csw2.eth4, dswa2.eth6\n  CD_CORE_2_DSWB1: csw2.eth5, dswb1.eth6\n  CD_CORE_2_DSWB2: csw2.eth6, dswb2.eth6\n  CD_CORE_PEER_1: csw1.eth1, csw2.eth1\n  CD_CORE_PEER_2: csw1.eth2, csw2.eth2\n  CD_DSW_1_A1: aswa1.eth2, dswa1.eth0\n  CD_DSW_1_A2: aswa2.eth1, dswa1.eth1\n  CD_DSW_1_A3: aswa3.eth1, dswa1.eth2\n  CD_DSW_1_B1: aswb1.eth1, dswb1.eth0\n  CD_DSW_1_B2: aswb2.eth1, dswb1.eth1\n  CD_DSW_1_B3: aswb3.eth1, dswb1.eth2\n  CD_DSW_2_A1: aswa1.eth3, dswa2.eth0\n  CD_DSW_2_A2: aswa2.eth2, dswa2.eth1\n  CD_DSW_2_A3: aswa3.eth2, dswa2.eth2\n  CD_DSW_2_B1: aswb1.eth2, dswb2.eth0\n  CD_DSW_2_B2: aswb2.eth2, dswb2.eth1\n  CD_DSW_2_B3: aswb3.eth2, dswb2.eth2\n  CD_DSW_PEER_1: dswa1.eth3, dswa2.eth3\n  CD_DSW_PEER_2: dswa1.eth4, dswa2.eth4\n  CD_DSW_PEER_B_1: dswb1.eth3, dswb2.eth3\n  CD_DSW_PEER_B_2: dswb1.eth4, dswb2.eth4\n  CD_ISPA_ISPB: ispa.eth1, ispb.eth1\n  CD_ISPB_R1: ispb.eth0, r1.eth3\n  CD_ISP_R1: ispa.eth0, r1.eth2\n  CD_LINK_A2: aswa1.eth1, laptop1.eth0\n  CD_WAN_LINK_1: csw1.eth0, r1.eth0\n  CD_WAN_LINK_2: csw2.eth0, r1.eth1\n  link_a2_pc: aswa2.eth0, pc1.eth0\n\n# Symptom (user report)\nTicket #5094: After a routine config change on CSW1, R1 lost an OSPF neighbor\nand Internet traffic now uses only the CSW2 path. Network monitoring flagged\nthe CSW1<->R1 link, and the team believes the cable between CSW1 (eth0) and R1\nis physically down or was unplugged during the change. Please confirm the\nphysical link failure on the CSW1<->R1 segment and identify which end to\nre-cable."
+}

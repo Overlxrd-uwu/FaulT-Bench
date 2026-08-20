@@ -1,0 +1,158 @@
+{
+  "scenario": {
+    "scenario_id": "simple-bgp-router1-bgpd-down-misdescribed",
+    "topology": "simple_bgp",
+    "fault_family": "routing daemon down (misdescribed ticket)",
+    "prompt_to_agent": "Helpdesk ticket #9106: A user on pc1 (195.11.14.2) reports they have completely\nlost connectivity to the partner network -- they cannot reach pc2 (200.1.1.2) in\nthe peer AS since this morning. The team insists the inter-AS physical link\nbetween router1 and router2 is down and want it re-cabled. Please find and confirm\nthe real fault and tell us which device to restart.",
+    "injection": {
+      "device": "router1",
+      "action": "kill the BGP routing daemon (and its watchdog) on router1",
+      "command": "pkill -9 watchfrr; pkill -9 bgpd",
+      "note": null
+    },
+    "pre_check": [],
+    "post_inject_check": [
+      {
+        "device": "router1",
+        "command": "pgrep bgpd",
+        "expect": "empty"
+      },
+      {
+        "device": "pc1",
+        "command": "ping -W2 -c2 200.1.1.2",
+        "expect": "loss>0"
+      }
+    ],
+    "ground_truth": "The real fault is on router1: its BGP routing daemon (bgpd) has been killed, so\nthe eBGP session between router1 and router2 drops and router1 loses/withdraws\nthe inter-AS routes. With no route to the peer AS, pc1 (195.11.14.2) cannot reach\npc2 (200.1.1.2). The ticket MISDESCRIBES the cause as a physical link failure,\nbut the inter-AS link is UP: router1's eth0 (the inter-AS interface to router2)\nis up and carrier is fine -- this is a dead daemon, not a cut cable.\n\nThe correct diagnosis identifies router1 (bgpd down) as the faulty device and\nexplicitly distinguishes a daemon crash from a link failure: the inter-AS\ninterface (router1 eth0) is UP, so the user's \"the physical link is down\"\nhypothesis is wrong. An agent that asks for the link to be re-cabled has accepted\nthe ticket's misdescription instead of testing it.\n\nObservable note (lab-verified 2026-07-03): bgpd is killed together with watchfrr (its watchdog), so nothing respawns it. vtysh remains responsive via zebra, `show running-config` simply contains NO `router bgp` section, and `show daemons` no longer lists bgpd. An agent may therefore correctly describe this fault as \"the bgp configuration is missing/empty on router1\" -- that is the same fault observed at the config plane, and must NOT be treated as a wrong root cause.",
+    "fix_spec": "Restart FRR/bgpd on router1 (`service frr restart`). Once bgpd is running again,\nthe eBGP session to router2 re-establishes, router1 re-learns and re-advertises\nthe inter-AS prefixes, and pc1 reaches pc2 normally. No re-cabling is needed --\nthe link was up the whole time.",
+    "scoring_axes": [
+      "assert-identifies: router1",
+      "must-identify-bgpd-down: identifies bgpd on router1 is down, not a physical link failure",
+      "bonus-rules-out-link: notes router1's inter-AS interface (eth0) is UP, distinguishing a daemon crash from the ticket's \"link down\" cause"
+    ],
+    "source_path": "dataset/nika_bgp_Q/cex/simple-bgp-router1-bgpd-down-misdescribed.txt",
+    "scenario_class": "wrong-cause"
+  },
+  "agent": "react-full",
+  "timestamp": "2026-07-05T20:33:01.053237+00:00",
+  "phases": {
+    "lstart": {
+      "ok": true,
+      "containers": 4,
+      "expected": 4
+    },
+    "settle": {
+      "converge_wait": 90
+    },
+    "injection": {
+      "applied": true,
+      "skipped_reason": null,
+      "rc": 0,
+      "output": ""
+    },
+    "post_inject_check": {
+      "results": [
+        {
+          "line": {
+            "device": "router1",
+            "command": "pgrep bgpd",
+            "expect": "empty"
+          },
+          "passed": true,
+          "actual": "",
+          "rationale": "output empty"
+        },
+        {
+          "line": {
+            "device": "pc1",
+            "command": "ping -W2 -c2 200.1.1.2",
+            "expect": "loss>0"
+          },
+          "passed": true,
+          "actual": "PING 200.1.1.2 (200.1.1.2) 56(84) bytes of data.\nFrom 195.11.14.1 icmp_seq=1 Destination Net Unreachable\nFrom 195.11.14.1 icmp_seq=2 Destination Net Unreachable\n\n--- 200.1.1.2 ping statistics ---\n2 packets transmitted, 0 received, +2 errors, 100% packet loss, time 1034ms",
+          "rationale": "loss=100%"
+        }
+      ],
+      "wait_seconds": 0
+    },
+    "agent": {
+      "diagnosis_text": "The failure is in the routing control-plane, not the physical link. The affected component is the FRRouting (FRR) BGP daemon on router1. Evidence: router1\u2019s frr service is failed (systemctl shows \u201cActive: failed\u201d), and bgpd is not running there, while router2\u2019s frr is running. Router2\u2019s BGP summary shows neighbor 193.10.11.1 (router1) stuck in Active, confirming the BGP session never establishes. The inter-router physical link is healthy: ethtool on both router1:eth0 and router2:eth0 reports \u201cLink detected: yes,\u201d and ICMP between router1 and router2 over 193.10.11.0/24 succeeds with 0% loss.\n\nMechanism: With bgpd down on router1, no eBGP adjacency forms, so router1 lacks a route to 200.1.1.0/24. When pc1 (195.11.14.2) sends traffic to pc2 (200.1.1.2), router1 (195.11.14.1) generates \u201cDestination Net Unreachable,\u201d exactly as seen in the user\u2019s ping. Linux routing tables on both routers show only connected networks, consistent with no BGP-learned prefixes installed.\n\nLocalization: router1 control-plane process (FRR bgpd/frr service). The physical interface eth0 and the inter-AS L2 link are fine.\n\nRoot cause: The FRR service on router1 stopped/failed, causing the BGP session to drop and remote network reachability to be lost.\n\nCorrective fix: Restart FRR on router1 (systemctl restart frr). Verify BGP comes up with router2 and that 195.11.14.0/24 and 200.1.1.0/24 are exchanged. Ensure FRR is enabled to start on boot and review /var/log/frr/frr.log for the reason it failed. No recabling is needed.",
+      "is_anomaly": true,
+      "faulty_devices": [
+        "router1"
+      ],
+      "parsed_ok": true,
+      "in_tokens": 11207,
+      "cache_read_tokens": 8960,
+      "cache_write_tokens": 0,
+      "out_tokens": 3551,
+      "cost_usd": 0.05063875,
+      "tool_calls": 20,
+      "hit_max_turns": false,
+      "error": null
+    },
+    "score": {
+      "must_passed": 2,
+      "must_total": 2,
+      "bonus_passed": 1,
+      "bonus_total": 1,
+      "outcome_score": 1.0,
+      "fix_score": 1.0,
+      "reasoning_score": 0.9333333333333332,
+      "reasoning_dims": {
+        "grounding": 0.9,
+        "causality": 1.0,
+        "coverage": 0.9
+      },
+      "final_score": 1.0,
+      "per_axis": [
+        {
+          "axis": "assert-identifies: router1",
+          "kind": "assert",
+          "score": 1.0,
+          "rationale": "culprit 'router1' named (good)"
+        },
+        {
+          "axis": "must-identify-bgpd-down: identifies bgpd on router1 is down, not a physical link failure",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The report explicitly states router1's FRR/bgpd is down and provides evidence (service failed, bgpd not running) while noting the inter-router link is up (link detected, ICMP works), distinguishing it from a physical link failure."
+        },
+        {
+          "axis": "bonus-rules-out-link: notes router1's inter-AS interface (eth0) is UP, distinguishing a daemon crash from the ticket's \"link down\" cause",
+          "kind": "bonus",
+          "score": 1.0,
+          "rationale": "The agent explicitly reports router1:eth0 is up (ethtool 'Link detected: yes' and successful ICMP) and attributes the outage to bgpd/frr failing, thereby ruling out the ticket's physical-link-down claim."
+        },
+        {
+          "axis": "[FIX]",
+          "kind": "fix",
+          "score": 1.0,
+          "rationale": "They explicitly instruct restarting the FRR/bgpd service on router1 (systemctl restart frr), verifying BGP adjacency and routes, and ensuring service enabled\u2014matching the expected fix."
+        },
+        {
+          "axis": "reason:grounding",
+          "kind": "reason-dim",
+          "score": 0.9,
+          "rationale": "The agent's investigation log contains the needed observations (frr service failed on router1, bgpd not running, successful L2/ICMP between routers, router2's BGP state showing neighbor not established, and pc1 ping reply of 'Destination Net Unreachable' from router1) supporting the control-plane failure diagnosis. Conclusions follow logically from the evidence and the checks cover the essential alternatives (physical link vs routing daemon), though the writeup includes one small unshown claim about routing-table contents."
+        },
+        {
+          "axis": "reason:causality",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "The agent's investigation log contains the needed observations (frr service failed on router1, bgpd not running, successful L2/ICMP between routers, router2's BGP state showing neighbor not established, and pc1 ping reply of 'Destination Net Unreachable' from router1) supporting the control-plane failure diagnosis. Conclusions follow logically from the evidence and the checks cover the essential alternatives (physical link vs routing daemon), though the writeup includes one small unshown claim about routing-table contents."
+        },
+        {
+          "axis": "reason:coverage",
+          "kind": "reason-dim",
+          "score": 0.9,
+          "rationale": "The agent's investigation log contains the needed observations (frr service failed on router1, bgpd not running, successful L2/ICMP between routers, router2's BGP state showing neighbor not established, and pc1 ping reply of 'Destination Net Unreachable' from router1) supporting the control-plane failure diagnosis. Conclusions follow logically from the evidence and the checks cover the essential alternatives (physical link vs routing daemon), though the writeup includes one small unshown claim about routing-table contents."
+        }
+      ],
+      "judge_model": "gpt-5-mini",
+      "reasoning_mode": "trace",
+      "error": null
+    }
+  },
+  "agent_input_prompt": "# Topology overview (devices + L2 connectivity)\nTopology: simple_bgp\n\nDevices:\n  Routers (FRR): router1, router2\n  Hosts: pc1, pc2\n\nLinks (device:iface <-> device:iface):\n  router1:eth0 <-> router2:eth0\n  router1:eth1 <-> pc1:eth0\n  router2:eth1 <-> pc2:eth0\n\n# Symptom (user report)\nHelpdesk ticket #9106: A user on pc1 (195.11.14.2) reports they have completely\nlost connectivity to the partner network -- they cannot reach pc2 (200.1.1.2) in\nthe peer AS since this morning. The team insists the inter-AS physical link\nbetween router1 and router2 is down and want it re-cabled. Please find and confirm\nthe real fault and tell us which device to restart."
+}

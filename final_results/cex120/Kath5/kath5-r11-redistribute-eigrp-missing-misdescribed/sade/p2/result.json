@@ -1,0 +1,159 @@
+{
+  "scenario": {
+    "scenario_id": "kath5-r11-redistribute-eigrp-missing-misdescribed",
+    "topology": "Kath5",
+    "fault_family": "route redistribution missing (misdescribed cause)",
+    "prompt_to_agent": "Ticket #9066: A user on pc12 (R12's LAN, 120.1.1.x) can reach their direct\nneighbors (R12, R11) but cannot reach anything in the OSPF backbone -- no router1\n(10.x), no router2 (1.x), no remote LANs. This started after maintenance on R11.\nThe team believes the EIGRP<->OSPF boundary link on R11 went physically down or was\nunplugged during the maintenance, severing the EIGRP cloud from the backbone.\nPlease confirm the down boundary link and identify the dead interface.",
+    "injection": {
+      "device": "r11",
+      "action": "remove `redistribute eigrp` from r11's OSPF",
+      "command": "vtysh -c \"configure terminal\" \\\n        -c \"router ospf\" \\\n        -c \"no redistribute eigrp\" \\\n        -c \"exit\" -c \"exit\"",
+      "note": null
+    },
+    "pre_check": [],
+    "post_inject_check": [
+      {
+        "device": "r11",
+        "command": "vtysh -c \"show running-config\" | grep \"redistribute eigrp\"",
+        "expect": "empty"
+      },
+      {
+        "device": "pc12",
+        "command": "ping -W2 -c2 10.1.1.1",
+        "expect": "loss>0"
+      }
+    ],
+    "ground_truth": "The root cause is IDENTICAL to kath5-r11-redistribute-eigrp-missing: R11's\n`router ospf` block is missing `redistribute eigrp`. R11 is the only bridge between\nthe EIGRP cloud (R11/R12/R13 in AS 100) and the OSPF backbone (areas 0/1/2/3).\nWithout `redistribute eigrp`, the 102.x/112.x/113.x/120.x prefixes never become\nOSPF LSAs, so pc12's 120.0.0.0/8 network is invisible to R1 and the rest of the\nOSPF domain -- exactly the reported pattern.\n\nThe TWIST: the ticket asserts the wrong CAUSE -- a downed EIGRP<->OSPF boundary\nlink. The link is actually UP and forwarding: R11's interfaces are operationally up,\nits EIGRP neighbors (R12/R13) are still Full, and R11 itself can reach the OSPF\nbackbone over that very link. Nothing physical failed. The \"EIGRP cloud cut off\nfrom the backbone\" symptom is real, but the narrated cause (a maintenance-window\nlink failure) is a red herring -- a route-redistribution statement was removed, the\nwire was not unplugged.\n\nDesign note (baseline, not a fault): the EIGRP side reaches the OSPF side via\nSTATIC DEFAULT routes on R12/R13 toward R11 -- intended design, since FRR's\neigrpd cannot redistribute OSPF into EIGRP (documented in r12.startup,\nr13.startup, r11 frr.conf). So pc12's OUTBOUND packets still leave through R11\neven after the injection; what breaks is the RETURN path -- the backbone loses\nevery route to 120.x/112.x/103.x the moment `redistribute eigrp` is removed.\nAn agent describing the missing return routes has found the injected fault;\nthe static-default arrangement itself is baseline design and must not be\nreported as the anomaly.\n\nCorrect diagnosis: is_anomaly=true, faulty_devices = r11 (missing `redistribute\neigrp`). The agent must check Layer 1/2 (R11's boundary interfaces and EIGRP\nadjacencies are up), then the redistribution config (`redistribute eigrp` absent\nfrom R11's OSPF), and explicitly reject the \"link down\" narrative. A decisive tell:\nR11 can reach the backbone itself (its default/redistribution the other way still\nworks) yet the EIGRP prefixes are missing from R1's RIB -- a live link with broken\none-way redistribution, not a dead wire. An agent that \"confirms the down boundary\nlink\" has followed the ticket's framing instead of the evidence. Fix: re-add\n`redistribute eigrp` to R11's OSPF block.",
+    "fix_spec": "re-add `redistribute eigrp` to r11's OSPF block",
+    "scoring_axes": [
+      "assert-identifies: r11",
+      "must-identify-redistribute-missing: OSPF redistribution / redistribute eigrp",
+      "bonus-rules-out-link-down (boundary link / interfaces and EIGRP adjacencies are up; one-way redistribution broke, not the wire)"
+    ],
+    "source_path": "dataset/kath5_Q/cex/kath5-r11-redistribute-eigrp-missing-misdescribed.txt",
+    "scenario_class": "wrong-cause",
+    "ticket_style": "standard"
+  },
+  "agent": "sade",
+  "timestamp": "2026-07-30T16:44:59.728511+00:00",
+  "phases": {
+    "lstart": {
+      "ok": true,
+      "containers": 15,
+      "expected": 15
+    },
+    "settle": {
+      "converge_wait": 90
+    },
+    "injection": {
+      "applied": true,
+      "skipped_reason": null,
+      "rc": 0,
+      "output": ""
+    },
+    "post_inject_check": {
+      "results": [
+        {
+          "line": {
+            "device": "r11",
+            "command": "vtysh -c \"show running-config\" | grep \"redistribute eigrp\"",
+            "expect": "empty"
+          },
+          "passed": true,
+          "actual": "",
+          "rationale": "output empty"
+        },
+        {
+          "line": {
+            "device": "pc12",
+            "command": "ping -W2 -c2 10.1.1.1",
+            "expect": "loss>0"
+          },
+          "passed": true,
+          "actual": "PING 10.1.1.1 (10.1.1.1) 56(84) bytes of data.\n\n--- 10.1.1.1 ping statistics ---\n2 packets transmitted, 0 received, 100% packet loss, time 1016ms",
+          "rationale": "loss=100%"
+        }
+      ],
+      "wait_seconds": 0
+    },
+    "agent": {
+      "diagnosis_text": "**Affected component:** FRR OSPF redistribution policy on R11 \u2014 specifically the `router ospf` stanza is missing the `redistribute eigrp 100` directive.\n\n**Mechanism:** R11 sits at the EIGRP/OSPF boundary. Its OSPF process is configured with `redistribute connected`, which exports only R11's own directly-attached subnets (111.x, 112.x, 103.x) into the OSPF domain. EIGRP-learned routes for the wider EIGRP cloud \u2014 including the 120.0.0.0/8 LAN segment where pc12 lives \u2014 are never injected into OSPF LSAs. Consequently, every backbone router (R1, R2, R3, \u2026) has a routing black hole for all EIGRP-cloud prefixes beyond R11's own links. When pc0 tries to reach 120.1.1.10, R1 (20.1.1.1) returns an immediate ICMP Destination Network Unreachable. When pc12 reaches out to 20.1.1.10, the forward path succeeds (EIGRP cloud has partial reachability through R11's connected redistributions), but R1 silently drops the ICMP reply \u2014 causing a full timeout on pc12.\n\n**Localization:** R11, `router ospf` in FRR (`/etc/frr/frr.conf`). All physical interfaces (eth0 = EE domain to R12, eth1 = B domain to R1, eth2 = FF domain to R13) are UP with zero carrier errors; no link flap history exists.\n\n**Root cause:** R11's OSPF process is missing `redistribute eigrp 100`, so the 120.0.0.0/8 subnet (and all other EIGRP-cloud prefixes) are never advertised into the OSPF backbone.\n\n**Fix:** Add `redistribute eigrp 100` inside `router ospf` on R11. Symmetrically, add `redistribute ospf` inside `router eigrp 100` on R11 so that EIGRP-cloud routers (R12, R13) also learn backbone routes via R11, fully restoring two-way reachability.",
+      "is_anomaly": true,
+      "faulty_devices": [
+        "r11"
+      ],
+      "parsed_ok": true,
+      "in_tokens": 21,
+      "cache_read_tokens": 133218,
+      "cache_write_tokens": 26777,
+      "out_tokens": 11980,
+      "cost_usd": 0.32153415,
+      "tool_calls": 13,
+      "hit_max_turns": false,
+      "error": null
+    },
+    "score": {
+      "must_passed": 2,
+      "must_total": 2,
+      "bonus_passed": 1,
+      "bonus_total": 1,
+      "outcome_score": 1.0,
+      "fix_score": 1.0,
+      "reasoning_score": 0.9333333333333332,
+      "reasoning_dims": {
+        "grounding": 1.0,
+        "causality": 0.9,
+        "coverage": 0.9
+      },
+      "final_score": 1.0,
+      "per_axis": [
+        {
+          "axis": "assert-identifies: r11",
+          "kind": "assert",
+          "score": 1.0,
+          "rationale": "culprit 'r11' named (good)"
+        },
+        {
+          "axis": "must-identify-redistribute-missing: OSPF redistribution / redistribute eigrp",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "Agent explicitly identifies that R11's `router ospf` stanza is missing `redistribute eigrp 100` and cites that as the root cause."
+        },
+        {
+          "axis": "bonus-rules-out-link-down (boundary link / interfaces and EIGRP adjacencies are up; one-way redistribution broke, not the wire)",
+          "kind": "bonus",
+          "score": 1.0,
+          "rationale": "The agent explicitly checked and reported R11's interfaces are UP with no flaps and described the failure as missing one-way redistribution (missing `redistribute eigrp`), rejecting the 'link down' cause."
+        },
+        {
+          "axis": "[FIX]",
+          "kind": "fix",
+          "score": 1.0,
+          "rationale": "Remediation includes re-adding `redistribute eigrp 100` in R11's OSPF process (the expected fix), which would restore the missing route advertisement."
+        },
+        {
+          "axis": "reason:grounding",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "The investigation log shows the agent ran reachability tests, verified R11's interfaces are up (dhcp_link_history), retrieved R11's FRR running-config (showing 'router ospf' lacks 'redistribute eigrp'), and checked R1's route table \u2014 the observations support the conclusion that routes from the EIGRP cloud are not being injected into OSPF. The reasoning links these observations to the missing-redistribution root cause with only minor, non-critical wording/forward-path inconsistency in the writeup."
+        },
+        {
+          "axis": "reason:causality",
+          "kind": "reason-dim",
+          "score": 0.9,
+          "rationale": "The investigation log shows the agent ran reachability tests, verified R11's interfaces are up (dhcp_link_history), retrieved R11's FRR running-config (showing 'router ospf' lacks 'redistribute eigrp'), and checked R1's route table \u2014 the observations support the conclusion that routes from the EIGRP cloud are not being injected into OSPF. The reasoning links these observations to the missing-redistribution root cause with only minor, non-critical wording/forward-path inconsistency in the writeup."
+        },
+        {
+          "axis": "reason:coverage",
+          "kind": "reason-dim",
+          "score": 0.9,
+          "rationale": "The investigation log shows the agent ran reachability tests, verified R11's interfaces are up (dhcp_link_history), retrieved R11's FRR running-config (showing 'router ospf' lacks 'redistribute eigrp'), and checked R1's route table \u2014 the observations support the conclusion that routes from the EIGRP cloud are not being injected into OSPF. The reasoning links these observations to the missing-redistribution root cause with only minor, non-critical wording/forward-path inconsistency in the writeup."
+        }
+      ],
+      "judge_model": "gpt-5-mini",
+      "reasoning_mode": "trace",
+      "error": null
+    }
+  },
+  "agent_input_prompt": "# Topology overview (devices + L2 connectivity)\nTopology: Kath5\n\nDevices:\n  pc0: eth0='E'\n  pc12: eth0=GG\n  r1: eth0=A, eth1=B, eth2=C, eth3=D, eth4=E, eth5=F\n  r10: eth0=I, eth1=DD\n  r11: eth0=EE, eth1=B, eth2=FF\n  r12: eth0=EE, eth1=GG\n  r13: eth0=FF\n  r2: eth0=A, eth1=H, eth2=I\n  r3: eth0=J, eth1=H, eth2=C, eth3=M, eth4=N, eth5=O, eth6=P\n  r4: eth0=M, eth1=R, eth2=S, eth3=T\n  r5: eth0=R, eth1=V, eth2=W, eth3=X\n  r6: eth0=S, eth1=V, eth2=Y, eth3=Z\n  r7: eth0=Y, eth1=AA\n  r8: eth0=W, eth1=BB\n  r9: eth0=J, eth1=CC\n\nCollision domains (shared L2 segments):\n  'E': pc0.eth0\n  A: r1.eth0, r2.eth0\n  AA: r7.eth1\n  B: r1.eth1, r11.eth1\n  BB: r8.eth1\n  C: r1.eth2, r3.eth2\n  CC: r9.eth1\n  D: r1.eth3\n  DD: r10.eth1\n  E: r1.eth4\n  EE: r11.eth0, r12.eth0\n  F: r1.eth5\n  FF: r11.eth2, r13.eth0\n  GG: pc12.eth0, r12.eth1\n  H: r2.eth1, r3.eth1\n  I: r10.eth0, r2.eth2\n  J: r3.eth0, r9.eth0\n  M: r3.eth3, r4.eth0\n  N: r3.eth4\n  O: r3.eth5\n  P: r3.eth6\n  R: r4.eth1, r5.eth0\n  S: r4.eth2, r6.eth0\n  T: r4.eth3\n  V: r5.eth1, r6.eth1\n  W: r5.eth2, r8.eth0\n  X: r5.eth3\n  Y: r6.eth2, r7.eth0\n  Z: r6.eth3\n\n# Symptom (user report)\nTicket #9066: A user on pc12 (R12's LAN, 120.1.1.x) can reach their direct\nneighbors (R12, R11) but cannot reach anything in the OSPF backbone -- no router1\n(10.x), no router2 (1.x), no remote LANs. This started after maintenance on R11.\nThe team believes the EIGRP<->OSPF boundary link on R11 went physically down or was\nunplugged during the maintenance, severing the EIGRP cloud from the backbone.\nPlease confirm the down boundary link and identify the dead interface."
+}

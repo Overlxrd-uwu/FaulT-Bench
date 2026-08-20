@@ -1,0 +1,81 @@
+==================================================
+Scenario: dc-clos-leaf1-both-uplinks-down
+Topology: dc_clos_bgp
+Fault family: link cut (both fabric uplinks of one leaf)
+==================================================
+
+[PROMPT-TO-AGENT]
+A user on pc_0_1 (10.0.1.2) reports a total outage: nothing across the
+fabric responds, and pc_0_0 (10.0.0.2) cannot reach pc_0_1 either.
+pc_0_1 CAN still ping its own gateway 10.0.1.1, and leaf_router_0_1
+itself is up and reachable on its console -- its FRR daemons are all
+running. Both of its BGP sessions to the spines are gone. Diagnose.
+
+[INJECTION]
+device: leaf_router_0_1
+action: bring down both spine-facing uplinks
+cmd: |
+  ip link set eth0 down
+  ip link set eth1 down
+
+[POST-INJECT-CHECK]
+leaf_router_0_1   ip -br link show eth0 | grep -c UP  => expect 0
+leaf_router_0_1   ip -br link show eth1 | grep -c UP  => expect 0
+pc_0_1            ping -W2 -c2 10.0.1.1               => expect 0% loss   (host link still OK)
+pc_0_0            ping -W2 -c2 10.0.1.2               => expect loss>0
+
+[GROUND-TRUTH]
+Affected component: leaf_router_0_1 eth0 and eth1 -- BOTH fabric
+  uplinks: eth0 (172.16.0.7/31, link subnet 172.16.0.6/31) to
+  spine_router_0_0 and eth1 (172.16.0.11/31, link subnet
+  172.16.0.10/31) to spine_router_0_1
+Mechanism: leaf_router_0_1's only paths into the CLOS fabric are its
+  two spine uplinks. With both interfaces down, both BGP sessions drop
+  and the leaf can neither learn 10.0.0.0/24 nor deliver its own
+  10.0.1.0/24 traffic anywhere -- the CLOS redundancy is defeated
+  because BOTH members of the redundant pair are down. The host-facing
+  port eth2 (10.0.1.1/24) is untouched, so pc_0_1 still reaches its
+  gateway but nothing beyond it. Note this is the one link-fault shape
+  where redundancy does not save the leaf; a single downed uplink
+  would only degrade redundancy.
+Localization: leaf_router_0_1
+Root cause: both spine-facing interfaces (eth0, eth1) down on
+  leaf_router_0_1
+Fix: `ip link set eth0 up` and `ip link set eth1 up` on
+  leaf_router_0_1; both BGP sessions re-establish on their own.
+
+[FIX]
+`ip link set eth0 up && ip link set eth1 up` on leaf_router_0_1. Once
+the uplinks are UP the sessions to both spines come back and pc_0_1
+regains fabric reachability.
+
+[DIAGNOSTIC-PROCESS]
+1. Scope the symptom: pc_0_1 reaches its gateway 10.0.1.1 but nothing
+   beyond; pc_0_0 cannot reach pc_0_1 -- pc_0_1's leaf is cut off from
+   the fabric while its host edge works.
+2. Layer 1/2 on the leaf: `ip -br link` on leaf_router_0_1 shows eth0
+   DOWN and eth1 DOWN while eth2 (host port) is UP.
+3. Confirm the identity of the downed links: eth0 is 172.16.0.7/31
+   toward spine_router_0_0, eth1 is 172.16.0.11/31 toward
+   spine_router_0_1 -- the leaf's only two paths into the fabric.
+4. Correlate with the control plane: both BGP sessions are down because
+   their underlying links are down; bgpd and zebra are running, and the
+   spines' other sessions are unaffected -- not a daemon or config
+   fault.
+5. Localize to the two downed uplinks on leaf_router_0_1: with both
+   members of the redundant pair down, total isolation of 10.0.1.0/24
+   is fully explained.
+
+[SCORING-AXES]
+assert-identifies: leaf_router_0_1
+must-identify-device: leaf_router_0_1
+must-identify-affected-links: BOTH spine uplinks down -- eth0 (to spine_router_0_0) AND eth1 (to spine_router_0_1)
+must-distinguish-symptom-pattern: pc_0_1 still reaches its gateway (host link fine) but nothing past the leaf
+bonus-notes-host-link-fine: explicitly rules out the host access link / pc_0_1 itself (eth2 UP, gateway pingable)
+# These axes score the outcome metric only; fix and reasoning are judged separately.
+
+[NIKA-LABEL]
+nika_label: link_down
+nika_category: LINK_FAILURE
+in_taxonomy: true
+note: both spine uplinks of one leaf cut simultaneously (link_down x2 on the same device)

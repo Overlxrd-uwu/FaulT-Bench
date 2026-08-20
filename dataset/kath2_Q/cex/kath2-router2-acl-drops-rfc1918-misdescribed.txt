@@ -1,0 +1,84 @@
+==================================================
+Scenario: kath2-router2-acl-drops-rfc1918-misdescribed
+Topology: Kath2
+Fault family: ACL drops legitimate transit (misdescribed cause)
+==================================================
+
+[PROMPT-TO-AGENT]
+Ticket #4548: IT and CS Dept users (192.168.1.x, 192.168.2.x) cannot reach the
+Server Room (1.0.0.x) or Internet Lab (128.168.0.x), but the Other zone
+(192.168.3.x) and Principle Room (192.168.4.x) reach those targets fine. The
+team concluded that router2's RIP daemon died during last night's maintenance
+and is no longer advertising the far networks. Please confirm router2's ripd is
+down and restart it.
+
+[INJECTION]
+device: router2
+action: add FORWARD DROP rules for IT (192.168.1.0/24) and CS (192.168.2.0/24)
+cmd: |
+  iptables -A FORWARD -s 192.168.1.0/24 -j DROP
+  iptables -A FORWARD -s 192.168.2.0/24 -j DROP
+
+[POST-INJECT-CHECK]
+it_hod   ping -W2 -c2 1.0.0.5                            => expect loss>0
+office_pc ping -W2 -c2 1.0.0.5                           => expect 0% loss
+
+[GROUND-TRUTH]
+The root cause is IDENTICAL to kath2-router2-acl-drops-rfc1918: extraneous
+iptables FORWARD DROP rules on router2 block any forwarded packet whose source
+is in 192.168.1.0/24 (IT) or 192.168.2.0/24 (CS). Office (192.168.3.x) and
+Principle (192.168.4.x) sources are not matched, so they reach the Server Room
+and Internet Lab normally. The failure is source-dependent, which is the
+signature of a packet filter, not a routing problem.
+
+The TWIST: the ticket asserts the wrong CAUSE -- a dead RIP daemon on router2.
+ripd is actually RUNNING and routing is HEALTHY: router2's RIP table is intact,
+it advertises and learns prefixes normally, and ip_forward is on. If ripd were
+down, ALL sources would lose reachability to the far networks -- but Office and
+Principle still get through, which a routing-table outage cannot explain. The
+selective, source-based drop only fits a FORWARD-chain ACL. The routing daemon
+is fine; an iptables rule is silently dropping IT/CS transit.
+
+Correct diagnosis: is_anomaly=true, faulty_devices = router2 (two iptables
+FORWARD DROP rules, one for source 192.168.1.0/24 and one for 192.168.2.0/24;
+describing the pair as the 192.168.1.0/23 span is equally correct, and the
+rules may render in nftables form under the iptables-nft backend -- either
+tool name is acceptable). The agent must verify routing is healthy (ripd up,
+RIP routes present), inspect the firewall, and explicitly reject the "ripd
+died" narrative. An agent that restarts ripd / "confirms the daemon is down"
+has followed the ticket's framing instead of the evidence. Fix:
+`iptables -D FORWARD -s 192.168.1.0/24 -j DROP && iptables -D FORWARD -s
+192.168.2.0/24 -j DROP` on router2.
+
+[FIX]
+remove both DROP rules on router2 — `iptables -D FORWARD -s 192.168.1.0/24 -j DROP && iptables -D FORWARD -s 192.168.2.0/24 -j DROP`
+
+[DIAGNOSTIC-PROCESS]
+1. Scope the selective failure: confirm IT (192.168.1.0/24) and CS
+   (192.168.2.0/24) hosts cannot reach 1.0.0.x and 128.168.0.x, while Office
+   (192.168.3.x) and Principle (192.168.4.x) reach them normally -- then TEST
+   the ticket's "ripd died" claim rather than assuming it.
+2. Check the routing daemon (as accused): `pgrep ripd` on router2 is non-empty,
+   the RIP table is intact, and ip_forward is on. A dead ripd would break ALL
+   sources, not just two -- so the narrated cause does not fit the evidence.
+3. Inspect the ACL on the transit device: run `iptables -nL FORWARD` (or
+   `nft list ruleset` -- same rules under the iptables-nft backend) on router2
+   -- two DROP rules are present, one for source 192.168.1.0/24 (IT) and one
+   for 192.168.2.0/24 (CS).
+4. Confirm the source-filter mechanism: Office (192.168.3.x) and Principle
+   (192.168.4.x) match neither rule; IT and CS sources are dropped in the
+   FORWARD chain before delivery -- exactly the observed pattern.
+5. Localize to the root cause: an iptables FORWARD rule on router2 -- NOT a ripd
+   outage. Routing is healthy; the firewall is the fault.
+
+[SCORING-AXES]
+assert-identifies: router2
+must-identify-acl-drop: FORWARD-chain DROP rules on router2 filtering the IT (192.168.1.0/24) and CS (192.168.2.0/24) source ranges (two /24 rules; describing them as one /23 span, or in nftables terms, is equally correct)
+bonus-rules-out-ripd-down: notes ripd is running and the RIP table is intact, so a dead daemon is ruled out (a routing outage would break all sources, not just IT/CS)
+# These axes score the outcome metric only; fix and reasoning are judged separately.
+
+[NIKA-LABEL]
+nika_label: icmp_acl_block
+nika_category: MISCONFIGURATION
+in_taxonomy: true
+note: partial: ACL drops RFC1918 transit broadly (NIKA acl_block is per-protocol); prompt misdescribes the cause as a router2 ripd outage (robustness perturbation dimension)

@@ -1,0 +1,159 @@
+{
+  "scenario": {
+    "scenario_id": "ospf-enterprise-dns-named-down-misdescribed",
+    "topology": "ospf_enterprise_static",
+    "fault_family": "service down (misdescribed ticket -- wrong cause)",
+    "prompt_to_agent": "Helpdesk ticket #8843: Users report that internal names (\"web0.local\",\n\"web1.local\") will not resolve from host_1_1_1_1. The team is convinced the\ncampus DNS server lost its network path -- they say \"we can't reach the DNS\nserver anymore, the routing to 10.200.0.2 must be down\" -- and want the OSPF\nroute / core path to the DNS server fixed. Please find and confirm the real\nfault and tell us which device to restart.",
+    "injection": {
+      "device": "dns_server",
+      "action": "stop the BIND (named) DNS service on dns_server",
+      "command": "pkill -9 named",
+      "note": null
+    },
+    "pre_check": [],
+    "post_inject_check": [
+      {
+        "device": "dns_server",
+        "command": "pgrep named",
+        "expect": "empty"
+      },
+      {
+        "device": "host_1_1_1_1",
+        "command": "ping -W2 -c2 10.200.0.3",
+        "expect": "0% loss"
+      }
+    ],
+    "ground_truth": "The real fault is on dns_server: its BIND (named) service is stopped, so the\ncampus DNS no longer resolves names -- web0.local, web1.local and the other\n*.local names fail to resolve, which is why the portals never load by name. The\nticket MISDESCRIBES the cause as a lost network path to the DNS server, but the\nnetwork is healthy: host_1_1_1_1 (10.1.1.2) reaches dns_server (10.200.0.2) at\nthe IP layer with 0% loss across the OSPF core (areas 0/1), and the OSPF route to\nthe server farm is present. The symptom is purely dead name resolution -- the\nright device, wrong cause: it is a service fault on dns_server, not a\nrouting/network fault.\n\nThe correct diagnosis identifies dns_server (DNS/named service down) as the\nfaulty device and explicitly RULES OUT the network: the host reaches 10.200.0.2\nby ping and the OSPF route to it is fine, so the user's \"routing to the DNS\nserver is down\" hypothesis is wrong. An agent that chases the OSPF core / a\nbackbone route to the server farm to match the ticket has followed the ticket's\nmistaken cause instead of the evidence.",
+    "fix_spec": "Restart the BIND DNS service on dns_server (e.g. `systemctl start named`). Once\nnamed is resolving again, web0.local / web1.local resolve to their server IPs and\nthe portals load normally. The network and OSPF routing need no change.",
+    "scoring_axes": [
+      "assert-identifies: dns_server",
+      "must-identify-dns-down: identifies the DNS/named service on dns_server is stopped (names do not resolve), not a routing or network fault",
+      "bonus-rules-out-network: explicitly notes the network/OSPF path to 10.200.0.2 is healthy (ping/route succeed), rejecting the ticket's \"routing to the DNS server is down\" cause"
+    ],
+    "source_path": "dataset/nika_ospf_Q/cex/ospf-enterprise-dns-named-down-misdescribed.txt",
+    "scenario_class": "wrong-cause",
+    "ticket_style": "standard"
+  },
+  "agent": "sade",
+  "timestamp": "2026-07-31T01:05:17.236979+00:00",
+  "phases": {
+    "lstart": {
+      "ok": true,
+      "containers": 15,
+      "expected": 15
+    },
+    "settle": {
+      "converge_wait": 90
+    },
+    "injection": {
+      "applied": true,
+      "skipped_reason": null,
+      "rc": 0,
+      "output": ""
+    },
+    "post_inject_check": {
+      "results": [
+        {
+          "line": {
+            "device": "dns_server",
+            "command": "pgrep named",
+            "expect": "empty"
+          },
+          "passed": true,
+          "actual": "",
+          "rationale": "output empty"
+        },
+        {
+          "line": {
+            "device": "host_1_1_1_1",
+            "command": "ping -W2 -c2 10.200.0.3",
+            "expect": "0% loss"
+          },
+          "passed": true,
+          "actual": "PING 10.200.0.3 (10.200.0.3) 56(84) bytes of data.\n64 bytes from 10.200.0.3: icmp_seq=1 ttl=60 time=1.70 ms\n64 bytes from 10.200.0.3: icmp_seq=2 ttl=60 time=1.75 ms\n\n--- 10.200.0.3 ping statistics ---\n2 packets transmitted, 2 received, 0% packet loss, time 1016ms\nrtt min/avg/max/mdev = 1.697/1.723/1.750/0.026 ms",
+          "rationale": "loss=0%"
+        }
+      ],
+      "wait_seconds": 0
+    },
+    "agent": {
+      "diagnosis_text": "**Affected component:** The BIND `named` DNS daemon on `dns_server` (10.200.0.2).\n\n**Mechanism:** Both campus hosts (`host_1_1_1_1` and `host_2_1_1_1`) correctly point their resolver at `10.200.0.2`. When they send UDP/TCP queries to port 53, there is no process listening \u2014 `named` has crashed \u2014 so every query silently fails, returning no addresses for `web0.local` through `web3.local`. With no IP resolved, all subsequent HTTP requests also fail (curl code 000). The failure is universal across both hosts and all four `.local` names because it is entirely server-side.\n\n**Localization:** `dns_server` \u2014 `named.service` is loaded and set to *enabled* in systemd, but its runtime state is `failed`. No `named`/`bind9`/`dnsmasq` process exists (`pgrep` empty); `ss` shows nothing bound to port 53; nftables contains only Docker-internal loopback NAT rules that are irrelevant to inbound DNS queries.\n\n**Routing claim debunked:** Phase 1 (get_reachability) confirms `host_1_1_1_1` reaches `10.200.0.3` (same /24 as `dns_server`) with 0% loss. Phase B (ospf_snapshot) shows all six FRR routers with Full adjacencies and 10 OSPF routes each. The path to `10.200.0.2` is intact; the DNS daemon is simply not running.\n\n**Root cause:** The `named` daemon on `dns_server` is in a systemd `failed` state \u2014 it either crashed after lab startup or failed to start \u2014 leaving port 53 with no listener.\n\n**Fix:** Run `systemctl start named` (or `systemctl restart named`) on `dns_server` to bring the BIND daemon back up. No routing or OSPF changes are needed.",
+      "is_anomaly": true,
+      "faulty_devices": [
+        "dns_server"
+      ],
+      "parsed_ok": true,
+      "in_tokens": 21,
+      "cache_read_tokens": 189090,
+      "cache_write_tokens": 26966,
+      "out_tokens": 7726,
+      "cost_usd": 0.27497550000000004,
+      "tool_calls": 13,
+      "hit_max_turns": false,
+      "error": null
+    },
+    "score": {
+      "must_passed": 2,
+      "must_total": 2,
+      "bonus_passed": 1,
+      "bonus_total": 1,
+      "outcome_score": 1.0,
+      "fix_score": 1.0,
+      "reasoning_score": 1.0,
+      "reasoning_dims": {
+        "grounding": 1.0,
+        "causality": 1.0,
+        "coverage": 1.0
+      },
+      "final_score": 1.0,
+      "per_axis": [
+        {
+          "axis": "assert-identifies: dns_server",
+          "kind": "assert",
+          "score": 1.0,
+          "rationale": "culprit 'dns_server' named (good)"
+        },
+        {
+          "axis": "must-identify-dns-down: identifies the DNS/named service on dns_server is stopped (names do not resolve), not a routing or network fault",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The report explicitly states named on dns_server is failed/not listening on port 53, causing name resolution to fail, and it rules out routing by showing ping/OSPF reachability to 10.200.0.2."
+        },
+        {
+          "axis": "bonus-rules-out-network: explicitly notes the network/OSPF path to 10.200.0.2 is healthy (ping/route succeed), rejecting the ticket's \"routing to the DNS server is down\" cause",
+          "kind": "bonus",
+          "score": 1.0,
+          "rationale": "The report explicitly debunks the routing hypothesis by citing host reachability and healthy OSPF adjacencies and stating the path to 10.200.0.2 is intact."
+        },
+        {
+          "axis": "[FIX]",
+          "kind": "fix",
+          "score": 1.0,
+          "rationale": "Recommends starting/restarting the named (BIND) service on dns_server, which directly restores DNS resolution as expected."
+        },
+        {
+          "axis": "reason:grounding",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "The agent's log contains direct observations (reachability, OSPF, service scans, process/listener checks) that support every key claim; the conclusion that the DNS daemon on dns_server is down and the network is healthy follows logically and the investigation covered necessary checks."
+        },
+        {
+          "axis": "reason:causality",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "The agent's log contains direct observations (reachability, OSPF, service scans, process/listener checks) that support every key claim; the conclusion that the DNS daemon on dns_server is down and the network is healthy follows logically and the investigation covered necessary checks."
+        },
+        {
+          "axis": "reason:coverage",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "The agent's log contains direct observations (reachability, OSPF, service scans, process/listener checks) that support every key claim; the conclusion that the DNS daemon on dns_server is down and the network is healthy follows logically and the investigation covered necessary checks."
+        }
+      ],
+      "judge_model": "gpt-5-mini",
+      "reasoning_mode": "trace",
+      "error": null
+    }
+  },
+  "agent_input_prompt": "# Topology overview (devices + L2 connectivity)\nTopology: ospf_enterprise_static\n\nDevices:\n  Routers (FRR): router_core_1, router_core_2, router_core_3, switch_dist_1_1, switch_dist_2_1, switch_server_access\n  Switches: switch_access_1_1_1, switch_access_2_1_1\n  Hosts: host_1_1_1_1, host_2_1_1_1\n  Dns servers: dns_server\n  Web servers: web_server_0, web_server_1, web_server_2, web_server_3\n\nLinks (device:iface <-> device:iface):\n  router_core_1:eth0 <-> router_core_2:eth0\n  router_core_1:eth1 <-> router_core_3:eth0\n  router_core_1:eth2 <-> switch_dist_1_1:eth0\n  router_core_2:eth1 <-> router_core_3:eth1\n  router_core_2:eth2 <-> switch_dist_2_1:eth0\n  router_core_3:eth2 <-> switch_server_access:eth5\n  switch_access_1_1_1:eth1 <-> host_1_1_1_1:eth0\n  switch_access_2_1_1:eth1 <-> host_2_1_1_1:eth0\n  switch_dist_1_1:eth1 <-> switch_access_1_1_1:eth0\n  switch_dist_2_1:eth1 <-> switch_access_2_1_1:eth0\n  dns_server:eth0 <-> switch_server_access:eth0\n  web_server_0:eth0 <-> switch_server_access:eth1\n  web_server_1:eth0 <-> switch_server_access:eth2\n  web_server_2:eth0 <-> switch_server_access:eth3\n  web_server_3:eth0 <-> switch_server_access:eth4\n\n# Symptom (user report)\nHelpdesk ticket #8843: Users report that internal names (\"web0.local\",\n\"web1.local\") will not resolve from host_1_1_1_1. The team is convinced the\ncampus DNS server lost its network path -- they say \"we can't reach the DNS\nserver anymore, the routing to 10.200.0.2 must be down\" -- and want the OSPF\nroute / core path to the DNS server fixed. Please find and confirm the real\nfault and tell us which device to restart."
+}

@@ -1,0 +1,81 @@
+==================================================
+Scenario: dc-clos-leaf0-spine1-link-down
+Topology: dc_clos_bgp
+Fault family: link cut (fabric tier, redundancy/ECMP degradation)
+==================================================
+
+[PROMPT-TO-AGENT]
+Monitoring flagged that leaf_router_0_0's BGP session toward
+spine_router_0_1 went down and has not recovered. A couple of users
+mentioned a brief blip around that time, but traffic between pc_0_0
+(10.0.0.2) and pc_0_1 (10.0.1.2) has been flowing since --
+leaf_router_0_0 is currently reaching the fabric through
+spine_router_0_0 only. The session toward spine_router_0_0 and all
+other fabric sessions are healthy. Find what broke and where.
+
+[INJECTION]
+device: leaf_router_0_0
+action: bring down the uplink to spine_router_0_1
+cmd: ip link set eth1 down
+
+[POST-INJECT-CHECK]
+leaf_router_0_0    ip -br link show eth1 | grep -c UP  => expect 0
+spine_router_0_1   ping -W2 -c2 172.16.0.9             => expect loss>0
+
+[GROUND-TRUTH]
+Affected component: leaf_router_0_0 eth1, the 172.16.0.8/31 fabric
+  link between leaf_router_0_0 (172.16.0.9) and spine_router_0_1
+  (172.16.0.8)
+Mechanism: leaf_router_0_0 normally has two spine paths -- eth0 to
+  spine_router_0_0 (172.16.0.4/31) and eth1 to spine_router_0_1
+  (172.16.0.8/31) -- and its BGP table holds the remote host prefix
+  via both spines (the FIB installs one best path; no maximum-paths is
+  configured on this minimal fabric). With eth1 down, the leaf's
+  session to spine_router_0_1 drops and its path set for 10.0.1.0/24
+  degrades from two spine paths to one; the fabric has lost its
+  redundancy for this leaf. Steady-state reachability is preserved via
+  spine_router_0_0 (a brief reroute transient is possible while the
+  spine side ages out the dead session, since the leaf's admin-down
+  does not drop carrier on the spine's side of the bridge-based link).
+Localization: leaf_router_0_0 eth1 (or equivalently the
+  leaf_router_0_0 <-> spine_router_0_1 link, 172.16.0.8/31 -- the DOWN
+  interface is on the leaf side; spine_router_0_1's eth1 still shows UP)
+Root cause: leaf_router_0_0's spine-facing interface eth1 is down
+Fix: `ip link set eth1 up` on leaf_router_0_0; the BGP session to
+  spine_router_0_1 re-establishes on its own.
+
+[FIX]
+`ip link set eth1 up` on leaf_router_0_0. Once the interface is UP the
+172.16.0.8/31 link carries the session to spine_router_0_1 again and
+the leaf regains its second spine path.
+
+[DIAGNOSTIC-PROCESS]
+1. Scope the symptom pattern: exactly one session (leaf_router_0_0 <->
+   spine_router_0_1) is down; everything else is Established and
+   pc_0_0 <-> pc_0_1 traffic flows -- consistent with losing one of two
+   redundant paths, not a device failure.
+2. Layer 1/2 first: on leaf_router_0_0, `ip -br link` shows eth1 DOWN;
+   its other uplink eth0 and host port eth2 are UP.
+3. Confirm the link identity: eth1 carries 172.16.0.9/31, the p2p link
+   to spine_router_0_1 (172.16.0.8) -- the same adjacency monitoring
+   flagged. From spine_router_0_1, pinging 172.16.0.9 fails.
+4. Correlate with the routing plane: leaf_router_0_0's BGP table now
+   holds 10.0.1.0/24 via spine_router_0_0 only (one path instead of
+   two) -- redundancy is gone but a valid path remains, matching the
+   "blip then normal" user reports.
+5. Localize to the downed interface: bgpd is running on both devices
+   and their configs are intact, so the lowest-layer cause is
+   leaf_router_0_0's eth1 being down.
+
+[SCORING-AXES]
+assert-identifies: leaf_router_0_0
+must-identify-affected-link: leaf_router_0_0 eth1 <-> spine_router_0_1 (172.16.0.8/31)
+must-identify-component: fabric interface / link down (leaf side)
+must-distinguish-symptom-pattern: single session down with traffic still flowing -- redundancy degraded from two spine paths to one, not an outage
+bonus-notes-path-count: shows the leaf's path set for the remote prefix dropped to a single spine path (e.g. one path in `show bgp` instead of two)
+# These axes score the outcome metric only; fix and reasoning are judged separately.
+
+[NIKA-LABEL]
+nika_label: link_down
+nika_category: LINK_FAILURE
+in_taxonomy: true

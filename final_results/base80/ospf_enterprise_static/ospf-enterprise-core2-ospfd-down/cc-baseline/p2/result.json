@@ -1,0 +1,181 @@
+{
+  "scenario": {
+    "scenario_id": "ospf-enterprise-core2-ospfd-down",
+    "topology": "ospf_enterprise_static",
+    "fault_family": "routing daemon down",
+    "prompt_to_agent": "Helpdesk ticket #8871: host_2_1_1_1 (10.2.1.2) reports it has lost everything\nbeyond its own gateway: every 10.200.0.x server times out, and it cannot reach\nhost_1_1_1_1 in the other pod either. It CAN still ping its gateway 10.2.1.1.\nPod 1 is unaffected -- host_1_1_1_1 reaches the server farm normally. Diagnose.",
+    "injection": {
+      "device": "router_core_2",
+      "action": "kill the OSPF daemon (ospfd) on router_core_2 and stop watchfrr from respawning it",
+      "command": "pkill -9 watchfrr; pkill -9 ospfd",
+      "note": null
+    },
+    "pre_check": [],
+    "post_inject_check": [
+      {
+        "device": "router_core_2",
+        "command": "pgrep ospfd",
+        "expect": "empty"
+      },
+      {
+        "device": "host_2_1_1_1",
+        "command": "ping -W2 -c2 10.200.0.2",
+        "expect": "loss>0"
+      },
+      {
+        "device": "host_1_1_1_1",
+        "command": "ping -W2 -c2 10.200.0.2",
+        "expect": "0% loss   (pod 1 unaffected)"
+      }
+    ],
+    "ground_truth": "Affected component: router_core_2 ospfd\nMechanism: router_core_2 is pod 2's only way out: switch_dist_2_1's single\n  uplink (172.16.0.8/31, area 1) terminates on router_core_2, which as the\n  pod-2 ABR carries 10.2.1.0/24 between area 1 and the area-0 backbone. With\n  ospfd killed, zebra flushes router_core_2's OSPF routes immediately, so\n  pod-2 traffic arriving at router_core_2 has no route and dies there; the\n  other routers then age out router_core_2's LSAs and withdraw 10.2.1.0/24.\n  Pod 1 (host -> switch_dist_1_1 -> router_core_1 -> router_core_3 -> farm)\n  never transits router_core_2, so it stays healthy.\nLocalization: router_core_2\nRoot cause: ospfd not running on router_core_2\nFix: restart FRR on router_core_2 (`service frr restart`).\n\nObservable note (same kill pattern lab-verified on this topology 2026-07-03):\nospfd is killed together with watchfrr (its watchdog), so nothing respawns it.\nvtysh remains responsive via zebra, `show running-config` simply contains NO\n`router ospf` section, and `show daemons` no longer lists ospfd. An agent may\ntherefore correctly describe this fault as \"the ospf configuration is\nmissing/empty on router_core_2\" -- that is the same fault observed at the\nconfig plane, and must NOT be treated as a wrong root cause.",
+    "fix_spec": "Restart FRR / the OSPF daemon on router_core_2 (`service frr restart`).\nUnlike the vtysh-provisioned Kath labs, this topology keeps its OSPF config\nin /etc/frr/frr.conf (the injection killed the process, not the file), so a\nplain restart reloads the full configuration, OSPF re-converges, and pod 2\nregains connectivity.",
+    "scoring_axes": [
+      "assert-identifies: router_core_2",
+      "must-identify-device: router_core_2",
+      "must-identify-component: ospfd / OSPF daemon down",
+      "bonus-scopes-blast-radius: notes pod 1 and the server farm stay healthy, isolating the fault to pod 2's transit through router_core_2"
+    ],
+    "source_path": "dataset/nika_ospf_Q/base/ospf-enterprise-core2-ospfd-down.txt",
+    "scenario_class": "base",
+    "ticket_style": "standard"
+  },
+  "agent": "cc-baseline",
+  "timestamp": "2026-08-03T09:24:41.593950+00:00",
+  "phases": {
+    "lstart": {
+      "ok": true,
+      "containers": 15,
+      "expected": 15
+    },
+    "settle": {
+      "converge_wait": 90
+    },
+    "injection": {
+      "applied": true,
+      "skipped_reason": null,
+      "rc": 0,
+      "output": ""
+    },
+    "post_inject_check": {
+      "results": [
+        {
+          "line": {
+            "device": "router_core_2",
+            "command": "pgrep ospfd",
+            "expect": "empty"
+          },
+          "passed": true,
+          "actual": "",
+          "rationale": "output empty"
+        },
+        {
+          "line": {
+            "device": "host_2_1_1_1",
+            "command": "ping -W2 -c2 10.200.0.2",
+            "expect": "loss>0"
+          },
+          "passed": true,
+          "actual": "PING 10.200.0.2 (10.200.0.2) 56(84) bytes of data.\n\n--- 10.200.0.2 ping statistics ---\n2 packets transmitted, 0 received, 100% packet loss, time 1106ms",
+          "rationale": "loss=100%"
+        },
+        {
+          "line": {
+            "device": "host_1_1_1_1",
+            "command": "ping -W2 -c2 10.200.0.2",
+            "expect": "0% loss   (pod 1 unaffected)"
+          },
+          "passed": true,
+          "actual": "PING 10.200.0.2 (10.200.0.2) 56(84) bytes of data.\n64 bytes from 10.200.0.2: icmp_seq=1 ttl=60 time=2.02 ms\n64 bytes from 10.200.0.2: icmp_seq=2 ttl=60 time=1.87 ms\n\n--- 10.200.0.2 ping statistics ---\n2 packets transmitted, 2 received, 0% packet loss, time 1081ms\nrtt min/avg/max/mdev = 1.873/1.947/2.022/0.074 ms",
+          "rationale": "loss=0%"
+        }
+      ],
+      "wait_seconds": 0
+    },
+    "agent": {
+      "diagnosis_text": "The ospfd process on router_core_2 crashed approximately 42 seconds after lab\nstartup and has not been restarted. FRR logs confirm the sequence: ospfd loaded\nits configuration correctly at 09:24:54, briefly completed OSPF DD negotiation\nwith router_core_1 (neighbour 172.16.0.0) at 09:25:43, then Zebra reported\n\"Client 'ospf' (session id 0) encountered an error and is shutting down\" at\n09:26:25, immediately withdrawing all 9 OSPF routes from the kernel RIB. The\ncurrent process table on router_core_2 shows only zebra, mgmtd, and staticd \u2014\nospfd is absent. Crucially, watchfrr is also not running, so the crash was\npermanent rather than self-healing.\n\nWithout ospfd, router_core_2 has no OSPF routes: its RIB contains only its\nthree directly connected /31 transit links. switch_dist_2_1 (pod-2 distribution\nlayer) peers with router_core_2 over 172.16.0.8/31 and likewise has no routes\nbeyond its directly connected segments. As a result, any traffic from\nhost_2_1_1_1 that reaches its gateway (10.2.1.1 on switch_dist_2_1) is\nblack-holed at router_core_2 for all non-local destinations \u2014 the 10.200.0.0/24\nserver farm and the 10.1.1.0/24 pod-1 subnet alike. Pod 1 is unaffected because\nrouter_core_1 is healthy and retains a full OSPF table.\n\nRoot cause: ospfd on router_core_2 was killed or crashed post-startup with\nwatchfrr also absent, leaving the router permanently without OSPF.\n\nCorrective fix: Restart ospfd on router_core_2 (e.g., `service frr restart` or\n`/usr/lib/frr/ospfd -d -F traditional -A 127.0.0.1`). Also ensure watchfrr is\nrunning (`/usr/lib/frr/watchfrr -d zebra mgmtd staticd ospfd`) so future ospfd\ncrashes trigger automatic recovery.",
+      "is_anomaly": true,
+      "faulty_devices": [
+        "router_core_2"
+      ],
+      "parsed_ok": true,
+      "in_tokens": 12,
+      "cache_read_tokens": 110105,
+      "cache_write_tokens": 18673,
+      "out_tokens": 5375,
+      "cost_usd": 0.18491525,
+      "tool_calls": 18,
+      "hit_max_turns": false,
+      "error": null
+    },
+    "score": {
+      "must_passed": 3,
+      "must_total": 3,
+      "bonus_passed": 0,
+      "bonus_total": 1,
+      "outcome_score": 0.7,
+      "fix_score": 1.0,
+      "reasoning_score": 0.9666666666666667,
+      "reasoning_dims": {
+        "grounding": 0.9,
+        "causality": 1.0,
+        "coverage": 1.0
+      },
+      "final_score": 0.7,
+      "per_axis": [
+        {
+          "axis": "assert-identifies: router_core_2",
+          "kind": "assert",
+          "score": 1.0,
+          "rationale": "culprit 'router_core_2' named (good)"
+        },
+        {
+          "axis": "must-identify-device: router_core_2",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The agent explicitly identifies router_core_2 as the affected device and attributes the ospfd crash and missing routes to it."
+        },
+        {
+          "axis": "must-identify-component: ospfd / OSPF daemon down",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The agent explicitly states ospfd on router_core_2 crashed/was killed and is absent from the process table, identifying the OSPF daemon as down."
+        },
+        {
+          "axis": "bonus-scopes-blast-radius: notes pod 1 and the server farm stay healthy, isolating the fault to pod 2's transit through router_core_2",
+          "kind": "bonus",
+          "score": 0.0,
+          "rationale": "The diagnosis notes Pod 1 is unaffected but does not confirm the server farm stays healthy\u2014in fact it contradictorily claims the server farm is black-holed\u2014so it fails to isolate the fault solely to Pod 2's transit through router_core_2."
+        },
+        {
+          "axis": "[FIX]",
+          "kind": "fix",
+          "score": 1.0,
+          "rationale": "Recommends restarting ospfd/FRR (e.g., service frr restart) and enabling watchfrr for automatic recovery, which matches the expected corrective fix."
+        },
+        {
+          "axis": "reason:grounding",
+          "kind": "reason-dim",
+          "score": 0.9,
+          "rationale": "The agent's investigation log contains direct observations (process list, routing table snippets, FRR logs) that support the diagnosis that ospfd crashed on router_core_2 and was not restarted; the causal chain from crash \u2192 route withdrawal \u2192 pod-2 blackhole is logical and well-supported, and the checks cover the required surfaces. Minor truncation of some command outputs is present but does not undermine the core evidence."
+        },
+        {
+          "axis": "reason:causality",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "The agent's investigation log contains direct observations (process list, routing table snippets, FRR logs) that support the diagnosis that ospfd crashed on router_core_2 and was not restarted; the causal chain from crash \u2192 route withdrawal \u2192 pod-2 blackhole is logical and well-supported, and the checks cover the required surfaces. Minor truncation of some command outputs is present but does not undermine the core evidence."
+        },
+        {
+          "axis": "reason:coverage",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "The agent's investigation log contains direct observations (process list, routing table snippets, FRR logs) that support the diagnosis that ospfd crashed on router_core_2 and was not restarted; the causal chain from crash \u2192 route withdrawal \u2192 pod-2 blackhole is logical and well-supported, and the checks cover the required surfaces. Minor truncation of some command outputs is present but does not undermine the core evidence."
+        }
+      ],
+      "judge_model": "gpt-5-mini",
+      "reasoning_mode": "trace",
+      "error": null
+    }
+  },
+  "agent_input_prompt": "# Topology overview (devices + L2 connectivity)\nTopology: ospf_enterprise_static\n\nDevices:\n  Routers (FRR): router_core_1, router_core_2, router_core_3, switch_dist_1_1, switch_dist_2_1, switch_server_access\n  Switches: switch_access_1_1_1, switch_access_2_1_1\n  Hosts: host_1_1_1_1, host_2_1_1_1\n  Dns servers: dns_server\n  Web servers: web_server_0, web_server_1, web_server_2, web_server_3\n\nLinks (device:iface <-> device:iface):\n  router_core_1:eth0 <-> router_core_2:eth0\n  router_core_1:eth1 <-> router_core_3:eth0\n  router_core_1:eth2 <-> switch_dist_1_1:eth0\n  router_core_2:eth1 <-> router_core_3:eth1\n  router_core_2:eth2 <-> switch_dist_2_1:eth0\n  router_core_3:eth2 <-> switch_server_access:eth5\n  switch_access_1_1_1:eth1 <-> host_1_1_1_1:eth0\n  switch_access_2_1_1:eth1 <-> host_2_1_1_1:eth0\n  switch_dist_1_1:eth1 <-> switch_access_1_1_1:eth0\n  switch_dist_2_1:eth1 <-> switch_access_2_1_1:eth0\n  dns_server:eth0 <-> switch_server_access:eth0\n  web_server_0:eth0 <-> switch_server_access:eth1\n  web_server_1:eth0 <-> switch_server_access:eth2\n  web_server_2:eth0 <-> switch_server_access:eth3\n  web_server_3:eth0 <-> switch_server_access:eth4\n\n# Symptom (user report)\nHelpdesk ticket #8871: host_2_1_1_1 (10.2.1.2) reports it has lost everything\nbeyond its own gateway: every 10.200.0.x server times out, and it cannot reach\nhost_1_1_1_1 in the other pod either. It CAN still ping its gateway 10.2.1.1.\nPod 1 is unaffected -- host_1_1_1_1 reaches the server farm normally. Diagnose."
+}

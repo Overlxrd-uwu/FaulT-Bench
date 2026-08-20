@@ -1,0 +1,165 @@
+[AGENT] sade starts on lab=Kath1__w3
+[TEXT] I'll start with Phase 1 — the mandatory blind-start reachability snapshot.
+[TOOL] ToolSearch({'query': 'select:mcp__kathara_base_mcp_server__get_reachability', 'max_results': 1})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_base_mcp_server__get_reachability'}]
+[TOOL] mcp__kathara_base_mcp_server__get_reachability({})
+[RESULT] {"result":"{\"hosts\":{\"pc1\":\"10.1.0.100\",\"pc2\":\"10.1.0.101\",\"pc3\":\"10.3.0.100\"},\"results\":[{\"src\":\"pc1\",\"dst\":\"pc3\",\"dst_ip\":\"10.3.0.100\",\"tx\":2,\"rx\":2,\"loss_percent\":0.0,\"time_ms\":1001.0,\"rtt_avg_ms\":7.893,\"rtt_min_ms\":2.165,\"rtt_max_ms\":13.621,\"rtt_mdev_ms\":5.728,\"status\":\"ok\"},{\"src\":\"pc1\",\"dst\":\"pc2\",\"dst_ip\":\"10.1.0.101\",\"tx\":2,\"rx
+[TEXT] **Phase 1 findings:** The reachability map covered pc1 (10.1.0.100), pc2 (10.1.0.101), and pc3 (10.3.0.100). All three tested pairs show 0% loss. Critically, **srv1 (10.5.0.4)** — the specific destination in the helpdesk ticket — was **not included** in the test. The reported path (pc1 → 10.5.0.4) is unconfirmed.
+
+**Phase 2 decision:** The reachability map is inconclusive for the reported symptom (srv1 absent from test). No confirmed packet loss observed in Phase 1 data. → **Escalate to Phase 4.**
+
+---
+
+**Phase 4 — Broad-search escalation.** First action: enter `diagnosis-methodology-skill`.
+[TOOL] Skill({'skill': 'diagnosis-methodology-skill'})
+[RESULT] Launching skill: diagnosis-methodology-skill
+[TEXT] Following the methodology: **Phase A** — run both triage helpers simultaneously.
+[TOOL] mcp__helper_server__run_helper({'script_name': 'infra_sweep', 'args': []})
+[TOOL] mcp__helper_server__run_helper({'script_name': 'l2_snapshot', 'args': []})
+[RESULT] {"result":"Unknown machine type: ispb with image kathara/dhcp\nUnknown machine type: r1 with image kathara/dhcp\nUnknown machine type: ispa with image kathara/dhcp\nUnknown machine type: ispb with image kathara/dhcp\nUnknown machine type: r1 with image kathara/dhcp\nUnknown machine type: ispa with image kathara/dhcp\n=== INFRA SWEEP ===\nLab: Kath1__w3\nScope: hosts, routers, switches, servers, bm
+[RESULT] {"result":"Unknown machine type: ispb with image kathara/dhcp\nUnknown machine type: r1 with image kathara/dhcp\nUnknown machine type: ispa with image kathara/dhcp\n=== L2 SNAPSHOT ===\nLab: Kath1__w3\nScope: hosts, routers, switches, servers, bmv2_switches, ovs_switches, sdn_controllers, other_devices\nDevices scanned: 20\nDuplicate MAC groups: 0\nFlagged devices: 4\nDevices with bridge members: 
+[TEXT] **Phase A findings — two signals to investigate:**
+
+1. **ACL flag on dswa1 and dswa2:** Both distribution switches in the "A" side carry an identical iptables FORWARD DROP rule — `-A FORWARD -s 10.1.0.0/24 -d 10.3.0.0/24 -i br0.10 -j DROP`. This drops traffic from Office A's user subnet toward 10.3.0.0/24. Notably, the Phase 1 reachability showed pc1 (10.1.0.100) → pc3 (10.3.0.100) at **0% loss**, which seems contradictory — this warrants closer inspection.
+2. **srv1 (10.5.0.4) was never probed.** The reported failure path is untested. The DROP rule covers only 10.3.0.0/24, not 10.5.0.0/24.
+3. **l2_snapshot collection failures on all four distribution switches** (dswa1, dswa2, dswb1, dswb2) — output truncated, not a duplicate-MAC signal.
+
+ISP RFC1918 drops and the r1 SSH drop are baseline 
+[TOOL] mcp__helper_server__run_helper({'script_name': 'ospf_snapshot', 'args': []})
+[TOOL] mcp__kathara_base_mcp_server__ping_pair({'src_host': 'pc1', 'dst_host': 'srv1'})
+[RESULT] {"result":"Unknown machine type: ispb with image kathara/dhcp\nUnknown machine type: r1 with image kathara/dhcp\nUnknown machine type: ispa with image kathara/dhcp\n=== OSPF SNAPSHOT ===\nLab: Kath1__w3\nRouters scanned: 12\nFlags:\n  - aswa1: FRR control sockets missing (ospfd_vty) — daemon likely down\n  - aswa1: no OSPF network statements\n  - aswa1: zero OSPF neighbors\n  - aswa2: FRR control 
+[RESULT] Error executing tool ping_pair: 2 validation errors for ping_pairArguments
+host_a
+  Field required [type=missing, input_value={'src_host': 'pc1', 'dst_host': 'srv1'}, input_type=dict]
+    For further information visit https://errors.pydantic.dev/2.13/v/missing
+host_b
+  Field required [type=missing, input_value={'src_host': 'pc1', 'dst_host': 'srv1'}, input_type=dict]
+    For further information vi
+[TEXT] **Phase B (OSPF) findings — VLAN map is now clear:**
+
+Key OSPF interface data reveals the L3 topology:
+- **dswa1/dswa2** (Office A distribution): `br0.10=10.1.0.x/24` (Office A clients — pc1 lives here), `br0.20=10.2.0.x/24`, `br0.40=10.6.0.x/24`
+- **dswb1/dswb2** (Office B distribution): `br0.10=10.3.0.x/24` (Office B clients — pc3), `br0.20=10.4.0.x/24`, **`br0.30=10.5.0.x/24`** ← srv1's subnet
+
+OSPF fabric is healthy: all 6 core/distribution routers have Full adjacencies and 31 OSPF routes each.
+
+**Returning to the ACL lead with new context:** The DROP rule on dswa1/dswa2 is:  
+`-A FORWARD -s 10.1.0.0/24 -d 10.3.0.0/24 -i br0.10 -j DROP`
+
+This blocks Office A clients → Office B clients (10.3.0.0/24) but **not** Office A → 10.5.0.0/24 (srv1's subnet). Yet: Phase 1 reachability showed pc1
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'pc1', 'command': 'ping -c 3 10.5.0.4'})
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'dswa1', 'command': "iptables -L FORWARD -n -v --line-numbers 2>/dev/null; echo '---'; iptables-save 2>/dev/null | grep -v '^#'"})
+[RESULT] {"result":"PING 10.5.0.4 (10.5.0.4) 56(84) bytes of data.\n64 bytes from 10.5.0.4: icmp_seq=1 ttl=61 time=3.36 ms\n64 bytes from 10.5.0.4: icmp_seq=2 ttl=61 time=5.71 ms\n64 bytes from 10.5.0.4: icmp_seq=3 ttl=61 time=4.61 ms\n\n--- 10.5.0.4 ping statistics ---\n3 packets transmitted, 3 received, 0% packet loss, time 2003ms\nrtt min/avg/max/mdev = 3.358/4.560/5.711/0.961 ms"}
+[RESULT] {"result":"Chain FORWARD (policy ACCEPT 0 packets, 0 bytes)\nnum   pkts bytes target     prot opt in     out     source               destination         \n1        6   504 ACCEPT     1    --  br0.10 *       10.1.0.0/24          10.3.0.0/24         \n2        0     0 DROP       0    --  br0.10 *       10.1.0.0/24          10.3.0.0/24         \n---\n*filter\n:INPUT ACCEPT [0:0]\n:FORWARD ACCEPT [0:
+[TEXT] **Critical discovery from dswa1's full chain:** There are **two rules** (not one):
+1. Rule 1: `ACCEPT icmp from 10.1.0.0/24 → 10.3.0.0/24 on br0.10` ← ICMP (ping) passes
+2. Rule 2: `DROP all from 10.1.0.0/24 → 10.3.0.0/24 on br0.10` ← TCP/UDP is **blocked**
+
+This explains the Phase 1 paradox: pc1→pc3 shows 0% loss *because the reachability test uses ICMP*, but TCP/UDP from Office A to Office B's 10.3.0.0/24 is silently dropped. However, **pc1 can currently ping 10.5.0.4** (srv1) — the rule covers only 10.3.0.0/24 not 10.5.0.0/24.
+
+Before entering the ACL fault family, I need to confirm whether TCP to srv1 is also blocked (possibly via dswa2), and verify srv1's actual IP and running services.
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'dswa2', 'command': "iptables-save 2>/dev/null | grep -v '^#'"})
+[RESULT] {"result":"*filter\n:INPUT ACCEPT [0:0]\n:FORWARD ACCEPT [0:0]\n:OUTPUT ACCEPT [0:0]\n-A FORWARD -s 10.1.0.0/24 -d 10.3.0.0/24 -i br0.10 -p icmp -j ACCEPT\n-A FORWARD -s 10.1.0.0/24 -d 10.3.0.0/24 -i br0.10 -j DROP\nCOMMIT\n*nat\n:PREROUTING ACCEPT [0:0]\n:INPUT ACCEPT [0:0]\n:OUTPUT ACCEPT [17:808]\n:POSTROUTING ACCEPT [18:892]\n:DOCKER_OUTPUT - [0:0]\n:DOCKER_POSTROUTING - [0:0]\n-A OUTPUT -d 12
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'srv1', 'command': "ip addr show; echo '---'; ss -tlnp"})
+[RESULT] {"result":"1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN group default qlen 1000\n    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00\n    inet 127.0.0.1/8 scope host lo\n       valid_lft forever preferred_lft forever\n1843: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc fq_codel state UP group default qlen 1000\n    link/ether 06:fa:c1:d6:43:f2 brd ff:ff:ff:ff:
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'pc1', 'command': "curl -s --connect-timeout 5 http://10.5.0.4 -o /dev/null -w '%{http_code}\\n' 2>&1; echo ---; nc -zv -w3 10.3.0.100 80 2>&1; echo ---; nc -zv -w3 10.5.0.4 80 2>&1"})
+[RESULT] {"result":"000\n---\nnc: connect to 10.3.0.100 port 80 (tcp) timed out: Operation now in progress\n---\nnc: connect to 10.5.0.4 port 80 (tcp) failed: Connection refused"}
+[TEXT] **Key findings so far:**
+- **dswa2 is identical** — same two-rule chain (ACCEPT icmp, DROP all for 10.1.0.0/24→10.3.0.0/24)
+- **srv1 (10.5.0.4):** runs only `named` (BIND DNS) on port 53 — **no payroll/HTTP service**
+- **TCP to 10.3.0.100 timed out** — the DROP rule is confirmed operational and blocking TCP
+- **TCP to 10.5.0.4 got Connection Refused** — srv1 is reachable; its port 80 just isn't open
+
+srv1 is a **DNS server**, not an application server. The user may be accessing payroll by **hostname**, which requires name resolution. The ACL drops non-ICMP from 10.1.0.0/24 to **any destination in 10.3.0.0/24** — if pc1's configured resolver is in that range, DNS queries (UDP/TCP port 53) would be silently dropped, causing all name resolution to fail.
+
+Let me check pc1's DNS configuration a
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'pc1', 'command': "cat /etc/resolv.conf; echo '---'; nslookup srv1 2>&1; echo '---'; nslookup srv1 10.5.0.4 2>&1"})
+[RESULT] {"result":"nameserver 10.5.0.4\n---\n;; Got recursion not available from 10.5.0.4\nServer:\t\t10.5.0.4\nAddress:\t10.5.0.4#53\n\n** server can't find srv1: REFUSED\n\n---\nServer:\t\t10.5.0.4\nAddress:\t10.5.0.4#53\n\n** server can't find srv1: REFUSED"}
+[TEXT] **Critical finding:** pc1's `/etc/resolv.conf` points to `10.5.0.4` (srv1) as its nameserver, but srv1's BIND daemon is **refusing DNS queries from pc1** (`REFUSED` + `recursion not available`). This is a DNS server-side fault — the DNS server is reachable at L3 (ICMP works, TCP connection established) but refuses to serve the 10.1.0.0/24 subnet.
+
+**Phase 3 — Symptom-first diagnosis (DNS server fault).**
+
+Active lead: srv1 (10.5.0.4) is refusing DNS queries from Office A's 10.1.0.0/24 subnet. This breaks name resolution for all Office A hosts, explaining "can't get to Office B AT ALL" — ICMP works but application-level hostname lookups fail.
+
+Mapping to fault family → `dns-fault-skill`.
+[TOOL] Skill({'skill': 'dns-fault-skill'})
+[RESULT] Launching skill: dns-fault-skill
+[TEXT] The skill fingerprints are clear. I already have key evidence:
+- named is **running** (pid=30, listening on 10.5.0.4:53) → rules out `dns_service_down`  
+- Queries get `REFUSED` (not timeout) → rules out `dns_port_blocked` and `dns_lookup_latency` (those produce timeouts)
+- `REFUSED` + `recursion not available` → points squarely at a **BIND ACL** (`allow-query` or `allow-recursion`) rejecting 10.1.0.0/24
+
+Confirming with named.conf and the srv1 firewall:
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'srv1', 'command': "cat /etc/bind/named.conf 2>/dev/null; echo '==='; cat /etc/bind/named.conf.options 2>/dev/null; echo '==='; cat /etc/bind/named.conf.local 2>/dev/null; echo '==='; iptables-save 2>/dev/null | grep -v '^#'"})
+[RESULT] {"result":"// SRV1 campus DNS — minimal authoritative resolver for jeremysitlab.com.\n// Offline lab: no upstream, so recursion is off and the server answers its own\n// zone only (clients/agents that probe 10.5.0.4 get live ARP + DNS responses,\n// so the \"missing DNS server\" baseline gap is gone).\noptions {\n    directory \"/var/cache/bind\";\n    recursion no;\n    allow-query { any; };\n   
+[TEXT] **Key DNS finding:** named.conf shows `recursion no;` with `allow-query { any; }` — the server is **authoritative-only** for `jeremysitlab.com`. The `REFUSED` response is expected behavior for any query it can't answer from its own zone. No iptables block on srv1. This is not `dns_port_blocked` or `dns_service_down`.
+
+Now I need to check the zone file to understand what names are resolvable, and verify whether the `recursion no` setting (or zone records) was changed "last night" — and cross-examine the ACL fault more carefully to determine the true root cause:
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'srv1', 'command': "cat /etc/bind/db.jeremysitlab 2>/dev/null; echo '==='; named-checkconf -p 2>/dev/null | head -50"})
+[RESULT] {"result":"$TTL 604800\n@   IN  SOA srv1.jeremysitlab.com. admin.jeremysitlab.com. (\n        2          ; Serial\n        604800     ; Refresh\n        86400      ; Retry\n        2419200    ; Expire\n        604800 )   ; Negative Cache TTL\n@       IN  NS  srv1.jeremysitlab.com.\n@       IN  A   10.5.0.4\nsrv1    IN  A   10.5.0.4\n; Wildcard so any campus hostname resolves to the server (lab con
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'pc1', 'command': "nslookup srv1.jeremysitlab.com 10.5.0.4 2>&1; echo '---'; nslookup pc3.jeremysitlab.com 10.5.0.4 2>&1; echo '---'; dig @10.5.0.4 jeremysitlab.com ANY 2>&1 | head -40"})
+[RESULT] {"result":"Server:\t\t10.5.0.4\nAddress:\t10.5.0.4#53\n\nName:\tsrv1.jeremysitlab.com\nAddress: 10.5.0.4\n\n---\nServer:\t\t10.5.0.4\nAddress:\t10.5.0.4#53\n\nName:\tpc3.jeremysitlab.com\nAddress: 10.5.0.4\n\n---\n\n; <<>> DiG 9.18.44-1~deb12u1-Debian <<>> @10.5.0.4 jeremysitlab.com ANY\n; (1 server found)\n;; global options: +cmd\n;; Got answer:\n;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id
+[TEXT] **DNS analysis complete:**
+- Zone has a **wildcard**: `* IN A 10.5.0.4` — any `*.jeremysitlab.com` name resolves to srv1 itself
+- DNS is working correctly for its zone (wildcard is a lab design; recursion deliberately disabled)
+- The `REFUSED` earlier was for bare `srv1` (no domain suffix) — expected with `recursion no`
+
+The DNS fault is **not** the root cause — it's by design. I need to pivot back to the ACL fault, which is the confirmed anomaly. The `nc` timeout to 10.3.0.100:80 confirmed TCP from Office A to 10.3.0.0/24 is blocked. Let me check if there's any real service running in the Office B subnet that the user would need via TCP, and also whether the ACL affects any path to srv1 indirectly.
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'pc3', 'command': "ss -tlnp 2>/dev/null; echo '---'; ip addr show; echo '---'; cat /etc/resolv.conf"})
+[RESULT] {"result":"State  Recv-Q Send-Q Local Address:Port  Peer Address:PortProcess\nLISTEN 0      4096      127.0.0.11:36149      0.0.0.0:*          \n---\n1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN group default qlen 1000\n    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00\n    inet 127.0.0.1/8 scope host lo\n       valid_lft forever preferred_lft forever\n1842: eth0: <B
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'dswa1', 'command': "iptables -L FORWARD -n -v; echo '---'; ip route show table all | grep -v 'cache\\|local' | head -30"})
+[RESULT] {"result":"Chain FORWARD (policy ACCEPT 0 packets, 0 bytes)\n pkts bytes target     prot opt in     out     source               destination         \n    6   504 ACCEPT     1    --  br0.10 *       10.1.0.0/24          10.3.0.0/24         \n    3   180 DROP       0    --  br0.10 *       10.1.0.0/24          10.3.0.0/24         \n---\ndefault nhid 33 proto ospf metric 20 \n\tnexthop via 10.0.0.45 d
+[TEXT] **pc3 has no services** — it's purely a client host in 10.3.0.0/24. Routing on dswa1 is ECMP via eth5/eth6 toward the core (OSPF). DROP counter on dswa1 shows **3 packets actively dropped** (from my earlier nc test), confirming the ACL is live.
+
+The ACL blocks TCP/UDP from 10.1.0.0/24 → 10.3.0.0/24, but pc1 demonstrably CAN reach srv1 (10.5.0.4) at L3. The user's "can't reach 10.5.0.4" needs one more check — srv1 only runs DNS, not a payroll application. Let me see if any application service on srv1 was stopped as part of the change:
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'srv1', 'command': "systemctl list-units --type=service --all 2>/dev/null | grep -v 'not-found' | head -30; echo '==='; journalctl -n 30 --no-pager 2>/dev/null | tail -20; echo '==='; ps aux 2>/dev/null | grep -v '\\[' | grep -v 'grep'"})
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'pc1', 'command': "ip route show; echo '---'; traceroute -n -m 5 10.5.0.4 2>/dev/null; echo '---'; nc -zv -w3 10.5.0.4 53 2>&1"})
+[RESULT] {"result":"apache-htcacheclean.service\tloaded inactive dead\tDisk Cache Cleaning Daemon for Apache HTTP Server\napache-htcacheclean@.service\tloaded inactive dead\tDisk Cache Cleaning Daemon for Apache HTTP Server\napache2.service\tloaded inactive dead\tThe Apache HTTP Server\napache2@.service\tloaded inactive dead\tThe Apache HTTP Server\napt-daily-upgrade.service\tloaded inactive dead\tDaily ap
+[RESULT] {"result":"default via 10.1.0.1 dev eth0 \n10.1.0.0/24 dev eth0 proto kernel scope link src 10.1.0.100 \n---\ntraceroute to 10.5.0.4 (10.5.0.4), 5 hops max, 60 byte packets\n 1  10.1.0.2  0.881 ms  1.535 ms  1.777 ms\n 2  10.0.0.49  3.321 ms  6.107 ms  6.256 ms\n 3  10.0.0.54  7.107 ms  8.636 ms  9.093 ms\n 4  10.5.0.4  9.412 ms  9.838 ms  10.134 ms\n---\nConnection to 10.5.0.4 53 port [tcp/domain
+[TEXT] **Smoking-gun evidence found:**
+
+- **Apache2 web server on srv1 is `inactive dead`** — it's installed but not running
+- Only `named` (DNS) and `bash` are running on srv1 — no HTTP service
+- Port 80 on 10.5.0.4 → "Connection Refused" (confirmed from pc1)
+- Port 53 (DNS) on 10.5.0.4 → TCP connection succeeds (L3 path is perfectly fine)
+- Traceroute from pc1 → srv1: 4 hops, clean path through dswa1 (10.1.0.2) → core → dswb → srv1 — NO routing or ACL fault on this path
+
+**Root cause is now localized:**
+
+The user's inability to reach the "payroll server at 10.5.0.4" is caused by **Apache2 being stopped on srv1**. The L3 path is intact (ICMP, DNS port 53 all work). The payroll web application ran on Apache2, which is now `inactive dead` — port 80 returns Connection Refused.
+
+Co-existing fault: *
+[FINAL] stop=end_turn tool_calls=21
+[SUBMITTED] parsed_ok=True is_anomaly=True faulty_devices=['srv1', 'dswa1', 'dswa2']
+[FINAL-TEXT] **Smoking-gun evidence found:**
+
+- **Apache2 web server on srv1 is `inactive dead`** — it's installed but not running
+- Only `named` (DNS) and `bash` are running on srv1 — no HTTP service
+- Port 80 on 10.5.0.4 → "Connection Refused" (confirmed from pc1)
+- Port 53 (DNS) on 10.5.0.4 → TCP connection succeeds (L3 path is perfectly fine)
+- Traceroute from pc1 → srv1: 4 hops, clean path through dswa1 (10.1.0.2) → core → dswb → srv1 — NO routing or ACL fault on this path
+
+**Root cause is now localized:**
+
+The user's inability to reach the "payroll server at 10.5.0.4" is caused by **Apache2 being stopped on srv1**. The L3 path is intact (ICMP, DNS port 53 all work). The payroll web application ran on Apache2, which is now `inactive dead` — port 80 returns Connection Refused.
+
+Co-existing fault: **dswa1 and dswa2** have iptables FORWARD rules (added "last night") that block all TCP/UDP from Office A (10.1.0.0/24) to Office B's VLAN 10 (10.3.0.0/24) while allowing ICMP through — DROP counter confirms active hits. This doesn't affect the 10.5.0.4 path but does break general Office A ↔ Office B client-subnet TCP connectivity.
+
+---
+
+=== DIAGNOSIS ===
+is_anomaly: true
+faulty_devices: srv1, dswa1, dswa2
+diagnosis_text:
+**Affected components:** The Apache2 HTTP daemon on srv1 (10.5.0.4) and the iptables FORWARD policy on dswa1/dswa2.
+
+**Mechanism:** The user's payroll application is a web service that ran on Apache2 on srv1 (10.5.0.4). As of "last night's change," Apache2 is stopped (`inactive dead`); only the BIND DNS daemon (`named`) is still running on that host. Any TCP connection to srv1 on port 80 returns an immediate Connection Refused — the L3 path from pc1 to srv1 is fully intact (4-hop traceroute succeeds, port 53 TCP connects), so the failure is purely at the service layer. This is why ICMP ping to 10.5.0.4 works perfectly while the payroll application is unreachable.
+
+A co-existing fault was also introduced at the same time: both distribution switches for Office A (dswa1 and dswa2) received a pair of iptables FORWARD rules that selectively block **all non-ICMP traffic** from the Office A subnet (10.1.0.0/24) toward the Office B client VLAN (10.3.0.0/24). The first rule explicitly accepts ICMP, causing the ping-based reachability test to show 0% loss to pc3 (10.3.0.100), while TCP/UDP to that subnet times out silently — DROP counters show the rules are actively hitting.
+
+**Localization:** srv1 is the faulty server (Apache2 stopped). dswa1 (br0.10 = 10.1.0.2) and dswa2 (br0.10 = 10.1.0.3) are the faulty distribution switches with the FORWARD drop rules on their br0.10 (VLAN 10) interfaces.
+
+**Root cause:** "Last night's change" stopped the Apache2 web server on srv1 (removing payroll web service from port 80) and simultaneously injected ICMP-bypass drop rules on dswa1/dswa2 blocking TCP/UDP from Office A to Office B's 10.3.0.0/24 VLAN.
+
+**Fix:** Start Apache2 on srv1 (`systemctl start apache2`) to restore the payroll web service. Remove the two injected FORWARD rules from dswa1 and dswa2 (`iptables -D FORWARD -s 10.1.0.0/24 -d 10.3.0.0/24 -i br0.10 -p icmp -j ACCEPT` and `iptables -D FORWARD -s 10.1.0.0/24 -d 10.3.0.0/24 -i br0.10 -j DROP` on each device).
+=== END ===

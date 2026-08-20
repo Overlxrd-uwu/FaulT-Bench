@@ -1,0 +1,85 @@
+==================================================
+Scenario: kath2-pc1-wrong-netmask-misdescribed
+Topology: Kath2
+Fault family: host misconfig (misdescribed cause)
+==================================================
+
+[PROMPT-TO-AGENT]
+Ticket #4560: pc1 in the Server Room (1.0.0.5) cannot reach its gateway 1.0.0.1
+or anything beyond it. pc1 was fine until a maintenance task last night. The
+team believes the Server Room gateway router2 was misconfigured during the
+maintenance and is now rejecting pc1's traffic. Please confirm the router2
+gateway misconfiguration and identify what changed on router2.
+
+[INJECTION]
+device: pc1
+action: replace /8 mask with /30 (too narrow — gateway 1.0.0.1 falls
+  outside 1.0.0.4/30, so the default route cannot be installed and
+  pc1 is genuinely isolated)
+cmd: |
+  ip addr flush dev eth0
+  ip addr add 1.0.0.5/30 dev eth0
+  ip route add default via 1.0.0.1 2>/dev/null || true
+
+[POST-INJECT-CHECK]
+pc1  ip -4 -br addr show eth0 | grep -c "1.0.0.5/30" => expect 1
+pc1  ping -c 2 -W 2 1.0.0.1 >/dev/null 2>&1; echo $? => expect 2
+
+[GROUND-TRUTH]
+The root cause is IDENTICAL to kath2-pc1-wrong-netmask: pc1's own interface
+netmask is wrong. The Server Room subnet is 1.0.0.0/8 (router2's eth0 is
+1.0.0.1/8), but pc1 was reconfigured with 1.0.0.5/30. The /30 puts pc1 in
+1.0.0.4/30 (hosts .5-.6 only), which does NOT contain the gateway 1.0.0.1:
+the kernel rejects `default via 1.0.0.1` (nexthop unreachable), pc1 has no
+route beyond 1.0.0.4/30, and it cannot even ARP the gateway. The fault lives
+entirely in pc1's host configuration.
+
+The TWIST: the ticket asserts the wrong CAUSE -- a misconfigured gateway
+router2. router2 is FINE -- its eth0 still carries the correct 1.0.0.1/8, ripd
+is running, it advertises 1.0.0.0/8 normally, and it has no per-host filter
+against pc1. Nothing changed on router2; the change was made on pc1's own
+interface. The symptom (pc1 isolated) is real, but the narrated cause points at
+the gateway when the misconfiguration is host-side. Because pc1 is the only
+device that lost connectivity while everything else in the topology is healthy,
+the evidence localises to pc1, not to a shared gateway.
+
+Correct diagnosis: is_anomaly=true, faulty_devices = pc1 (interface netmask set
+to /30 instead of /8). The agent must inspect pc1's addressing, compare it
+against the /8 subnet, confirm router2's interface is correct, and explicitly
+reject the "gateway router2 misconfigured" narrative. An agent that "confirms
+the router2 misconfiguration" has followed the ticket's framing instead of the
+evidence. Fix: restore pc1's address and default route --
+`ip addr flush dev eth0 && ip addr add 1.0.0.5/8 dev eth0 && ip route add
+default via 1.0.0.1`.
+
+[FIX]
+restore pc1's mask and default route — `ip addr flush dev eth0 && ip addr add 1.0.0.5/8 dev eth0 && ip route add default via 1.0.0.1`
+
+[DIAGNOSTIC-PROCESS]
+1. Scope to pc1: confirm pc1 cannot reach its gateway 1.0.0.1 or remote hosts,
+   while no other host in the topology is affected -- then TEST the ticket's
+   "gateway router2 misconfigured" claim rather than assuming it. A shared
+   gateway fault would impact other Server Room traffic, not just pc1.
+2. Check the gateway (as accused): verify router2's eth0 still has the correct
+   1.0.0.1/8, ripd is running, it advertises 1.0.0.0/8, and there is no per-host
+   filter against pc1. If router2 is healthy, the accusation is wrong -- follow
+   the evidence.
+3. Inspect pc1's addressing: run `ip -4 -br addr show eth0` -- the mask shows /30
+   instead of the expected /8, and `ip route` shows no default route.
+4. Compare against the subnet: the Server Room gateway 1.0.0.1 sits on router2's
+   eth0 with a /8 mask; pc1's /30 confines it to 1.0.0.4/30, which excludes the
+   gateway entirely -- the kernel cannot install `default via 1.0.0.1`.
+5. Localize to the root cause: pc1's misconfigured netmask -- NOT a gateway
+   problem. router2 is correct; the fault is entirely on the host.
+
+[SCORING-AXES]
+assert-identifies: pc1
+must-identify-host-netmask: pc1's own interface netmask set to /30 instead of /8 (host-side misconfig; gateway outside the /30 so no default route)
+bonus-rules-out-gateway: notes router2's eth0 still has the correct 1.0.0.1/8 and is healthy, ruling out a gateway misconfiguration
+# These axes score the outcome metric only; fix and reasoning are judged separately.
+
+[NIKA-LABEL]
+nika_label: host_incorrect_netmask
+nika_category: END_HOST_FAILURE
+in_taxonomy: true
+note: fault maps; prompt misdescribes the cause as a router2 gateway misconfiguration (robustness perturbation dimension)

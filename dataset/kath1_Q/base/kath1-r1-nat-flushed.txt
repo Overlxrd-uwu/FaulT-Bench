@@ -1,0 +1,68 @@
+==================================================
+Scenario: kath1-r1-nat-flushed
+Topology: Kath1
+Fault family: NAT misconfig
+==================================================
+
+[PROMPT-TO-AGENT]
+PC1 (10.1.0.100) can ping the corporate gateway and Office-B
+internal devices fine, but cannot reach any public IP on the
+Internet. DNS works (resolves names) but TCP connections to
+external servers all time out. Diagnose.
+
+[INJECTION]
+device: r1
+action: flush nat table
+cmd: iptables -t nat -F POSTROUTING
+
+[POST-INJECT-CHECK]
+r1   iptables -t nat -nL POSTROUTING | grep -c MASQUERADE  => expect 0
+pc1  curl -s -m 5 -o /dev/null -w "%{http_code}" http://203.0.113.1  => expect 0
+
+[GROUND-TRUTH]
+Affected component: r1 iptables nat POSTROUTING chain
+Mechanism: r1 acts as the NAT boundary for all internal /24
+  subnets (A-PC, B-PC, A-Mgmt, B-Mgmt, Wi-Fi). With MASQUERADE
+  rules flushed, outbound packets from 10.x leave the inside
+  interface unmodified. ISPA's ACL 100 drops RFC1918 source
+  ranges, so the packets are silently dropped at the WAN edge.
+  Internal traffic is unaffected because it never crosses r1.
+Localization: r1
+Root cause: NAT (iptables nat POSTROUTING) MASQUERADE rules
+  missing on r1
+Fix: re-add MASQUERADE rules for each internal subnet via
+  iptables, or re-run the relevant block from r1.startup.
+
+[FIX]
+re-add MASQUERADE rules for each internal subnet via
+  iptables, or re-run the relevant block from r1.startup.
+
+[DIAGNOSTIC-PROCESS]
+1. Scope the symptom: internal traffic (PC1 to Office B) works; DNS works;
+   only Internet-bound TCP connections from 10.x hosts fail -- the fault
+   is on the NAT/egress path, not routing or DNS.
+2. Confirm internal-to-external routing is intact: r1's default route is
+   present and OSPF neighbors are Full -- the issue is not a missing route.
+3. Inspect the NAT table on r1: `iptables -t nat -nL POSTROUTING` -- zero
+   MASQUERADE rules present; the chain was flushed.
+4. Trace the mechanism: without MASQUERADE, packets from 10.x subnets leave
+   r1's WAN interface with RFC1918 source addresses; ISPA's ACL 100 drops
+   RFC1918 source ranges at the WAN edge, so packets never reach the
+   Internet and no ICMP unreachable is returned to the sender.
+5. Localize to the root cause: iptables nat POSTROUTING MASQUERADE rules
+   missing on r1; rule out a routing failure (default route is present) and
+   a firewall FORWARD drop (internal-to-internal works, meaning FORWARD is
+   passing traffic).
+
+[SCORING-AXES]
+assert-identifies: r1
+must-identify-device: r1
+must-identify-component: NAT / iptables nat / MASQUERADE
+bonus-explains-mechanism (specifically the ISPA RFC1918 drop)
+# These axes score the outcome metric only; fix and reasoning are judged separately.
+
+[NIKA-LABEL]
+nika_label: none
+nika_category: NOVEL
+in_taxonomy: false
+note: NAT rule flush; no NAT fault in NIKA

@@ -1,0 +1,188 @@
+{
+  "scenario": {
+    "scenario_id": "ospf-enterprise-web1-default-route-removed",
+    "topology": "ospf_enterprise_static",
+    "fault_family": "host static route removed",
+    "prompt_to_agent": "Helpdesk ticket #8875: Users in both pods report the \"web1.local\" portal\nstopped loading. DNS still resolves web1.local to 10.200.0.4, and the other\nportals (web0/web2/web3) all load fine. From user machines, ping 10.200.0.4\ngets no reply -- yet the server team says web_server_1 is up, Apache is\nrunning, and the dns_server can still ping 10.200.0.4 from inside the farm.\nDiagnose.",
+    "injection": {
+      "device": "web_server_1",
+      "action": "delete the server's default (gateway) route",
+      "command": "ip route del default",
+      "note": null
+    },
+    "pre_check": [],
+    "post_inject_check": [
+      {
+        "device": "web_server_1",
+        "command": "ip route | grep -c default",
+        "expect": "0"
+      },
+      {
+        "device": "host_1_1_1_1",
+        "command": "ping -W2 -c2 10.200.0.4",
+        "expect": "loss>0"
+      },
+      {
+        "device": "host_1_1_1_1",
+        "command": "ping -W2 -c2 10.200.0.3",
+        "expect": "0% loss   (web0 still fine)"
+      }
+    ],
+    "ground_truth": "Affected component: web_server_1 default-route (gateway) configuration\nMechanism: web_server_1 (10.200.0.4) normally reaches off-subnet clients via\n  its default route through the farm gateway 10.200.0.1 on\n  switch_server_access. With the default route deleted, the server can only\n  talk to 10.200.0.0/24. Requests from the user pods still ARRIVE (the OSPF\n  path and DNS are healthy), but every reply to a 10.1.1.x / 10.2.1.x source\n  is unroutable on the server and is dropped -- so pings time out and HTTP\n  never completes, while intra-farm reachability (dns_server -> 10.200.0.4)\n  keeps working. Scope is exactly one server; web0/web2/web3 are untouched.\nLocalization: web_server_1\nRoot cause: default route (via 10.200.0.1) missing on web_server_1\nFix: `ip route add default via 10.200.0.1 dev eth0` on web_server_1",
+    "fix_spec": "`ip route add default via 10.200.0.1 dev eth0` on web_server_1",
+    "scoring_axes": [
+      "assert-identifies: web_server_1",
+      "must-identify-device: web_server_1",
+      "must-identify-component: missing default (gateway) route on the server",
+      "must-identify-mechanism: requests arrive but replies to off-subnet clients are unroutable -- a reply-path failure on the server itself",
+      "bonus-exonerates-network: notes DNS resolution, the OSPF path, and the other web servers are healthy, so nothing network-side needs fixing"
+    ],
+    "source_path": "dataset/nika_ospf_Q/base/ospf-enterprise-web1-default-route-removed.txt",
+    "scenario_class": "base",
+    "ticket_style": "standard"
+  },
+  "agent": "cc-baseline",
+  "timestamp": "2026-08-03T04:28:04.700270+00:00",
+  "phases": {
+    "lstart": {
+      "ok": true,
+      "containers": 15,
+      "expected": 15
+    },
+    "settle": {
+      "converge_wait": 90
+    },
+    "injection": {
+      "applied": true,
+      "skipped_reason": null,
+      "rc": 0,
+      "output": ""
+    },
+    "post_inject_check": {
+      "results": [
+        {
+          "line": {
+            "device": "web_server_1",
+            "command": "ip route | grep -c default",
+            "expect": "0"
+          },
+          "passed": true,
+          "actual": "0",
+          "rationale": "got 0, expected 0"
+        },
+        {
+          "line": {
+            "device": "host_1_1_1_1",
+            "command": "ping -W2 -c2 10.200.0.4",
+            "expect": "loss>0"
+          },
+          "passed": true,
+          "actual": "PING 10.200.0.4 (10.200.0.4) 56(84) bytes of data.\n\n--- 10.200.0.4 ping statistics ---\n2 packets transmitted, 0 received, 100% packet loss, time 1067ms",
+          "rationale": "loss=100%"
+        },
+        {
+          "line": {
+            "device": "host_1_1_1_1",
+            "command": "ping -W2 -c2 10.200.0.3",
+            "expect": "0% loss   (web0 still fine)"
+          },
+          "passed": true,
+          "actual": "PING 10.200.0.3 (10.200.0.3) 56(84) bytes of data.\n64 bytes from 10.200.0.3: icmp_seq=1 ttl=60 time=1.60 ms\n64 bytes from 10.200.0.3: icmp_seq=2 ttl=60 time=1.47 ms\n\n--- 10.200.0.3 ping statistics ---\n2 packets transmitted, 2 received, 0% packet loss, time 1062ms\nrtt min/avg/max/mdev = 1.466/1.530/1.595/0.064 ms",
+          "rationale": "loss=0%"
+        }
+      ],
+      "wait_seconds": 0
+    },
+    "agent": {
+      "diagnosis_text": "web_server_1 (10.200.0.4/24) is missing its default gateway. Every other\nhost in the 10.200.0.0/24 server farm \u2014 web_server_0, web_server_2,\nweb_server_3, and dns_server \u2014 carries the entry \"default via 10.200.0.1\ndev eth0\", pointing at the switch_server_access bridge interface (br0,\n10.200.0.1/24). web_server_1 has only its directly-connected route\n(10.200.0.0/24) and nothing else.\n\nThe mechanism that produces the exact observed asymmetry is classic black-\nhole return-path failure. Inbound traffic reaches web_server_1 correctly:\nthe OSPF domain advertises 10.200.0.0/24 via switch_server_access, so\nrouter_core_3 forwards user packets into the server segment. web_server_1\nreceives those packets but, when it tries to send the reply to a user\naddress (e.g. 10.1.1.x or 10.2.1.x), the kernel finds no route and\nsilently drops the datagram. From the user side this looks like a silent\ntimeout \u2014 exactly what helpdesk reports. dns_server (10.200.0.2) lives in\nthe same /24, so its ping replies use the directly-connected route and\nsucceed, corroborating the \"server is up\" claim from the server team.\nApache is genuinely running; the fault is purely at the IP routing layer of\nthe host OS.\n\nRoot cause: web_server_1's startup configuration omits the default gateway,\nleaving it with no route to any destination outside 10.200.0.0/24.\n\nCorrective fix: Add a persistent default route on web_server_1:\n  ip route add default via 10.200.0.1 dev eth0\nand record it in the lab's startup script so it survives reboots. No\nrouter, switch, or daemon changes are required.",
+      "is_anomaly": true,
+      "faulty_devices": [
+        "web_server_1"
+      ],
+      "parsed_ok": true,
+      "in_tokens": 10,
+      "cache_read_tokens": 71928,
+      "cache_write_tokens": 14221,
+      "out_tokens": 3786,
+      "cost_usd": 0.13291015,
+      "tool_calls": 11,
+      "hit_max_turns": false,
+      "error": null
+    },
+    "score": {
+      "must_passed": 4,
+      "must_total": 4,
+      "bonus_passed": 1,
+      "bonus_total": 1,
+      "outcome_score": 1.0,
+      "fix_score": 1.0,
+      "reasoning_score": 0.9333333333333332,
+      "reasoning_dims": {
+        "grounding": 0.9,
+        "causality": 0.9,
+        "coverage": 1.0
+      },
+      "final_score": 1.0,
+      "per_axis": [
+        {
+          "axis": "assert-identifies: web_server_1",
+          "kind": "assert",
+          "score": 1.0,
+          "rationale": "culprit 'web_server_1' named (good)"
+        },
+        {
+          "axis": "must-identify-device: web_server_1",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "Agent explicitly identifies web_server_1 as the affected device."
+        },
+        {
+          "axis": "must-identify-component: missing default (gateway) route on the server",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The agent explicitly identifies web_server_1 as missing its default gateway (default route via 10.200.0.1) and ties the failure to that missing route."
+        },
+        {
+          "axis": "must-identify-mechanism: requests arrive but replies to off-subnet clients are unroutable -- a reply-path failure on the server itself",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The agent explicitly states inbound traffic reaches web_server_1 but replies to off\u2011subnet addresses are unroutable and dropped due to a missing default route, i.e. a reply\u2011path failure on the server."
+        },
+        {
+          "axis": "bonus-exonerates-network: notes DNS resolution, the OSPF path, and the other web servers are healthy, so nothing network-side needs fixing",
+          "kind": "bonus",
+          "score": 1.0,
+          "rationale": "Yes \u2014 the report calls out the OSPF path, confirms dns_server reachability and other web servers' correct routing, and explicitly states no network-side changes are required."
+        },
+        {
+          "axis": "[FIX]",
+          "kind": "fix",
+          "score": 1.0,
+          "rationale": "Recommends adding the default route via 10.200.0.1 on web_server_1 and making it persistent, which matches the expected fix."
+        },
+        {
+          "axis": "reason:grounding",
+          "kind": "reason-dim",
+          "score": 0.9,
+          "rationale": "The agent's investigation log shows the key observations (no default route on web_server_1; other servers have default via 10.200.0.1; gateway present on switch_server_access) and the writeup draws logical inferences from those facts. A small unsupported aside (claiming Apache explicitly running) appears, but it doesn't affect the routing diagnosis or recommended fix."
+        },
+        {
+          "axis": "reason:causality",
+          "kind": "reason-dim",
+          "score": 0.9,
+          "rationale": "The agent's investigation log shows the key observations (no default route on web_server_1; other servers have default via 10.200.0.1; gateway present on switch_server_access) and the writeup draws logical inferences from those facts. A small unsupported aside (claiming Apache explicitly running) appears, but it doesn't affect the routing diagnosis or recommended fix."
+        },
+        {
+          "axis": "reason:coverage",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "The agent's investigation log shows the key observations (no default route on web_server_1; other servers have default via 10.200.0.1; gateway present on switch_server_access) and the writeup draws logical inferences from those facts. A small unsupported aside (claiming Apache explicitly running) appears, but it doesn't affect the routing diagnosis or recommended fix."
+        }
+      ],
+      "judge_model": "gpt-5-mini",
+      "reasoning_mode": "trace",
+      "error": null
+    }
+  },
+  "agent_input_prompt": "# Topology overview (devices + L2 connectivity)\nTopology: ospf_enterprise_static\n\nDevices:\n  Routers (FRR): router_core_1, router_core_2, router_core_3, switch_dist_1_1, switch_dist_2_1, switch_server_access\n  Switches: switch_access_1_1_1, switch_access_2_1_1\n  Hosts: host_1_1_1_1, host_2_1_1_1\n  Dns servers: dns_server\n  Web servers: web_server_0, web_server_1, web_server_2, web_server_3\n\nLinks (device:iface <-> device:iface):\n  router_core_1:eth0 <-> router_core_2:eth0\n  router_core_1:eth1 <-> router_core_3:eth0\n  router_core_1:eth2 <-> switch_dist_1_1:eth0\n  router_core_2:eth1 <-> router_core_3:eth1\n  router_core_2:eth2 <-> switch_dist_2_1:eth0\n  router_core_3:eth2 <-> switch_server_access:eth5\n  switch_access_1_1_1:eth1 <-> host_1_1_1_1:eth0\n  switch_access_2_1_1:eth1 <-> host_2_1_1_1:eth0\n  switch_dist_1_1:eth1 <-> switch_access_1_1_1:eth0\n  switch_dist_2_1:eth1 <-> switch_access_2_1_1:eth0\n  dns_server:eth0 <-> switch_server_access:eth0\n  web_server_0:eth0 <-> switch_server_access:eth1\n  web_server_1:eth0 <-> switch_server_access:eth2\n  web_server_2:eth0 <-> switch_server_access:eth3\n  web_server_3:eth0 <-> switch_server_access:eth4\n\n# Symptom (user report)\nHelpdesk ticket #8875: Users in both pods report the \"web1.local\" portal\nstopped loading. DNS still resolves web1.local to 10.200.0.4, and the other\nportals (web0/web2/web3) all load fine. From user machines, ping 10.200.0.4\ngets no reply -- yet the server team says web_server_1 is up, Apache is\nrunning, and the dns_server can still ping 10.200.0.4 from inside the farm.\nDiagnose."
+}

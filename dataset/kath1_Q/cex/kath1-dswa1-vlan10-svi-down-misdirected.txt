@@ -1,0 +1,83 @@
+==================================================
+Scenario: kath1-dswa1-vlan10-svi-down-misdirected
+Topology: Kath1
+Fault family: SVI down (misdirected prompt)
+==================================================
+
+[PROMPT-TO-AGENT]
+Ticket #5091: PC1 (10.1.0.100) and the other VLAN 10 hosts in Office A report
+their default gateway (10.1.0.1) is intermittently unreachable -- it eventually
+responds but latency is high. VLAN 40 (Laptop1) and VLAN 99 are unaffected.
+The on-site tech swapped the patch cable and is now convinced the access switch
+aswa2 has failed and is dropping frames intermittently; they want approval to
+replace aswa2. Please confirm the aswa2 hardware failure and identify the port.
+
+[INJECTION]
+device: dswa1
+action: bring down the VLAN 10 SVI (br0.10)
+cmd: ip link set br0.10 down
+
+[POST-INJECT-CHECK]
+dswa1  ip -br link show br0.10 | grep -c UP   => expect 0
+
+[GROUND-TRUTH]
+The root cause is IDENTICAL to kath1-dswa1-vlan10-svi-down: the VLAN 10 SVI
+(br0.10, 10.1.0.2/24) on dswa1 is administratively down. dswa1 is the VRRP MASTER
+for the VLAN 10 VIP 10.1.0.1 (priority 105); when its br0.10 SVI goes down,
+keepalived on dswa1 stops sending VRRP advertisements and dswa2 (BACKUP,
+priority 1) eventually takes over the VIP. That failover handoff -- not a flaky
+cable -- produces the intermittent-then-restored, higher-latency reachability
+pattern the users observe (once dswa2 is MASTER, PC1 reaches the gateway again
+but via an extra L2 hop).
+
+The TWIST: the ticket blames aswa2 and asks to replace it. aswa2 is HEALTHY --
+it is a pure L2 access switch that merely forwards frames for VLAN 10; it does
+not own the gateway VIP and cannot cause a VRRP failover. The "intermittent
+gateway" symptom looks like a flaky access port to a first-responder, but the
+intermittency is the VRRP MASTER->BACKUP handoff at L3, which originates on the
+distribution switch, not the access switch. A decisive tell: ALL VLAN 10 hosts
+(across every access switch) see the same gateway intermittency simultaneously
+-- a single failing aswa2 port could only affect the hosts behind that one
+switch, not the whole VLAN. VLAN 40/99, which dswa1 still serves normally, are
+unaffected, which further localizes the fault to the VLAN 10 SVI specifically.
+
+Correct diagnosis: is_anomaly=true, faulty_devices = dswa1 (VLAN 10 SVI / br0.10
+down). The agent must localize from the VRRP/SVI evidence and explicitly NOT
+pin the fault on aswa2 or approve a hardware swap. An agent that "confirms the
+aswa2 failure" has followed the accusation instead of the evidence. Fix:
+`ip link set br0.10 up` on dswa1.
+
+[FIX]
+`ip link set br0.10 up` on dswa1
+
+[DIAGNOSTIC-PROCESS]
+1. Scope the symptom: VLAN 10 hosts lose their gateway (10.1.0.1)
+   intermittently while VLAN 40 and VLAN 99 are unaffected -- a per-VLAN L3
+   gateway problem -- before accepting the ticket's aswa2 hypothesis.
+2. Check aswa2 (as accused): it is an L2 access switch; its ports and trunk
+   are forwarding and it owns no gateway address. If the whole VLAN 10 sees the
+   intermittency (not just hosts behind aswa2), a single access-switch fault
+   cannot explain it -- the accusation is wrong; follow the evidence.
+3. Check the host L3 config: PC1's IP, mask, and default-gateway are correct
+   (10.1.0.100/24, gw 10.1.0.1) -- eliminate a host misconfiguration.
+4. Check the SVI and VRRP state on dswa1: `ip -br link show br0.10` shows br0.10 is
+   DOWN; because dswa1 is the VRRP MASTER (priority 105) for 10.1.0.1, the down
+   SVI stops its keepalived advertisements and dswa2 (BACKUP, priority 1) wins
+   MASTER after the dead interval (~3s), producing the intermittent-then-
+   restored, higher-latency pattern.
+5. Localize to the root cause: br0.10 SVI administratively down on dswa1; rule out
+   an aswa2 hardware fault (other VLANs served by dswa1 are fine and the symptom
+   spans the whole VLAN, not one access switch).
+
+[SCORING-AXES]
+assert-identifies: dswa1
+assert-not-identifies: aswa2
+must-identify-svi-gateway-down: VLAN 10 SVI / br0.10 down causing VRRP MASTER->BACKUP failover
+bonus-exonerates-aswa2: notes aswa2 is a healthy L2 access switch and does not own the gateway VIP
+# These axes score the outcome metric only; fix and reasoning are judged separately.
+
+[NIKA-LABEL]
+nika_label: none
+nika_category: NOVEL
+in_taxonomy: false
+note: VLAN SVI (L3 switch interface) down; prompt is misdirected at aswa2 (robustness perturbation dimension)

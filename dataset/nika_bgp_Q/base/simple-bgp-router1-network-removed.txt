@@ -1,0 +1,75 @@
+==================================================
+Scenario: simple-bgp-router1-network-removed
+Topology: simple_bgp
+Fault family: BGP missing network advertisement
+==================================================
+
+[PROMPT-TO-AGENT]
+pc1 (195.11.14.2) reports pings to pc2 (200.1.1.2) just time out.
+The partner operator reports the reverse direction fails too, but
+differently: pings from pc2 toward 195.11.14.x die immediately
+with "Destination Net Unreachable" from their own gateway
+200.1.1.1. Both sides confirm the eBGP session between router1
+and router2 shows Established. Diagnose.
+
+[INJECTION]
+device: router1
+action: remove the network advertisement for pc1's subnet from router1's BGP config
+cmd: |
+  vtysh -c "configure terminal" \
+        -c "router bgp 1" \
+        -c "no network 195.11.14.0/24" \
+        -c "exit" -c "exit"
+
+[POST-INJECT-CHECK]
+router1   vtysh -c "show running-config" | grep -c "network 195.11.14.0/24"  => expect 0
+pc1       ping -W2 -c2 200.1.1.2                                             => expect loss>0
+
+[GROUND-TRUTH]
+Affected component: router1 BGP configuration (network statement)
+Mechanism: router1's `router bgp 1` section no longer contains
+  `network 195.11.14.0/24`, so router1 sends router2 an UPDATE
+  withdrawing that prefix. The eBGP session itself stays
+  Established and router1 still learns 200.1.1.0/24, so the
+  FORWARD path pc1 -> router1 -> router2 -> pc2 still delivers.
+  The RETURN path is dead: router2 has no route to 195.11.14.0/24,
+  so pc2's replies (and pc2-originated pings toward pc1) are
+  rejected at router2 with ICMP net-unreachable, sourced from
+  200.1.1.1, the router2 interface facing pc2. pc1 therefore sees
+  pure timeouts while pc2 sees instant net-unreachable errors.
+Localization: router1
+Root cause: missing `network 195.11.14.0/24` advertisement in
+  router1's BGP configuration
+Fix: re-add the network statement on router1 (see [FIX])
+
+[FIX]
+Re-add the advertisement on router1:
+`vtysh -c "configure terminal" -c "router bgp 1" -c "network 195.11.14.0/24"`
+router2 re-learns 195.11.14.0/24 and two-way reachability returns.
+(A `service frr restart` on router1 also restores it, since /etc/frr/frr.conf
+on disk was never modified.)
+
+[DIAGNOSTIC-PROCESS]
+1. Reproduce both directions: pc1 -> pc2 times out; pc2 -> pc1 fails instantly
+   with net-unreachable from 200.1.1.1. The asymmetry points at a missing route
+   on the AS 2 side rather than a dead session or link.
+2. Check the session: `show bgp summary` on both routers shows the peer
+   Established -- prefixes, not the session, are the problem.
+3. Check received routes: router2 has no route to 195.11.14.0/24 (it was
+   withdrawn); router1 still has 200.1.1.0/24 via BGP.
+4. Inspect router1's config: the `network 195.11.14.0/24` line is missing from
+   `router bgp 1` -- router1 simply no longer advertises pc1's subnet.
+5. Localize to router1's missing network statement: forward delivery still
+   works, only the return path is unroutable at router2.
+
+[SCORING-AXES]
+assert-identifies: router1
+must-identify-device: router1
+must-identify-component: missing `network 195.11.14.0/24` advertisement in router1's BGP config
+must-identify-mechanism: router2 no longer receives 195.11.14.0/24, so return traffic toward pc1 is unroutable while the eBGP session stays Established
+bonus-explains-asymmetry: explains why pc1's pings time out (forward delivered, reply unroutable at router2) while pc2's fail instantly with net-unreachable from 200.1.1.1
+
+[NIKA-LABEL]
+nika_label: bgp_missing_route_advertisement
+nika_category: MISCONFIGURATION
+in_taxonomy: true

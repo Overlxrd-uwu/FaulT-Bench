@@ -1,0 +1,181 @@
+{
+  "scenario": {
+    "scenario_id": "ospf-enterprise-dns-named-down",
+    "topology": "ospf_enterprise_static",
+    "fault_family": "service down",
+    "prompt_to_agent": "Helpdesk ticket #8879: Users in both pods report that no internal portal\nloads by NAME anymore -- web0.local through web3.local all fail with\nname-resolution errors. Loading a portal directly by its IP address (e.g.\nhttp://10.200.0.3) still works, and pings to 10.200.0.2 succeed. Diagnose.",
+    "injection": {
+      "device": "dns_server",
+      "action": "stop the BIND (named) DNS service on dns_server",
+      "command": "pkill -9 named",
+      "note": null
+    },
+    "pre_check": [],
+    "post_inject_check": [
+      {
+        "device": "dns_server",
+        "command": "pgrep named",
+        "expect": "empty"
+      },
+      {
+        "device": "host_1_1_1_1",
+        "command": "nslookup web0.local 10.200.0.2 | grep -c 10.200.0.3",
+        "expect": "0"
+      },
+      {
+        "device": "host_1_1_1_1",
+        "command": "ping -W2 -c2 10.200.0.2",
+        "expect": "0% loss   (server itself still up)"
+      }
+    ],
+    "ground_truth": "Affected component: dns_server BIND (named) DNS service\nMechanism: the named daemon on dns_server (10.200.0.2) has been killed, so\n  nothing answers on port 53 and every *.local lookup from the pods times\n  out -- which is why the portals fail by name. Everything else is healthy:\n  the host 10.200.0.2 itself is up and pingable, the OSPF path works, and\n  the web servers keep serving HTTP (portals load when addressed by IP).\n  The symptom is purely dead name resolution.\nLocalization: dns_server\nRoot cause: named not running on dns_server (port 53 closed)\nFix: `systemctl start named` on dns_server",
+    "fix_spec": "Restart the BIND DNS service on dns_server (e.g. `systemctl start named`).\nOnce named is answering again, web0.local..web3.local resolve to their\n10.200.0.x addresses and the portals load by name. The web servers and the\nnetwork need no change.",
+    "scoring_axes": [
+      "assert-identifies: dns_server",
+      "must-identify-device: dns_server",
+      "must-identify-component: BIND/named DNS service down (name resolution dead, port 53 closed)",
+      "bonus-rules-out-network: notes 10.200.0.2 is reachable and portals load by IP, so the network and web servers are healthy -- only resolution is broken"
+    ],
+    "source_path": "dataset/nika_ospf_Q/base/ospf-enterprise-dns-named-down.txt",
+    "scenario_class": "base",
+    "ticket_style": "standard"
+  },
+  "agent": "cc-baseline",
+  "timestamp": "2026-08-03T10:24:09.079045+00:00",
+  "phases": {
+    "lstart": {
+      "ok": true,
+      "containers": 15,
+      "expected": 15
+    },
+    "settle": {
+      "converge_wait": 90
+    },
+    "injection": {
+      "applied": true,
+      "skipped_reason": null,
+      "rc": 0,
+      "output": ""
+    },
+    "post_inject_check": {
+      "results": [
+        {
+          "line": {
+            "device": "dns_server",
+            "command": "pgrep named",
+            "expect": "empty"
+          },
+          "passed": true,
+          "actual": "",
+          "rationale": "output empty"
+        },
+        {
+          "line": {
+            "device": "host_1_1_1_1",
+            "command": "nslookup web0.local 10.200.0.2 | grep -c 10.200.0.3",
+            "expect": "0"
+          },
+          "passed": true,
+          "actual": "0",
+          "rationale": "got 0, expected 0"
+        },
+        {
+          "line": {
+            "device": "host_1_1_1_1",
+            "command": "ping -W2 -c2 10.200.0.2",
+            "expect": "0% loss   (server itself still up)"
+          },
+          "passed": true,
+          "actual": "PING 10.200.0.2 (10.200.0.2) 56(84) bytes of data.\n64 bytes from 10.200.0.2: icmp_seq=1 ttl=60 time=1.69 ms\n64 bytes from 10.200.0.2: icmp_seq=2 ttl=60 time=1.66 ms\n\n--- 10.200.0.2 ping statistics ---\n2 packets transmitted, 2 received, 0% packet loss, time 1066ms\nrtt min/avg/max/mdev = 1.656/1.673/1.691/0.017 ms",
+          "rationale": "loss=0%"
+        }
+      ],
+      "wait_seconds": 0
+    },
+    "agent": {
+      "diagnosis_text": "The BIND9 named daemon on dns_server was not running at the time of the\nreport, causing port 53 on 10.200.0.2 to actively refuse connections.\nBoth hosts are correctly configured with \"nameserver 10.200.0.2\" in\n/etc/resolv.conf, and the DNS server is IP-reachable (the interface holds\n10.200.0.2/24 and pings succeed). However, every nslookup issued by the\nhosts received \"connection refused\" on port 53 \u2014 not a timeout, an\nimmediate refusal \u2014 because no process was listening.\n\nInspection of dns_server showed the named service as \"inactive (dead)\"\nwhile marked \"enabled\" in systemd. The zone file /etc/bind/db.local is\nwell-formed and complete (A records for web0\u2013web3 mapping correctly to\n10.200.0.3\u201310.200.0.6, and named-checkconf reported no errors), so the\nfault is not in the DNS data itself. The startup script\n(startup.sh) contains \"systemctl start named\", but systemd is not a\nfully functional init inside Kathara/Docker containers; the systemctl\ncall either failed silently or the daemon exited immediately after the\ncontainer came up, leaving the service dead.\n\nRunning \"service named start\" brought the daemon up immediately (bind9\nnamed -u bind), and name resolution from both pod hosts was confirmed\nworking for web0.local through web3.local.\n\nRoot cause: the dns_server startup script uses \"systemctl start named\",\nwhich does not reliably start services inside Kathara containers, so the\nBIND9 daemon was never running after lab deployment.\n\nCorrective fix: Replace \"systemctl start named\" with \"service named\nstart\" (or invoke named directly: /usr/sbin/named -u bind) in\ndns_server's startup script so the daemon starts reliably on every lab\nlaunch.",
+      "is_anomaly": true,
+      "faulty_devices": [
+        "dns_server"
+      ],
+      "parsed_ok": true,
+      "in_tokens": 15,
+      "cache_read_tokens": 156382,
+      "cache_write_tokens": 17959,
+      "out_tokens": 5321,
+      "cost_usd": 0.19526385000000002,
+      "tool_calls": 20,
+      "hit_max_turns": false,
+      "error": null
+    },
+    "score": {
+      "must_passed": 3,
+      "must_total": 3,
+      "bonus_passed": 0,
+      "bonus_total": 1,
+      "outcome_score": 0.7,
+      "fix_score": 1.0,
+      "reasoning_score": 0.9333333333333332,
+      "reasoning_dims": {
+        "grounding": 0.9,
+        "causality": 0.9,
+        "coverage": 1.0
+      },
+      "final_score": 0.7,
+      "per_axis": [
+        {
+          "axis": "assert-identifies: dns_server",
+          "kind": "assert",
+          "score": 1.0,
+          "rationale": "culprit 'dns_server' named (good)"
+        },
+        {
+          "axis": "must-identify-device: dns_server",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The report explicitly identifies dns_server as the affected device. "
+        },
+        {
+          "axis": "must-identify-component: BIND/named DNS service down (name resolution dead, port 53 closed)",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The agent explicitly identified that the BIND/named daemon on dns_server was not running (port 53 closed/connection refused), matching the required component identification."
+        },
+        {
+          "axis": "bonus-rules-out-network: notes 10.200.0.2 is reachable and portals load by IP, so the network and web servers are healthy -- only resolution is broken",
+          "kind": "bonus",
+          "score": 0.0,
+          "rationale": "The report notes 10.200.0.2 is IP-reachable but does not explicitly state that portals/web servers load by IP, so it fails to fully rule out a network/webserver issue as required."
+        },
+        {
+          "axis": "[FIX]",
+          "kind": "fix",
+          "score": 1.0,
+          "rationale": "Replacing the failing systemctl call with 'service named start' or launching named directly ensures the BIND daemon is started, which matches the expected remediation to restart named."
+        },
+        {
+          "axis": "reason:grounding",
+          "kind": "reason-dim",
+          "score": 0.9,
+          "rationale": "The agent's investigation log contains direct observations for the key claims (hosts point to 10.200.0.2, nslookup showed 'connection refused', named was inactive, named-checkconf/zone loaded, manual service start succeeded and restored resolution, startup script contains 'systemctl start named'). The only mildly speculative element is the claim that systemctl is nonfunctional in Kathara containers, but the observed facts (startup script attempts systemctl and service named was not running until manually started) support that inference well."
+        },
+        {
+          "axis": "reason:causality",
+          "kind": "reason-dim",
+          "score": 0.9,
+          "rationale": "The agent's investigation log contains direct observations for the key claims (hosts point to 10.200.0.2, nslookup showed 'connection refused', named was inactive, named-checkconf/zone loaded, manual service start succeeded and restored resolution, startup script contains 'systemctl start named'). The only mildly speculative element is the claim that systemctl is nonfunctional in Kathara containers, but the observed facts (startup script attempts systemctl and service named was not running until manually started) support that inference well."
+        },
+        {
+          "axis": "reason:coverage",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "The agent's investigation log contains direct observations for the key claims (hosts point to 10.200.0.2, nslookup showed 'connection refused', named was inactive, named-checkconf/zone loaded, manual service start succeeded and restored resolution, startup script contains 'systemctl start named'). The only mildly speculative element is the claim that systemctl is nonfunctional in Kathara containers, but the observed facts (startup script attempts systemctl and service named was not running until manually started) support that inference well."
+        }
+      ],
+      "judge_model": "gpt-5-mini",
+      "reasoning_mode": "trace",
+      "error": null
+    }
+  },
+  "agent_input_prompt": "# Topology overview (devices + L2 connectivity)\nTopology: ospf_enterprise_static\n\nDevices:\n  Routers (FRR): router_core_1, router_core_2, router_core_3, switch_dist_1_1, switch_dist_2_1, switch_server_access\n  Switches: switch_access_1_1_1, switch_access_2_1_1\n  Hosts: host_1_1_1_1, host_2_1_1_1\n  Dns servers: dns_server\n  Web servers: web_server_0, web_server_1, web_server_2, web_server_3\n\nLinks (device:iface <-> device:iface):\n  router_core_1:eth0 <-> router_core_2:eth0\n  router_core_1:eth1 <-> router_core_3:eth0\n  router_core_1:eth2 <-> switch_dist_1_1:eth0\n  router_core_2:eth1 <-> router_core_3:eth1\n  router_core_2:eth2 <-> switch_dist_2_1:eth0\n  router_core_3:eth2 <-> switch_server_access:eth5\n  switch_access_1_1_1:eth1 <-> host_1_1_1_1:eth0\n  switch_access_2_1_1:eth1 <-> host_2_1_1_1:eth0\n  switch_dist_1_1:eth1 <-> switch_access_1_1_1:eth0\n  switch_dist_2_1:eth1 <-> switch_access_2_1_1:eth0\n  dns_server:eth0 <-> switch_server_access:eth0\n  web_server_0:eth0 <-> switch_server_access:eth1\n  web_server_1:eth0 <-> switch_server_access:eth2\n  web_server_2:eth0 <-> switch_server_access:eth3\n  web_server_3:eth0 <-> switch_server_access:eth4\n\n# Symptom (user report)\nHelpdesk ticket #8879: Users in both pods report that no internal portal\nloads by NAME anymore -- web0.local through web3.local all fail with\nname-resolution errors. Loading a portal directly by its IP address (e.g.\nhttp://10.200.0.3) still works, and pings to 10.200.0.2 succeed. Diagnose."
+}

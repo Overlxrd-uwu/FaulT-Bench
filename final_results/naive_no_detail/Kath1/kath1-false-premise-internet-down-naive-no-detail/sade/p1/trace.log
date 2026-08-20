@@ -1,0 +1,66 @@
+[AGENT] sade starts on lab=Kath1
+[TOOL] ToolSearch({'query': 'select:mcp__kathara_base_mcp_server__get_reachability'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_base_mcp_server__get_reachability'}]
+[TOOL] mcp__kathara_base_mcp_server__get_reachability({})
+[RESULT] {"result":"{\"hosts\":{\"pc1\":\"10.1.0.100\",\"pc2\":\"10.1.0.101\",\"pc3\":\"10.3.0.100\"},\"results\":[{\"src\":\"pc1\",\"dst\":\"pc3\",\"dst_ip\":\"10.3.0.100\",\"tx\":2,\"rx\":2,\"loss_percent\":0.0,\"time_ms\":1003.0,\"rtt_avg_ms\":5.488,\"rtt_min_ms\":5.398,\"rtt_max_ms\":5.578,\"rtt_mdev_ms\":0.09,\"status\":\"ok\"},{\"src\":\"pc2\",\"dst\":\"pc3\",\"dst_ip\":\"10.3.0.100\",\"tx\":2,\"rx\"
+[TEXT] Internal LAN fully clean (0% loss pc1↔pc2↔pc3). No real symptom in Phase 1 for the reported internet outage — external IPs not tested. Escalating to Phase 4.
+[TOOL] Skill({'skill': 'diagnosis-methodology-skill'})
+[RESULT] Launching skill: diagnosis-methodology-skill
+[TEXT] Phase A — run both triage helpers in parallel.
+[TOOL] mcp__helper_server__run_helper({'script_name': 'infra_sweep'})
+[TOOL] mcp__helper_server__run_helper({'script_name': 'l2_snapshot'})
+[RESULT] {"result":"Unknown machine type: ispb with image kathara/dhcp\nUnknown machine type: r1 with image kathara/dhcp\nUnknown machine type: ispa with image kathara/dhcp\nUnknown machine type: ispb with image kathara/dhcp\nUnknown machine type: r1 with image kathara/dhcp\nUnknown machine type: ispa with image kathara/dhcp\n=== INFRA SWEEP ===\nLab: Kath1\nScope: hosts, routers, switches, servers, bmv2_s
+[RESULT] {"result":"Unknown machine type: ispb with image kathara/dhcp\nUnknown machine type: r1 with image kathara/dhcp\nUnknown machine type: ispa with image kathara/dhcp\n=== L2 SNAPSHOT ===\nLab: Kath1\nScope: hosts, routers, switches, servers, bmv2_switches, ovs_switches, sdn_controllers, other_devices\nDevices scanned: 20\nDuplicate MAC groups: 3\nFlagged devices: 20\nDevices with bridge members: 5\n
+[TEXT] **infra_sweep key findings:**
+- `dswa1/dswa2`: DROP Office A→B (inter-VLAN, not internet-path)
+- `ispa/ispb`: RFC1918 anti-spoof drops on eth0 — potentially normal ISP behavior
+- `r1`: SSH DROP only — not relevant
+- `l2_snapshot`: duplicate MAC entries are all-zeros artifacts (data collection noise), not real conflicts
+
+Phase A clean for internet path. Proceed to Phase B — routing/control plane.
+[TOOL] mcp__helper_server__run_helper({'script_name': 'ospf_snapshot'})
+[RESULT] {"result":"Unknown machine type: ispb with image kathara/dhcp\nUnknown machine type: r1 with image kathara/dhcp\nUnknown machine type: ispa with image kathara/dhcp\n=== OSPF SNAPSHOT ===\nLab: Kath1\nRouters scanned: 12\nFlags:\n  - aswa1: FRR control sockets missing (ospfd_vty) — daemon likely down\n  - aswa1: no OSPF network statements\n  - aswa1: zero OSPF neighbors\n  - aswa2: FRR control sock
+[TEXT] OSPF fabric healthy (29 routes, all core adjacencies Full). But `csw1.eth0` (WAN to r1) shows 0 OSPF neighbors — r1 is NOT participating in OSPF. Need to check r1's routing/FRR state and whether the fabric has a default route.
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'r1', 'command': 'systemctl is-active frr; pgrep -a ospfd; ip route show; ip addr show'})
+[TOOL] mcp__kathara_frr_mcp_server__frr_show_ip_route({'router_name': 'csw1'})
+[RESULT] {"result":"inactive\ndefault via 203.0.113.1 dev eth2 \n10.0.0.32/30 dev eth0 proto kernel scope link src 10.0.0.33 \n10.0.0.36/30 dev eth1 proto kernel scope link src 10.0.0.37 \n203.0.113.0/30 dev eth2 proto kernel scope link src 203.0.113.2 \n203.0.113.4/30 dev eth3 proto kernel scope link src 203.0.113.6 \n1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN group default qlen 1
+[RESULT] {"result":"Codes: K - kernel route, C - connected, L - local, S - static,\n       R - RIP, O - OSPF, I - IS-IS, B - BGP, E - EIGRP, N - NHRP,\n       T - Table, v - VNC, V - VNC-Direct, A - Babel, F - PBR,\n       f - OpenFabric, t - Table-Direct,\n       > - selected route, * - FIB route, q - queued, r - rejected, b - backup\n       t - trapped, o - offload failure\n\nIPv4 unicast VRF default:\nO
+[TEXT] **Critical finding:**
+- `r1`: FRR service **inactive**, ospfd not running
+- `csw1` routing table: **no 0.0.0.0/0 default route** — internet traffic has nowhere to go
+
+r1 has its own default route (`default via 203.0.113.1 dev eth2`) but isn't running OSPF to advertise it into the fabric. Active lead confirmed: FRR down on r1 → no default route propagated → internet broken.
+
+Entering the matching fault family:
+[TOOL] Skill({'skill': 'ospf-fault-skill'})
+[RESULT] Launching skill: ospf-fault-skill
+[TEXT] Direct evidence matches `frr_service_down`. Confirm r1 FRR config to establish what it was meant to advertise.
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'r1', 'command': "ps aux | grep -E 'zebra|ospfd|watchfrr' | grep -v grep; cat /etc/frr/frr.conf 2>/dev/null || cat /etc/frr/ospfd.conf 2>/dev/null"})
+[RESULT] {"result":"! r1/etc/frr/frr.conf\nhostname R1\npassword zebra\nenable password zebra\n!\ninterface lo\n ip address 10.0.0.76/32\n!\nrouter ospf\n ospf router-id 10.0.0.76\n passive-interface lo\n ! Advertise internal links to Core\n network 10.0.0.32/30 area 0\n network 10.0.0.36/30 area 0\n network 10.0.0.76/32 area 0\n ! Advertise Default Route to Core [Source 112]\n default-information originat
+[TEXT] Confirmed. `ps aux` shows zero FRR processes on r1. Config has `default-information originate` — exactly what distributes the default route into OSPF. With FRR down, that never happens.
+
+=== DIAGNOSIS ===
+is_anomaly: true
+faulty_devices: r1
+diagnosis_text:
+**Affected component:** FRR routing daemon stack on the edge router r1.
+
+**Mechanism:** r1's FRR configuration includes `default-information originate` under `router ospf`, which causes r1 to inject a default route (0.0.0.0/0) into the OSPF domain whenever its own default gateway (203.0.113.1 via ispa on eth2) is reachable. With FRR inactive, no OSPF process runs, no adjacencies form with csw1 or csw2, and no default route is ever advertised into the campus fabric. Every core and distribution switch therefore has a full internal topology
+[FINAL] stop=end_turn tool_calls=10
+[SUBMITTED] parsed_ok=True is_anomaly=True faulty_devices=['r1']
+[FINAL-TEXT] Confirmed. `ps aux` shows zero FRR processes on r1. Config has `default-information originate` — exactly what distributes the default route into OSPF. With FRR down, that never happens.
+
+=== DIAGNOSIS ===
+is_anomaly: true
+faulty_devices: r1
+diagnosis_text:
+**Affected component:** FRR routing daemon stack on the edge router r1.
+
+**Mechanism:** r1's FRR configuration includes `default-information originate` under `router ospf`, which causes r1 to inject a default route (0.0.0.0/0) into the OSPF domain whenever its own default gateway (203.0.113.1 via ispa on eth2) is reachable. With FRR inactive, no OSPF process runs, no adjacencies form with csw1 or csw2, and no default route is ever advertised into the campus fabric. Every core and distribution switch therefore has a full internal topology table (29 OSPF routes covering all office subnets) but zero entry for 0.0.0.0/0. Internet-bound traffic from any office host reaches csw1 or csw2, finds no matching route, and is silently dropped.
+
+**Localization:** r1 — `systemctl is-active frr` returns `inactive`; `pgrep ospfd` returns nothing; csw1's full RIB confirms the absence of any default route. r1's own kernel table retains the static default via 203.0.113.1, so r1 itself can reach the internet — only the internal fabric is blind to it.
+
+**Root cause:** The FRR service on r1 was not started (or crashed and was not restarted), silencing the OSPF default-route origination that the entire campus depends on for internet access.
+
+**Fix:** Run `systemctl start frr` on r1. Once FRR comes up, ospfd will establish adjacencies with csw1 and csw2 and immediately redistribute the default route via `default-information originate`, restoring internet connectivity to all office hosts.
+=== END ===

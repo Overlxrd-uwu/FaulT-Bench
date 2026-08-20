@@ -1,0 +1,79 @@
+==================================================
+Scenario: kath2-router1-ip-forward-off-misdirected
+Topology: Kath2
+Fault family: ip_forward disabled (misdirected prompt)
+==================================================
+
+[PROMPT-TO-AGENT]
+IT and CS Dept users opened ticket #4521: they can no longer reach the Server
+Room (1.0.0.x) or Internet Lab (128.168.0.x). Their team has decided the
+problem is router0 -- "router0 stopped routing for us" -- since router0 is the
+gateway their traffic leaves through. Please confirm that router0 has stopped
+routing and identify what failed on router0.
+
+[INJECTION]
+device: router1
+action: drop all transit forwarding on router1 (net.ipv4.ip_forward is not writable from the exec context, so use the iptables equivalent: a FORWARD-chain drop)
+cmd: iptables -A FORWARD -j DROP
+
+[POST-INJECT-CHECK]
+it_hod    ping -W2 -c2 1.0.0.5                  => expect loss>0
+office_pc ping -W2 -c2 192.168.3.1             => expect 0% loss
+
+[GROUND-TRUTH]
+The root cause is IDENTICAL to kath2-router1-ip-forward-off: router1 is not
+forwarding transit traffic. A FORWARD-chain DROP rule on router1 makes it drop
+every packet it would route BETWEEN interfaces (the iptables equivalent of
+net.ipv4.ip_forward=0). router1 is the only transit hop between the
+192.168.x.x departments and the Server Room / Internet Lab, so IT/CS traffic
+(it_hod -> router0 -> router1 -> router2) is dropped at router1. The tell is
+that office_pc, which sits on router1's OWN LAN, can still ping its gateway
+192.168.3.1 (local delivery), but cannot reach the Server Room (transit) --
+router1 is up but not forwarding.
+
+The TWIST: the ticket blames router0 ("router0 stopped routing"). router0 is
+HEALTHY -- its ripd is running, its RIP table is intact, its interfaces are up,
+and it correctly forwards the IT/CS traffic onward to router1 over the serial
+link. router0 is simply the users' first hop, so they accuse it; the packets
+actually die one hop later, at router1's FORWARD-chain drop. This is classic
+first-hop bias toward the users' own gateway.
+
+Correct diagnosis: is_anomaly=true, faulty_devices = router1 (packet
+forwarding disabled / FORWARD-chain drop). The agent must localise from the
+evidence -- router1 forwards local but not transit traffic -- and explicitly
+NOT pin the fault on router0 despite the prompt. An agent that "confirms
+router0 stopped routing" has followed the accusation instead of the evidence.
+Fix: `iptables -D FORWARD -j DROP` on router1.
+
+[FIX]
+`iptables -D FORWARD -j DROP` on router1 (re-enable forwarding)
+
+[DIAGNOSTIC-PROCESS]
+1. Scope the symptom: confirm IT/CS hosts cannot reach the Server Room and
+   Internet Lab, while office_pc (on router1's own LAN segment) CAN ping its
+   gateway 192.168.3.1 -- then TEST the ticket's "router0 stopped routing"
+   claim rather than accepting it.
+2. Check router0 first (as accused): verify router0's ripd is running, its RIP
+   table is intact, its interfaces are up, and it forwards IT/CS traffic onward
+   to router1. If router0 is healthy, the accusation is wrong -- follow the
+   evidence.
+3. Trace one hop further: the traffic reaches router1 but is not forwarded
+   onward. router1's interfaces and RIP routes are fine, yet transit is broken.
+4. Check IP forwarding on router1: a FORWARD-chain DROP rule (equivalent to
+   ip_forward=0) is dropping every transit packet. Local delivery to router1's
+   own interfaces (office_pc -> 192.168.3.1) still works.
+5. Localize to the root cause: router1 is up but not forwarding transit; router0
+   is merely the first hop, not the fault.
+
+[SCORING-AXES]
+assert-identifies: router1
+assert-not-identifies: router0
+must-identify-forwarding-disabled: router1 not forwarding transit (FORWARD-chain drop / ip_forward=0)
+bonus-exonerates-router0: notes router0's ripd, routes, and interfaces are healthy and it correctly forwards onward
+# These axes score the outcome metric only; fix and reasoning are judged separately.
+
+[NIKA-LABEL]
+nika_label: none
+nika_category: NOVEL
+in_taxonomy: false
+note: net.ipv4.ip_forward disabled (silent transit blackhole); not in NIKA; prompt is misdirected (robustness perturbation dimension)

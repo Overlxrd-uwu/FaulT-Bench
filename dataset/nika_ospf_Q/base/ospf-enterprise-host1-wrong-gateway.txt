@@ -1,0 +1,70 @@
+==================================================
+Scenario: ospf-enterprise-host1-wrong-gateway
+Topology: ospf_enterprise_static
+Fault family: host misconfig (wrong default gateway)
+==================================================
+
+[PROMPT-TO-AGENT]
+Helpdesk ticket #8876: host_1_1_1_1 (10.1.1.2) reports it cannot reach
+anything outside its own subnet -- no server farm, no other pod, and name
+lookups time out too. It can still ping its gateway address 10.1.1.1.
+host_2_1_1_1 is unaffected and reaches everything normally. Diagnose
+host_1_1_1_1's connectivity.
+
+[INJECTION]
+device: host_1_1_1_1
+action: point the host's default route at a non-existent in-subnet gateway
+cmd: |
+  ip route del default 2>/dev/null
+  ip route add default via 10.1.1.254
+
+[POST-INJECT-CHECK]
+host_1_1_1_1  ip route show default | grep -c "10.1.1.254"  => expect 1
+host_1_1_1_1  ping -W2 -c2 10.200.0.2                        => expect loss>0
+host_1_1_1_1  ping -W2 -c2 10.1.1.1                          => expect 0% loss   (real gateway still reachable on-link)
+
+[GROUND-TRUTH]
+Affected component: host_1_1_1_1 default-gateway configuration
+Mechanism: host_1_1_1_1's correct gateway is 10.1.1.1 (switch_dist_1_1's br0
+  address). Its default route was repointed to 10.1.1.254 -- in-subnet but
+  unassigned -- so ARP for the gateway never resolves and no off-subnet
+  packet leaves the host. On-link destinations (10.1.1.1 via the connected
+  route) still work, which is why the gateway pings fine. DNS "times out"
+  only because the resolver 10.200.0.2 is off-subnet. The network itself is
+  healthy: pod 2 reaches everything, and switch_dist_1_1 still advertises
+  10.1.1.0/24.
+Localization: host_1_1_1_1
+Root cause: host_1_1_1_1's default gateway set to 10.1.1.254 instead of
+  10.1.1.1
+Fix: restore the default route on host_1_1_1_1 --
+  `ip route replace default via 10.1.1.1 dev eth0`
+
+[FIX]
+restore host_1_1_1_1's default route --
+`ip route replace default via 10.1.1.1 dev eth0`
+
+[DIAGNOSTIC-PROCESS]
+1. Scope the symptom: exactly one host is affected; its gateway pings but
+   nothing beyond it. Everything shared (distribution, core, farm) works for
+   pod 2 -- isolate to host_1_1_1_1's own configuration.
+2. Inspect the host's routing: `ip route show default` on host_1_1_1_1 shows
+   the default via 10.1.1.254 rather than the expected 10.1.1.1.
+3. Confirm the ARP consequence: 10.1.1.254 is in-subnet but unassigned, so
+   the gateway MAC never resolves and off-subnet traffic dies in the host's
+   ARP queue; 10.1.1.1 still answers because it is reached via the connected
+   route, not the default.
+4. Localize to the host config: rule out switch_dist_1_1 (its br0 gateway
+   10.1.1.1 is up and pod-1's prefix is still advertised) and the core/farm
+   (healthy for pod 2).
+
+[SCORING-AXES]
+assert-identifies: host_1_1_1_1
+must-identify-device: host_1_1_1_1 (host-side issue)
+must-identify-component: default gateway / default route points at wrong address (10.1.1.254 instead of 10.1.1.1)
+bonus-exonerates-network: notes switch_dist_1_1 and the OSPF core are healthy (pod 2 works, the real gateway answers), so no network device needs fixing
+# These axes score the outcome metric only; fix and reasoning are judged separately.
+
+[NIKA-LABEL]
+nika_label: host_incorrect_gateway
+nika_category: END_HOST_FAILURE
+in_taxonomy: true

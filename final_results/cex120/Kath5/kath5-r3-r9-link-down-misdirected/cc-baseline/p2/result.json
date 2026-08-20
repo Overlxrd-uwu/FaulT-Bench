@@ -1,0 +1,166 @@
+{
+  "scenario": {
+    "scenario_id": "kath5-r3-r9-link-down-misdirected",
+    "topology": "Kath5",
+    "fault_family": "WAN link cut (misdirected prompt)",
+    "prompt_to_agent": "Ticket #9052: After a maintenance window, routes for 19.0.0.0/8, 39.0.0.0/8, and\n90.0.0.0/8 became unstable in R1's RIB and R3 reports losing an OSPF neighbor. R9\ndropped off the network -- those are R9's prefixes and they keep flapping. The team\nwants R9 rebooted; they believe R9 hung during maintenance. Please confirm R9 is\nthe failed node and bring it back.",
+    "injection": {
+      "device": "r3",
+      "action": "bring down the link toward r9",
+      "command": "ip link set eth0 down",
+      "note": null
+    },
+    "pre_check": [],
+    "post_inject_check": [
+      {
+        "device": "r3",
+        "command": "ip -br link show eth0 | grep -c UP",
+        "expect": "0"
+      },
+      {
+        "device": "r1",
+        "command": "vtysh -c \"show ip route\" | grep -c \"90.0.0.0\"",
+        "expect": "0"
+      }
+    ],
+    "ground_truth": "The root cause is IDENTICAL to kath5-r3-r9-link-down: the backbone link from R3\ntoward R9 is down. R3 is R9's primary OSPF backbone neighbor and R9 owns the\n19.0.0.0/8 and 90.0.0.0/8 prefixes. With the R3<->R9 link down, the adjacency drops\nand R9 -- whose ONLY uplink is that R3 link (its other interface is a stub LAN)\n-- becomes ISOLATED, so those prefixes disappear from R1's RIB -- exactly the\nreported pattern.\n\nThe TWIST: the ticket blames R9 and wants it rebooted. R9 is HEALTHY but\nUNREACHABLE -- it has no alternate path (the R3 link is its sole uplink), so\nnothing about R9 can be probed remotely once the link drops; from R9's own side\nits interface is up and it keeps sending hellos into a dead wire. The fault is\nthe link on R3's side, not R9. A decisive tell: on R3, the interface facing R9\nis operationally DOWN (L1/L2), while R3's OTHER adjacencies stay Full and every\nother backbone prefix is stable -- the blast radius is exactly R9's prefixes,\nthe signature of a cut uplink, not a crashed router. Rebooting R9 would do\nnothing -- the wire to R3 stays down. This is \"blame the device that went quiet\"\nbias: R9's prefixes flap, so the team assumes R9 hung.\n\nCorrect diagnosis: is_anomaly=true, faulty_devices = r3 (its link toward R9 is\ndown). The agent must localise the failed LINK from evidence -- R3's down interface\ntoward R9 and the resulting adjacency loss -- and explicitly NOT pin the fault on\nR9 or recommend rebooting it. An agent that \"confirms R9 failed\" has followed the\naccusation instead of the evidence. Fix: bring the R3<->R9 link back up.",
+    "fix_spec": "bring the link back up",
+    "scoring_axes": [
+      "assert-identifies: r3",
+      "assert-not-identifies: r9",
+      "must-identify-affected-link: r3<->r9",
+      "bonus-notes-r9-healthy: argues R9 itself need not have failed by any valid evidence -- e.g. the fault localizes to R3's down interface, the blast radius is exactly R9's prefixes, R9 is unreachable only because its sole uplink is cut, and/or a reboot of R9 would not fix the link"
+    ],
+    "source_path": "dataset/kath5_Q/cex/kath5-r3-r9-link-down-misdirected.txt",
+    "scenario_class": "wrong-device",
+    "ticket_style": "standard"
+  },
+  "agent": "cc-baseline",
+  "timestamp": "2026-07-30T17:23:38.469337+00:00",
+  "phases": {
+    "lstart": {
+      "ok": true,
+      "containers": 15,
+      "expected": 15
+    },
+    "settle": {
+      "converge_wait": 90
+    },
+    "injection": {
+      "applied": true,
+      "skipped_reason": null,
+      "rc": 0,
+      "output": ""
+    },
+    "post_inject_check": {
+      "results": [
+        {
+          "line": {
+            "device": "r3",
+            "command": "ip -br link show eth0 | grep -c UP",
+            "expect": "0"
+          },
+          "passed": true,
+          "actual": "0",
+          "rationale": "got 0, expected 0"
+        },
+        {
+          "line": {
+            "device": "r1",
+            "command": "vtysh -c \"show ip route\" | grep -c \"90.0.0.0\"",
+            "expect": "0"
+          },
+          "passed": true,
+          "actual": "0",
+          "rationale": "got 0, expected 0"
+        }
+      ],
+      "wait_seconds": 0
+    },
+    "agent": {
+      "diagnosis_text": "The fault lies entirely on **R3**, not on R9. R3's eth0 interface (segment J, IP 39.1.1.1/8) is administratively/physically shut down \u2014 `ip link show eth0` reports `state DOWN` with no UP or LOWER_UP flags. This is the only link between R3 and R9 in the topology (segment J is shared exclusively by r3.eth0 and r9.eth0).\n\nBecause the interface is down, FRR's OSPF daemon on R3 cannot activate it, even though the correct network statement (`network 39.0.0.0/8 area 0`) exists in R3's running configuration. As a result, R3 sends no OSPF hellos toward R9. On R9's side, the OSPF dead timer for neighbor 39.1.1.1 (R3) expires every ~40 seconds, causing repeated neighbor-loss events. Each time the adjacency drops, R9's OSPF-advertised prefixes \u2014 the 19.x.x.x/24 loopbacks, 39.0.0.0/8, and 90.0.0.0/8 \u2014 are flushed from the LSDB and disappear from R1's RIB. The routes then briefly reappear when R9 re-elects itself DR on eth0, only to flap again, matching the instability reported in the ticket exactly.\n\nR9 itself is completely healthy: all FRR daemons (zebra, ospfd, watchfrr) are running, both eth0 and eth1 are link-up, and OSPF is actively running on both interfaces.\n\n**Root cause:** R3's eth0 interface was left in the `DOWN` state after the maintenance window, severing the only OSPF path to R9.\n\n**Corrective fix:** On R3, run `ip link set eth0 up`. The existing OSPF network statement will immediately activate OSPF on eth0, the R3\u2013R9 adjacency will re-form, and R9's prefixes will be re-advertised into the domain. No action on R9 is required.",
+      "is_anomaly": true,
+      "faulty_devices": [
+        "r3"
+      ],
+      "parsed_ok": true,
+      "in_tokens": 10,
+      "cache_read_tokens": 83879,
+      "cache_write_tokens": 22010,
+      "out_tokens": 6205,
+      "cost_usd": 0.2021462,
+      "tool_calls": 12,
+      "hit_max_turns": false,
+      "error": null
+    },
+    "score": {
+      "must_passed": 3,
+      "must_total": 3,
+      "bonus_passed": 1,
+      "bonus_total": 1,
+      "outcome_score": 1.0,
+      "fix_score": 1.0,
+      "reasoning_score": 1.0,
+      "reasoning_dims": {
+        "grounding": 1.0,
+        "causality": 1.0,
+        "coverage": 1.0
+      },
+      "final_score": 1.0,
+      "per_axis": [
+        {
+          "axis": "assert-identifies: r3",
+          "kind": "assert",
+          "score": 1.0,
+          "rationale": "culprit 'r3' named (good)"
+        },
+        {
+          "axis": "assert-not-identifies: r9",
+          "kind": "assert",
+          "score": 1.0,
+          "rationale": "decoy 'r9' absent (good)"
+        },
+        {
+          "axis": "must-identify-affected-link: r3<->r9",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The diagnosis explicitly names the R3\u2013R9 link (R3 eth0 on segment J to R9 eth0) as the down/affected interface."
+        },
+        {
+          "axis": "bonus-notes-r9-healthy: argues R9 itself need not have failed by any valid evidence -- e.g. the fault localizes to R3's down interface, the blast radius is exactly R9's prefixes, R9 is unreachable only because its sole uplink is cut, and/or a reboot of R9 would not fix the link",
+          "kind": "bonus",
+          "score": 1.0,
+          "rationale": "The diagnosis explicitly localizes the failure to R3's down eth0, shows R9 is reachable only via that cut link and otherwise healthy (daemon/interface state), and states a reboot of R9 is unnecessary."
+        },
+        {
+          "axis": "[FIX]",
+          "kind": "fix",
+          "score": 1.0,
+          "rationale": "Recommends bringing R3's downed interface up (ip link set eth0 up), which directly restores the link as required."
+        },
+        {
+          "axis": "reason:grounding",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "The investigation log contains direct evidence (R3 eth0 state DOWN, R3 has the correct OSPF network statement, R9's FRR and OSPF are running and attempting adjacency) that supports the conclusion the R3\u2192R9 link is the fault. The writeup's inferences follow logically and cover necessary alternatives (R9 reboot unnecessary)."
+        },
+        {
+          "axis": "reason:causality",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "The investigation log contains direct evidence (R3 eth0 state DOWN, R3 has the correct OSPF network statement, R9's FRR and OSPF are running and attempting adjacency) that supports the conclusion the R3\u2192R9 link is the fault. The writeup's inferences follow logically and cover necessary alternatives (R9 reboot unnecessary)."
+        },
+        {
+          "axis": "reason:coverage",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "The investigation log contains direct evidence (R3 eth0 state DOWN, R3 has the correct OSPF network statement, R9's FRR and OSPF are running and attempting adjacency) that supports the conclusion the R3\u2192R9 link is the fault. The writeup's inferences follow logically and cover necessary alternatives (R9 reboot unnecessary)."
+        }
+      ],
+      "judge_model": "gpt-5-mini",
+      "reasoning_mode": "trace",
+      "error": null
+    }
+  },
+  "agent_input_prompt": "# Topology overview (devices + L2 connectivity)\nTopology: Kath5\n\nDevices:\n  pc0: eth0='E'\n  pc12: eth0=GG\n  r1: eth0=A, eth1=B, eth2=C, eth3=D, eth4=E, eth5=F\n  r10: eth0=I, eth1=DD\n  r11: eth0=EE, eth1=B, eth2=FF\n  r12: eth0=EE, eth1=GG\n  r13: eth0=FF\n  r2: eth0=A, eth1=H, eth2=I\n  r3: eth0=J, eth1=H, eth2=C, eth3=M, eth4=N, eth5=O, eth6=P\n  r4: eth0=M, eth1=R, eth2=S, eth3=T\n  r5: eth0=R, eth1=V, eth2=W, eth3=X\n  r6: eth0=S, eth1=V, eth2=Y, eth3=Z\n  r7: eth0=Y, eth1=AA\n  r8: eth0=W, eth1=BB\n  r9: eth0=J, eth1=CC\n\nCollision domains (shared L2 segments):\n  'E': pc0.eth0\n  A: r1.eth0, r2.eth0\n  AA: r7.eth1\n  B: r1.eth1, r11.eth1\n  BB: r8.eth1\n  C: r1.eth2, r3.eth2\n  CC: r9.eth1\n  D: r1.eth3\n  DD: r10.eth1\n  E: r1.eth4\n  EE: r11.eth0, r12.eth0\n  F: r1.eth5\n  FF: r11.eth2, r13.eth0\n  GG: pc12.eth0, r12.eth1\n  H: r2.eth1, r3.eth1\n  I: r10.eth0, r2.eth2\n  J: r3.eth0, r9.eth0\n  M: r3.eth3, r4.eth0\n  N: r3.eth4\n  O: r3.eth5\n  P: r3.eth6\n  R: r4.eth1, r5.eth0\n  S: r4.eth2, r6.eth0\n  T: r4.eth3\n  V: r5.eth1, r6.eth1\n  W: r5.eth2, r8.eth0\n  X: r5.eth3\n  Y: r6.eth2, r7.eth0\n  Z: r6.eth3\n\n# Symptom (user report)\nTicket #9052: After a maintenance window, routes for 19.0.0.0/8, 39.0.0.0/8, and\n90.0.0.0/8 became unstable in R1's RIB and R3 reports losing an OSPF neighbor. R9\ndropped off the network -- those are R9's prefixes and they keep flapping. The team\nwants R9 rebooted; they believe R9 hung during maintenance. Please confirm R9 is\nthe failed node and bring it back."
+}

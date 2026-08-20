@@ -1,0 +1,76 @@
+[AGENT] sade starts on lab=ospf_enterprise_static
+[TOOL] ToolSearch({'query': 'select:mcp__kathara_base_mcp_server__get_reachability'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_base_mcp_server__get_reachability'}]
+[TOOL] mcp__kathara_base_mcp_server__get_reachability({})
+[RESULT] {"result":"{\"hosts\":{\"host_1_1_1_1\":\"10.1.1.2\",\"host_2_1_1_1\":\"10.2.1.2\",\"web_server_0\":\"10.200.0.3\",\"web_server_1\":\"10.200.0.4\",\"web_server_2\":\"10.200.0.5\",\"web_server_3\":\"10.200.0.6\",\"dns_server\":\"10.200.0.2\"},\"results\":[{\"src\":\"dns_server\",\"dst\":\"host_1_1_1_1\",\"dst_ip\":\"10.1.1.2\",\"tx\":2,\"rx\":2,\"loss_percent\":0.0,\"time_ms\":1068.0,\"rtt_avg_ms\"
+[TEXT] **Phase 1 complete.** All ICMP paths show 0% loss, including to `web_server_2` (10.200.0.5). No packet-loss symptom in `get_reachability`.
+
+**Phase 2 — Branch:** The user ticket is the symptom source. ICMP to 10.200.0.5 is confirmed clean; the failure is HTTP-only, isolated to `web_server_2`, while peers web0/1/3 work. This is a **real symptom** at the service layer — connection fails immediately (suggesting a TCP RST or port-unreachable) while L3 is healthy.
+
+**Phase 3 — Active lead:** HTTP to `web_server_2` (10.200.0.5) fails immediately while ICMP succeeds and all three peer web servers respond normally. This pattern — selective protocol failure on a single server with working ICMP — maps to **`acl-skill`** (selective HTTP port block via nft/iptables).
+[TOOL] Skill({'skill': 'acl-skill'})
+[RESULT] Launching skill: acl-skill
+[TEXT] The skill instructs me to run `infra_sweep` first — it scans all devices for ACL fingerprints (including TCP 80 blocks). Let me load and run it.
+[TOOL] ToolSearch({'query': 'select:mcp__helper_server__run_helper'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__helper_server__run_helper'}]
+[TOOL] mcp__helper_server__run_helper({'script_name': 'infra_sweep'})
+[RESULT] {"result":"=== INFRA SWEEP ===\nLab: ospf_enterprise_static\nScope: hosts, routers, switches, servers, bmv2_switches, ovs_switches, sdn_controllers, other_devices\nDevices scanned: 15\nFlagged devices: 0\n\nCategories inspected:\n  - ACL/firewall drop fingerprints: 0 device(s) with rules matched (0 means no protocol-specific drops seen)\n  - Static ARP entries (CM/PM/PERMANENT) on hosts: 0 found\n
+[TEXT] `infra_sweep` found **0 ACL fingerprints** across all 15 devices — no TCP-80 drop rules anywhere. The fault is not an ACL. Let me pivot to the service layer: "fails immediately" with working ICMP and no firewall rules points to **no listener on port 80** (TCP connection refused). I'll run `service_snapshot` to check HTTP service health across the web servers.
+[TOOL] mcp__helper_server__run_helper({'script_name': 'service_snapshot'})
+[RESULT] {"result":"=== SERVICE SNAPSHOT ===\nLab: ospf_enterprise_static\nClients scanned: 2\nService devices scanned: 4\nHostnames: web0.local, web1.local, web2.local, web3.local\nURLs: http://web0.local/, http://web1.local/, http://web2.local/, http://web3.local/\nPublished hostnames: web0.local, web1.local, web2.local, web3.local\n\nResolver groups:\n- 10.200.0.2: 2 hosts [host_1_1_1_1, host_2_1_1_1]\n
+[TEXT] **Direct evidence confirmed.** `service_snapshot` shows:
+
+| Device | Localhost HTTP | Processes | Flag |
+|---|---|---|---|
+| web_server_0 | 200 ✓ | 3 | none |
+| web_server_1 | 200 ✓ | 3 | none |
+| **web_server_2** | **000 ✗** | **0** | **localhost_http_non_ok** |
+| web_server_3 | 200 ✓ | 3 | none |
+
+`web_server_2` has **0 processes running** and curl returns code 000 (connection refused) even from localhost. The web daemon is dead. Let me do a single-device confirmation.
+[TOOL] ToolSearch({'query': 'select:mcp__kathara_base_mcp_server__exec_shell'})
+[RESULT] [{'type': 'tool_reference', 'tool_name': 'mcp__kathara_base_mcp_server__exec_shell'}]
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'web_server_2', 'command': 'ps aux; echo "---"; ss -tlnp; echo "---"; systemctl status nginx 2>/dev/null || systemctl status apache2 2>/dev/null || echo "no systemctl service found"'})
+[RESULT] {"result":"USER       PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND\nroot         1  0.0  0.0   4608  3696 pts/0    Ss+  11:11   0:00 bash\nroot       212 20.0  0.0   4344  2992 ?        Ss   11:14   0:00 /bin/bash -c ps aux; echo \\\"---\\\"; ss -tlnp; echo \\\"---\\\"; systemctl status nginx 2>/dev/null || systemctl status apache2 2>/dev/null || echo \\\"no systemctl service foun
+[TEXT] **Confirmed.** `apache2.service` is **inactive (dead)** on `web_server_2` — no listener on port 80, no web processes running. Let me check the Apache error log for why it stopped.
+[TOOL] mcp__kathara_base_mcp_server__exec_shell({'host_name': 'web_server_2', 'command': 'journalctl -u apache2 --no-pager -n 30 2>/dev/null; echo "---APACHELOG---"; cat /var/log/apache2/error.log 2>/dev/null | tail -30; echo "---CONFIGTEST---"; apache2ctl configtest 2>&1'})
+[RESULT] {"result":"-- No entries --\n\"---APACHELOG---\"\n[Mon Aug 03 11:11:26.795026 2026] [mpm_event:notice] [pid 57:tid 57] AH00489: Apache/2.4.62 (Debian) configured -- resuming normal operations\n[Mon Aug 03 11:11:26.795233 2026] [core:notice] [pid 57:tid 57] AH00094: Command line: '/usr/sbin/apache2'\n[Mon Aug 03 11:12:58.578921 2026] [mpm_event:notice] [pid 57:tid 57] AH00491: caught SIGTERM, shutt
+[TEXT] **Root cause is confirmed.** The Apache error log tells the complete story:
+
+```
+[11:11:26] AH00489: Apache/2.4.62 -- resuming normal operations  ← started OK
+[11:12:58] AH00491: caught SIGTERM, shutting down                ← killed ~92s later
+```
+
+Apache started cleanly at lab boot, received a `SIGTERM` ~92 seconds later, gracefully shut down, and was never restarted. `apache2ctl configtest` returns `Syntax OK`, so no config error prevents recovery. Port 80 has no listener, giving every HTTP connection an immediate "connection refused" (curl code 000). ICMP continues to work because the kernel and network stack are alive — only the application daemon is gone.
+
+All peer web servers (`web_server_0/1/3`) have 3 processes each and return HTTP 200 — the fault is fully isolated to `web_server_2
+[FINAL] stop=end_turn tool_calls=9
+[SUBMITTED] parsed_ok=True is_anomaly=True faulty_devices=['web_server_2']
+[FINAL-TEXT] **Root cause is confirmed.** The Apache error log tells the complete story:
+
+```
+[11:11:26] AH00489: Apache/2.4.62 -- resuming normal operations  ← started OK
+[11:12:58] AH00491: caught SIGTERM, shutting down                ← killed ~92s later
+```
+
+Apache started cleanly at lab boot, received a `SIGTERM` ~92 seconds later, gracefully shut down, and was never restarted. `apache2ctl configtest` returns `Syntax OK`, so no config error prevents recovery. Port 80 has no listener, giving every HTTP connection an immediate "connection refused" (curl code 000). ICMP continues to work because the kernel and network stack are alive — only the application daemon is gone.
+
+All peer web servers (`web_server_0/1/3`) have 3 processes each and return HTTP 200 — the fault is fully isolated to `web_server_2`.
+
+---
+
+=== DIAGNOSIS ===
+is_anomaly: true
+faulty_devices: web_server_2
+diagnosis_text:
+**Affected component:** The Apache2 HTTP daemon (`apache2.service`) on `web_server_2` (10.200.0.5).
+
+**Mechanism:** Apache started normally at lab boot (11:11:26) but received a `SIGTERM` approximately 92 seconds later (11:12:58), causing it to perform a clean, graceful shutdown. No auto-restart or watchdog is configured, so the process remained dead. With no listener on TCP port 80, every inbound HTTP connection receives an immediate TCP RST / "connection refused" response — hence the user experience of "connections fail immediately." ICMP continues to function normally because the Linux network stack is alive; only the application layer is gone.
+
+**Localization:** Exclusively `web_server_2` (eth0 / 10.200.0.5). Peer servers `web_server_0`, `web_server_1`, and `web_server_3` all show 3 running processes and return HTTP 200. `service_snapshot` confirms 0 processes and a `localhost_http_non_ok` flag only on `web_server_2`. `infra_sweep` found zero ACL or routing anomalies across all 15 devices, ruling out firewall, routing, and addressing faults entirely.
+
+**Root cause:** The Apache2 web service on `web_server_2` was killed by a `SIGTERM` signal after lab startup and has not been restarted, leaving port 80 with no listener.
+
+**Fix:** Restart the Apache2 service on `web_server_2`: `systemctl start apache2` (or `apache2ctl start`). The configuration is syntactically valid and requires no changes.
+=== END ===

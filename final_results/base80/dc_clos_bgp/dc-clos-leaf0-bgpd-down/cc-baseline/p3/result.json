@@ -1,0 +1,166 @@
+{
+  "scenario": {
+    "scenario_id": "dc-clos-leaf0-bgpd-down",
+    "topology": "dc_clos_bgp",
+    "fault_family": "routing daemon down",
+    "prompt_to_agent": "A user on pc_0_0 (10.0.0.2) reports they lost all reach across the\ndata-center fabric -- pc_0_1 (10.0.1.2) is unreachable, though pc_0_0\ncan still ping its own gateway 10.0.0.1. The NOC adds that both\nspine routers reported their BGP session toward leaf_router_0_0 going\ndown at the same moment, while the leaf's uplink interfaces still\nshow UP. Diagnose.",
+    "injection": {
+      "device": "leaf_router_0_0",
+      "action": "kill the BGP routing daemon (and watchfrr) on leaf_router_0_0",
+      "command": "pkill -9 watchfrr; pkill -9 bgpd",
+      "note": null
+    },
+    "pre_check": [],
+    "post_inject_check": [
+      {
+        "device": "leaf_router_0_0",
+        "command": "pgrep bgpd",
+        "expect": "empty"
+      },
+      {
+        "device": "pc_0_0",
+        "command": "ping -W2 -c2 10.0.1.2",
+        "expect": "loss>0"
+      }
+    ],
+    "ground_truth": "Affected component: leaf_router_0_0 bgpd\nMechanism: leaf_router_0_0 is the top-of-rack leaf for pc_0_0\n  (host subnet 10.0.0.0/24 on eth2). Its only fabric attachment is\n  EBGP: neighbor 172.16.0.4 (spine_router_0_0, AS 65100) on eth0 and\n  neighbor 172.16.0.8 (spine_router_0_1, AS 65101) on eth1. With bgpd\n  dead the leaf stops learning 10.0.1.0/24 and stops advertising\n  10.0.0.0/24, so pc_0_0 is isolated from the fabric even though every\n  physical link is still UP.\nLocalization: leaf_router_0_0\nRoot cause: bgpd not running on leaf_router_0_0\nFix: restart FRR on leaf_router_0_0 (`service frr restart`) -- this lab\n  keeps its config in /etc/frr/frr.conf, so a restart fully restores\n  the BGP configuration and sessions.\n\nObservable note (lab-verified 2026-07-03 on this fabric): bgpd is killed\ntogether with watchfrr (its watchdog), so nothing respawns it. vtysh\nremains responsive via zebra, `show running-config` simply contains NO\n`router bgp` section, and `show daemons` no longer lists bgpd. An agent\nmay therefore correctly describe this fault as \"the bgp configuration is\nmissing/empty on leaf_router_0_0\" -- that is the same fault observed at\nthe config plane, and must NOT be treated as a wrong root cause.",
+    "fix_spec": "`service frr restart` on leaf_router_0_0. Unlike the vtysh-configured\nkath labs, this lab has a persistent /etc/frr/frr.conf, so the restart\nbrings bgpd back WITH its full BGP configuration; the sessions to both\nspines re-establish and pc_0_0 reaches pc_0_1 again.",
+    "scoring_axes": [
+      "assert-identifies: leaf_router_0_0",
+      "must-identify-device: leaf_router_0_0",
+      "must-identify-component: bgpd / BGP daemon down",
+      "bonus-exonerates-fabric: notes the spines, the super-spine and leaf_router_0_1 are healthy (their other sessions stay Established), so the fault is only on leaf_router_0_0"
+    ],
+    "source_path": "dataset/nika_clos_Q/base/dc-clos-leaf0-bgpd-down.txt",
+    "scenario_class": "base",
+    "ticket_style": "standard"
+  },
+  "agent": "cc-baseline",
+  "timestamp": "2026-08-04T17:48:19.460026+00:00",
+  "phases": {
+    "lstart": {
+      "ok": true,
+      "containers": 7,
+      "expected": 7
+    },
+    "settle": {
+      "converge_wait": 90
+    },
+    "injection": {
+      "applied": true,
+      "skipped_reason": null,
+      "rc": 0,
+      "output": ""
+    },
+    "post_inject_check": {
+      "results": [
+        {
+          "line": {
+            "device": "leaf_router_0_0",
+            "command": "pgrep bgpd",
+            "expect": "empty"
+          },
+          "passed": true,
+          "actual": "",
+          "rationale": "output empty"
+        },
+        {
+          "line": {
+            "device": "pc_0_0",
+            "command": "ping -W2 -c2 10.0.1.2",
+            "expect": "loss>0"
+          },
+          "passed": true,
+          "actual": "PING 10.0.1.2 (10.0.1.2) 56(84) bytes of data.\nFrom 10.0.0.1 icmp_seq=1 Destination Net Unreachable\nFrom 10.0.0.1 icmp_seq=2 Destination Net Unreachable\n\n--- 10.0.1.2 ping statistics ---\n2 packets transmitted, 0 received, +2 errors, 100% packet loss, time 1087ms",
+          "rationale": "loss=100%"
+        }
+      ],
+      "wait_seconds": 0
+    },
+    "agent": {
+      "diagnosis_text": "The BGP daemon (bgpd) on leaf_router_0_0 has crashed and is no longer\nrunning. This is the sole root cause of the fabric-wide reachability loss.\n\nAffected component: The bgpd process within the FRR suite on leaf_router_0_0.\n\nMechanism: With bgpd dead, leaf_router_0_0 sent TCP FIN/RST to both of\nits eBGP peers, causing both spine_router_0_0 (172.16.0.4) and\nspine_router_0_1 (172.16.0.8) to drop their sessions simultaneously \u2014\nexactly matching the NOC report. The spines confirm this: both show the\nleaf peer (172.16.0.5 / 172.16.0.9) in \"Active\" state, and\nspine_router_0_0's neighbor detail records \"Connections established 1;\ndropped 1 / Peer closed the session.\" Without bgpd, leaf_router_0_0\nstops advertising 10.0.0.0/24 into the fabric and stops receiving\n10.0.1.0/24 from the spines. Its own RIB contains only three directly\nconnected prefixes; no BGP routes exist. The gateway (10.0.0.1) is\nstill reachable from pc_0_0 because the eth2 connected route survives\nin zebra, but every attempt to reach 10.0.1.2 returns \"Destination Net\nUnreachable\" from that same gateway.\n\nLocalization: leaf_router_0_0 exclusively. Its /etc/frr/daemons has\nbgpd=yes and /etc/frr/frr.conf contains a complete, valid BGP\nconfiguration (AS 65200, neighbors 172.16.0.4 / 172.16.0.8, network\n10.0.0.0/24), but no bgpd process exists and watchfrr is also absent,\nmeaning there is no auto-restart guard in place.\n\nRoot cause: bgpd was killed on leaf_router_0_0 with watchfrr not\nrunning to restart it.\n\nCorrective fix: Restart the FRR service on leaf_router_0_0\n(`service frr restart` or `systemctl restart frr`). This will relaunch\nbgpd (and watchfrr), reload frr.conf, re-establish eBGP sessions to\nboth spines, and restore end-to-end fabric reachability within one BGP\nkeepalive cycle (~60 s).",
+      "is_anomaly": true,
+      "faulty_devices": [
+        "leaf_router_0_0"
+      ],
+      "parsed_ok": true,
+      "in_tokens": 9,
+      "cache_read_tokens": 55571,
+      "cache_write_tokens": 14971,
+      "out_tokens": 4279,
+      "cost_usd": 0.13799355,
+      "tool_calls": 14,
+      "hit_max_turns": false,
+      "error": null
+    },
+    "score": {
+      "must_passed": 3,
+      "must_total": 3,
+      "bonus_passed": 0,
+      "bonus_total": 1,
+      "outcome_score": 0.7,
+      "fix_score": 1.0,
+      "reasoning_score": 0.9,
+      "reasoning_dims": {
+        "grounding": 0.9,
+        "causality": 0.9,
+        "coverage": 0.9
+      },
+      "final_score": 0.7,
+      "per_axis": [
+        {
+          "axis": "assert-identifies: leaf_router_0_0",
+          "kind": "assert",
+          "score": 1.0,
+          "rationale": "culprit 'leaf_router_0_0' named (good)"
+        },
+        {
+          "axis": "must-identify-device: leaf_router_0_0",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The report explicitly and repeatedly localizes the failure to leaf_router_0_0 as the affected device (bgpd on that router is stopped)."
+        },
+        {
+          "axis": "must-identify-component: bgpd / BGP daemon down",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The report explicitly states that the bgpd process on leaf_router_0_0 has crashed/is not running and treats that as the root cause."
+        },
+        {
+          "axis": "bonus-exonerates-fabric: notes the spines, the super-spine and leaf_router_0_1 are healthy (their other sessions stay Established), so the fault is only on leaf_router_0_0",
+          "kind": "bonus",
+          "score": 0.0,
+          "rationale": "The report localizes the fault to leaf_router_0_0 and notes the two spines\u2019 peer states, but it does not explicitly state that the super-spine and leaf_router_0_1 (and other sessions on the spines) remain healthy/Established."
+        },
+        {
+          "axis": "[FIX]",
+          "kind": "fix",
+          "score": 1.0,
+          "rationale": "Recommends restarting the FRR service (service frr restart / systemctl restart frr) to relaunch bgpd and restore BGP sessions, which matches the expected fix."
+        },
+        {
+          "axis": "reason:grounding",
+          "kind": "reason-dim",
+          "score": 0.9,
+          "rationale": "The investigation log shows direct checks (bgpd absent, frr.conf present, daemons file, missing watchfrr, spine neighbor states, and connectivity failure) that support the agent's conclusion; a few specific mechanistic claims (explicit TCP FIN/RST, exact RIB contents) are asserted without direct log snippets but do not undermine the main diagnosis."
+        },
+        {
+          "axis": "reason:causality",
+          "kind": "reason-dim",
+          "score": 0.9,
+          "rationale": "The investigation log shows direct checks (bgpd absent, frr.conf present, daemons file, missing watchfrr, spine neighbor states, and connectivity failure) that support the agent's conclusion; a few specific mechanistic claims (explicit TCP FIN/RST, exact RIB contents) are asserted without direct log snippets but do not undermine the main diagnosis."
+        },
+        {
+          "axis": "reason:coverage",
+          "kind": "reason-dim",
+          "score": 0.9,
+          "rationale": "The investigation log shows direct checks (bgpd absent, frr.conf present, daemons file, missing watchfrr, spine neighbor states, and connectivity failure) that support the agent's conclusion; a few specific mechanistic claims (explicit TCP FIN/RST, exact RIB contents) are asserted without direct log snippets but do not undermine the main diagnosis."
+        }
+      ],
+      "judge_model": "gpt-5-mini",
+      "reasoning_mode": "trace",
+      "error": null
+    }
+  },
+  "agent_input_prompt": "# Topology overview (devices + L2 connectivity)\nTopology: dc_clos_bgp\n\nDevices:\n  Routers (FRR): leaf_router_0_0, leaf_router_0_1, spine_router_0_0, spine_router_0_1, super_spine_router_0\n  Hosts: pc_0_0, pc_0_1\n\nLinks (device:iface <-> device:iface):\n  leaf_router_0_0:eth2 <-> pc_0_0:eth0\n  leaf_router_0_1:eth2 <-> pc_0_1:eth0\n  spine_router_0_0:eth1 <-> leaf_router_0_0:eth0\n  spine_router_0_0:eth2 <-> leaf_router_0_1:eth0\n  spine_router_0_1:eth1 <-> leaf_router_0_0:eth1\n  spine_router_0_1:eth2 <-> leaf_router_0_1:eth1\n  super_spine_router_0:eth0 <-> spine_router_0_0:eth0\n  super_spine_router_0:eth1 <-> spine_router_0_1:eth0\n\n# Symptom (user report)\nA user on pc_0_0 (10.0.0.2) reports they lost all reach across the\ndata-center fabric -- pc_0_1 (10.0.1.2) is unreachable, though pc_0_0\ncan still ping its own gateway 10.0.0.1. The NOC adds that both\nspine routers reported their BGP session toward leaf_router_0_0 going\ndown at the same moment, while the leaf's uplink interfaces still\nshow UP. Diagnose."
+}

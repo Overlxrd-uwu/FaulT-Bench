@@ -1,0 +1,188 @@
+{
+  "scenario": {
+    "scenario_id": "dc-clos-leaf0-acl-drops-transit",
+    "topology": "dc_clos_bgp",
+    "fault_family": "ACL drops legitimate transit (iptables FORWARD)",
+    "prompt_to_agent": "Users on pc_0_0 (10.0.0.2) and pc_0_1 (10.0.1.2) report they cannot\nreach each other in either direction. Both hosts can still ping their\nown gateways (10.0.0.1 and 10.0.1.1). The NOC insists the fabric is\nhealthy: every BGP session is Established, all routes are present on\nevery router, no interface has flapped, and all FRR daemons are\nrunning. Identify what is silently eating the traffic.",
+    "injection": {
+      "device": "leaf_router_0_0",
+      "action": "add a FORWARD DROP rule for pc_0_0 -> pc_0_1 transit",
+      "command": "iptables -A FORWARD -s 10.0.0.0/24 -d 10.0.1.0/24 -j DROP",
+      "note": null
+    },
+    "pre_check": [],
+    "post_inject_check": [
+      {
+        "device": "leaf_router_0_0",
+        "command": "iptables -S FORWARD | grep -c \"10.0.1.0/24\"",
+        "expect": "1"
+      },
+      {
+        "device": "pc_0_0",
+        "command": "ping -W2 -c2 10.0.1.2",
+        "expect": "loss>0"
+      },
+      {
+        "device": "pc_0_0",
+        "command": "ping -W2 -c2 10.0.0.1",
+        "expect": "0% loss   (gateway still OK -- INPUT chain untouched)"
+      }
+    ],
+    "ground_truth": "Affected component: leaf_router_0_0 iptables FORWARD chain\nMechanism: a DROP rule on leaf_router_0_0 discards every forwarded\n  packet with source in 10.0.0.0/24 and destination in 10.0.1.0/24.\n  All pc_0_0 traffic must transit leaf_router_0_0 (its only gateway),\n  so pc_0_0 -> pc_0_1 packets die there. The reverse direction fails\n  too, despite matching no rule on its way in: pc_0_1's echo requests\n  ARE delivered to pc_0_0, but pc_0_0's replies (src 10.0.0.2, dst\n  10.0.1.2) match the rule and are dropped -- a one-directional filter\n  breaks bidirectional traffic. Routing and BGP are completely\n  healthy; the drop is at the firewall layer. Local delivery to the\n  gateway itself uses the INPUT chain, which is untouched, so both\n  hosts still ping their gateways.\nLocalization: leaf_router_0_0\nRoot cause: extraneous iptables FORWARD DROP rule\n  (-s 10.0.0.0/24 -d 10.0.1.0/24) on leaf_router_0_0\nFix: `iptables -D FORWARD -s 10.0.0.0/24 -d 10.0.1.0/24 -j DROP` on\n  leaf_router_0_0",
+    "fix_spec": "remove the DROP rule on leaf_router_0_0 --\n`iptables -D FORWARD -s 10.0.0.0/24 -d 10.0.1.0/24 -j DROP`",
+    "scoring_axes": [
+      "assert-identifies: leaf_router_0_0",
+      "must-identify-device: leaf_router_0_0",
+      "must-identify-component: iptables FORWARD DROP / firewall filter",
+      "must-recognize-filter-pattern: recognizes healthy routing + healthy BGP with silent forwarding loss as a packet-filter fault, not a routing fault",
+      "bonus-explains-asymmetric-drop: explains that the single directional rule (10.0.0.0/24 -> 10.0.1.0/24) also kills the reverse ping because replies match it"
+    ],
+    "source_path": "dataset/nika_clos_Q/base/dc-clos-leaf0-acl-drops-transit.txt",
+    "scenario_class": "base",
+    "ticket_style": "standard"
+  },
+  "agent": "react-full",
+  "timestamp": "2026-08-03T11:36:47.602090+00:00",
+  "phases": {
+    "lstart": {
+      "ok": true,
+      "containers": 7,
+      "expected": 7
+    },
+    "settle": {
+      "converge_wait": 90
+    },
+    "injection": {
+      "applied": true,
+      "skipped_reason": null,
+      "rc": 0,
+      "output": ""
+    },
+    "post_inject_check": {
+      "results": [
+        {
+          "line": {
+            "device": "leaf_router_0_0",
+            "command": "iptables -S FORWARD | grep -c \"10.0.1.0/24\"",
+            "expect": "1"
+          },
+          "passed": true,
+          "actual": "1",
+          "rationale": "got 1, expected 1"
+        },
+        {
+          "line": {
+            "device": "pc_0_0",
+            "command": "ping -W2 -c2 10.0.1.2",
+            "expect": "loss>0"
+          },
+          "passed": true,
+          "actual": "PING 10.0.1.2 (10.0.1.2) 56(84) bytes of data.\n\n--- 10.0.1.2 ping statistics ---\n2 packets transmitted, 0 received, 100% packet loss, time 1100ms",
+          "rationale": "loss=100%"
+        },
+        {
+          "line": {
+            "device": "pc_0_0",
+            "command": "ping -W2 -c2 10.0.0.1",
+            "expect": "0% loss   (gateway still OK -- INPUT chain untouched)"
+          },
+          "passed": true,
+          "actual": "PING 10.0.0.1 (10.0.0.1) 56(84) bytes of data.\n64 bytes from 10.0.0.1: icmp_seq=1 ttl=64 time=0.404 ms\n64 bytes from 10.0.0.1: icmp_seq=2 ttl=64 time=0.307 ms\n\n--- 10.0.0.1 ping statistics ---\n2 packets transmitted, 2 received, 0% packet loss, time 1108ms\nrtt min/avg/max/mdev = 0.307/0.355/0.404/0.048 ms",
+          "rationale": "loss=0%"
+        }
+      ],
+      "wait_seconds": 0
+    },
+    "agent": {
+      "diagnosis_text": "The fabric control plane is fine; the problem is in the data plane filtering on leaf_router_0_0. The affected component is the Linux netfilter/iptables FORWARD chain on that leaf. We found an explicit inter-subnet block: on leaf_router_0_0, iptables -S shows \u201c-A FORWARD -s 10.0.0.0/24 -d 10.0.1.0/24 -j DROP,\u201d while default policies are ACCEPT. Packet counters confirm it\u2019s actively dropping traffic: \u201cChain FORWARD \u2026 12 pkts 1008 bytes DROP \u2026 10.0.0.0/24 -> 10.0.1.0/24.\u201d\n\nMechanism: Hosts can ping their own gateways because traffic to/from the leaf itself hits INPUT/OUTPUT (both ACCEPT). Any routed traffic between subnets traverses the FORWARD chain. Echo requests from 10.0.0.2 to 10.0.1.2 match the DROP and never leave the leaf. Even when initiating from 10.0.1.2, the echo-reply returning from 10.0.0.2 back to 10.0.1.2 is dropped by the same rule, so connectivity fails \u201cboth ways,\u201d appearing symmetric to users.\n\nLocalization: leaf_router_0_0, iptables FORWARD chain (data-plane filter), not an FRR/OSPF/BGP issue. Kernel forwarding is enabled (ip_forward=1) and rp_filter=0, so routing would work absent this rule.\n\nRoot cause: a misconfigured iptables ACL on leaf_router_0_0 silently drops 10.0.0.0/24 \u2192 10.0.1.0/24 traffic.\n\nCorrective fix: Remove the rule and ensure it isn\u2019t re-applied by config management. Example: iptables -D FORWARD -s 10.0.0.0/24 -d 10.0.1.0/24 -j DROP (or flush the FORWARD chain), then persist the clean state (iptables-save). Optionally add an explicit ACCEPT for inter-VLAN traffic if desired. Audit other leaves for similar filters.",
+      "is_anomaly": true,
+      "faulty_devices": [
+        "leaf_router_0_0"
+      ],
+      "parsed_ok": true,
+      "in_tokens": 4187,
+      "cache_read_tokens": 10624,
+      "cache_write_tokens": 0,
+      "out_tokens": 8118,
+      "cost_usd": 0.08774175,
+      "tool_calls": 24,
+      "hit_max_turns": false,
+      "error": null
+    },
+    "score": {
+      "must_passed": 4,
+      "must_total": 4,
+      "bonus_passed": 1,
+      "bonus_total": 1,
+      "outcome_score": 1.0,
+      "fix_score": 1.0,
+      "reasoning_score": 1.0,
+      "reasoning_dims": {
+        "grounding": 1.0,
+        "causality": 1.0,
+        "coverage": 1.0
+      },
+      "final_score": 1.0,
+      "per_axis": [
+        {
+          "axis": "assert-identifies: leaf_router_0_0",
+          "kind": "assert",
+          "score": 1.0,
+          "rationale": "culprit 'leaf_router_0_0' named (good)"
+        },
+        {
+          "axis": "must-identify-device: leaf_router_0_0",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The agent explicitly names the affected device as leaf_router_0_0 multiple times in the diagnosis."
+        },
+        {
+          "axis": "must-identify-component: iptables FORWARD DROP / firewall filter",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The report explicitly names the iptables/netfilter FORWARD chain on leaf_router_0_0 and cites the exact DROP rule (-s 10.0.0.0/24 -d 10.0.1.0/24 -j DROP) as the cause."
+        },
+        {
+          "axis": "must-recognize-filter-pattern: recognizes healthy routing + healthy BGP with silent forwarding loss as a packet-filter fault, not a routing fault",
+          "kind": "must",
+          "score": 1.0,
+          "rationale": "The submission explicitly states routing/BGP are healthy and correctly identifies an iptables FORWARD DROP on leaf_router_0_0 as the silent packet-filter causing forwarding loss rather than a routing fault."
+        },
+        {
+          "axis": "bonus-explains-asymmetric-drop: explains that the single directional rule (10.0.0.0/24 -> 10.0.1.0/24) also kills the reverse ping because replies match it",
+          "kind": "bonus",
+          "score": 1.0,
+          "rationale": "The agent explicitly explains that the DROP rule matching src 10.0.0.0/24 dst 10.0.1.0/24 also drops the replies (10.0.0.2 -> 10.0.1.2), causing the apparent bidirectional failure."
+        },
+        {
+          "axis": "[FIX]",
+          "kind": "fix",
+          "score": 1.0,
+          "rationale": "Proposes removing the specific DROP rule and persisting the change, which directly fixes the fault."
+        },
+        {
+          "axis": "reason:grounding",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "Investigation log contains explicit iptables rules and packet-drop counters on leaf_router_0_0 plus kernel forwarding/rp_filter checks and failed pings; the agent\u2019s inferences that the FORWARD DROP is blocking inter-subnet traffic and that removing it will restore connectivity follow logically. The essential alternatives (routing, rp_filter, forwarding) were checked and ruled out."
+        },
+        {
+          "axis": "reason:causality",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "Investigation log contains explicit iptables rules and packet-drop counters on leaf_router_0_0 plus kernel forwarding/rp_filter checks and failed pings; the agent\u2019s inferences that the FORWARD DROP is blocking inter-subnet traffic and that removing it will restore connectivity follow logically. The essential alternatives (routing, rp_filter, forwarding) were checked and ruled out."
+        },
+        {
+          "axis": "reason:coverage",
+          "kind": "reason-dim",
+          "score": 1.0,
+          "rationale": "Investigation log contains explicit iptables rules and packet-drop counters on leaf_router_0_0 plus kernel forwarding/rp_filter checks and failed pings; the agent\u2019s inferences that the FORWARD DROP is blocking inter-subnet traffic and that removing it will restore connectivity follow logically. The essential alternatives (routing, rp_filter, forwarding) were checked and ruled out."
+        }
+      ],
+      "judge_model": "gpt-5-mini",
+      "reasoning_mode": "trace",
+      "error": null
+    }
+  },
+  "agent_input_prompt": "# Topology overview (devices + L2 connectivity)\nTopology: dc_clos_bgp\n\nDevices:\n  Routers (FRR): leaf_router_0_0, leaf_router_0_1, spine_router_0_0, spine_router_0_1, super_spine_router_0\n  Hosts: pc_0_0, pc_0_1\n\nLinks (device:iface <-> device:iface):\n  leaf_router_0_0:eth2 <-> pc_0_0:eth0\n  leaf_router_0_1:eth2 <-> pc_0_1:eth0\n  spine_router_0_0:eth1 <-> leaf_router_0_0:eth0\n  spine_router_0_0:eth2 <-> leaf_router_0_1:eth0\n  spine_router_0_1:eth1 <-> leaf_router_0_0:eth1\n  spine_router_0_1:eth2 <-> leaf_router_0_1:eth1\n  super_spine_router_0:eth0 <-> spine_router_0_0:eth0\n  super_spine_router_0:eth1 <-> spine_router_0_1:eth0\n\n# Symptom (user report)\nUsers on pc_0_0 (10.0.0.2) and pc_0_1 (10.0.1.2) report they cannot\nreach each other in either direction. Both hosts can still ping their\nown gateways (10.0.0.1 and 10.0.1.1). The NOC insists the fabric is\nhealthy: every BGP session is Established, all routes are present on\nevery router, no interface has flapped, and all FRR daemons are\nrunning. Identify what is silently eating the traffic."
+}
